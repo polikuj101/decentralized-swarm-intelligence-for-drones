@@ -2,7 +2,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
-logs/
+/Swarm
+/logs/*
+!/logs/bench/
+!/logs/bench/before.jsonl
 docker/drone-agent/models/embed/*
 !docker/drone-agent/models/embed/.gitkeep
-Swarm
