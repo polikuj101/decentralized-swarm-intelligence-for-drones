@@ -1,0 +1,16 @@
+x-swarm-env: &swarm-env
+  SWARM_SIZE: "5"
+  SWARM_KEY: ${SWARM_KEY:?задайте SWARM_KEY в .env}
+  MISSION_FILE: /opt/swarm/config/mission.json
+  SCENE_FILE: /opt/swarm/scene/scene.json
+  HUD_URL: http://172.33.0.5:8000/api/ingest
+  EW_TOKEN: ${EW_TOKEN:?}
+  LLM_URL: http://127.0.0.1:8080
+  LLM_TIMEOUT_S: "20"
+
+services:
+  drone-agent-1: { environment: *swarm-env }
+  drone-agent-2: { environment: *swarm-env }
+  drone-agent-3: { environment: *swarm-env }
+  drone-agent-4: { environment: *swarm-env }
+  drone-agent-5: { environment: *swarm-env }

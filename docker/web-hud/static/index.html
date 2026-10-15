@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Swarm Mission Control</title>
+  <link rel="stylesheet" href="/static/vendor/leaflet.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="top">
+    <b>SWARM MISSION CONTROL</b>
+    <span id="ewb" class="b UNKNOWN">EW: —</span>
+    <span id="scn-st" class="dim"></span>
+    <span id="kpi" class="dim"></span>
+    <span class="sp"></span>
+    <span id="conn" class="b UNKNOWN">HUD offline</span>
+  </header>
+  <main>
+    <section id="map"></section>
+    <aside id="side">
+      <svg id="graph" viewBox="0 0 260 210"></svg>
+      <div id="cards"></div>
+    </aside>
+    <section id="consolebox">
+      <div class="bar">
+        <b>Бортовой планировщик (Qwen) и события роя</b>
+        <select id="fdrone"></select>
+        <label><input type="checkbox" id="showEv" checked> события роя</label>
+        <label><input type="checkbox" id="autoscroll" checked> автопрокрутка</label>
+      </div>
+      <div id="console"></div>
+    </section>
+    <section id="ctrl">
+      <h3>Управление РЭБ</h3>
+      <div class="r2">Борты: <span id="dsel"></span></div>
+      <div class="r2">
+        <label>длительность, с <input id="dur" type="number" min="1" placeholder="до снятия"></label>
+        <label><input type="checkbox" id="onb"> + onboard MAVLink</label>
+      </div>
+      <div class="btns"><button id="c2cut">Обрыв C2</button><button id="c2res">Вернуть C2</button></div>
+      <div class="btns">
+        <select id="gmode">
+          <option>denied</option><option>degraded</option><option>noise</option><option>drift</option><option>spoof</option>
+        </select>
+        <button id="gps">GPS: применить</button><button id="gpsres">Вернуть GPS</button>
+      </div>
+      <div class="r2 small">drift/spoof: скорость <input id="rate" value="1.5" size="3"> м/с,
+        курс <input id="head" value="90" size="3">°, цель N <input id="tn" value="0" size="3"> E <input id="te" value="60" size="3"> м</div>
+      <div class="btns">
+        <button data-lvl="L1">Mesh L1</button><button data-lvl="L2">L2</button>
+        <button data-lvl="L3">L3</button><button data-lvl="L4">L4</button>
+        <button id="meshres">Вернуть mesh</button>
+      </div>
+      <div class="btns"><button id="reset" class="danger">Сброс всей РЭБ</button></div>
+      <div class="btns"><select id="scn"></select><button id="scnrun">Сценарий ▶</button><button id="scnstop">■ Стоп</button></div>
+      <div id="ewmsg" class="dim"></div>
+    </section>
+  </main>
+  <script src="/static/vendor/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

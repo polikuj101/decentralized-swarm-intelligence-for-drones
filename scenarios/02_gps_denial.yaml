@@ -1,0 +1,5 @@
+name: gps_denial
+description: Потеря GPS на бортах 1 и 2 (45 с), затем деградация ковариации на всех
+steps:
+  - {at: 20, action: gps, params: {mode: denied, drones: [1, 2], duration_s: 45}}
+  - {at: 90, action: gps, params: {mode: degraded, eph_start_m: 5, eph_end_m: 80, ramp_s: 40, duration_s: 60}}

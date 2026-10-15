@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# @name Gazebo x500 swarm (SITL, companion-driven)
+#
+# @type Quadrotor
+# @class Copter
+#
+# @maintainer swarm-sitl
+#
+
+# Базовый airframe: геометрия, моторы, SIM_GZ_*, PID
+. ${R}etc/init.d-posix/airframes/4001_gz_x500
+
+# Идентичность борта (в мульти-режиме приходит из окружения fc-N)
+param set-default MAV_SYS_ID ${PX4_SYS_ID:=1}
+
+# Поведение при потере C2 / RC (сценарии п. 2.8): рой управляется бортовыми агентами, а не оператором
+param set-default NAV_DLL_ACT 0
+param set-default NAV_RCL_ACT 0
+param set-default COM_RC_IN_MODE 4
+param set-default COM_RCL_EXCEPT 7
+param set-default COM_ARM_WO_GPS 1
+param set-default COM_OF_LOSS_T 1.0
+
+# Оценка состояния при отказе GPS: высота по барометру, внешнее зрение (VIO) по скорости
+param set-default EKF2_HGT_REF 0
+param set-default EKF2_GPS_CTRL 7
+param set-default EKF2_EV_CTRL 4
+param set-default EKF2_EV_DELAY 40
+param set-default EKF2_EV_NOISE_MD 0
+param set-default EKF2_EVV_NOISE 0.15
+param set-default EKF2_NOAID_TOUT 5000000
+
+# Инъекция глушения GPS (патч P4): по умолчанию выключена
+param set-default SIM_GPS_JAM 0
+param set-default SIM_GPS_JAM_EPH 5.0
+
+# Лог только при взведённых моторах (экономит диск при долгих прогонах)
+param set-default SDLOG_MODE 1

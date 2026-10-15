@@ -1,0 +1,969 @@
+# Раздел 5. Web-интерфейс оператора (Mission Control и HUD)
+
+## 5.1. Допущения и поправки к разделам 1-4
+
+HUD отображает состояние роя и дополнительно содержит панель управления РЭБ. Панель нужна, чтобы проводить сценарии из раздела 2 из браузера, без `ewctl.sh`. Она проксирует вызовы в `ew-controller` и ничего не решает сама.
+
+Допущения:
+- **Стек.** Backend: FastAPI + WebSocket + `pymavlink` (приём MAVLink по C2). Frontend: Vanilla JS + **Leaflet** в режиме `CRS.Simple`. Карта строится в локальных ENU-метрах, тайлов и интернета не требуется.
+- **Размер.** Рассчитан на 3-8 бортов и одного-двух операторов. Масштабирование и авторизация пользователей в ТЗ не входят.
+- **Источники данных.** Позиции и «мысли» борта приходят **только** по телеметрии на `mgmt-net` (п. 4.11). MAVLink по `c2-net` используется для индикатора канала C2. Ground truth из Gazebo в HUD не поступает: оператор видит то, что знает каждый борт, плюс истинное состояние РЭБ от `ew-controller`.
+- **Код написан без возможности запуска.** Места риска собраны в п. 5.10, проверки в п. 5.9.
+
+| № | Было | Стало |
+|---|---|---|
+| U13 | п. 1.8: `web-hud` публикует `ports: ["8000:8000"]` | **`["127.0.0.1:8000:8000"]`** (правится в базовом `docker-compose.yml`, потому что Compose объединяет списки `ports`, а не заменяет). С панелью управления РЭБ открытый порт дал бы любому в сети управление глушением. Доступ с другой машины делается SSH-туннелем. |
+| U14 | п. 4.11: «HUD удаляет дубли по `id`» | Дедупликация идёт по **(`id`, `t`, `verdict`)**. Записи REJECTED и FALLBACK в `planner_bridge` получают `id = cmd_id + 1`, и следующая принятая команда получает тот же `id`. Дедупликация только по `id` скрыла бы одну из них. Код `planner_bridge` не меняется. |
+| U15 | п. 1.6: `web-hud` без томов | HUD монтирует `scene.json` (том `scene`, только чтение) и `mission.json` (bind-mount из `docker/drone-agent/config/`). Один файл миссии остаётся единственным источником правды. |
+| U16 | п. 4.11: JSON из `json.dumps` | Python пишет `NaN` как невалидный JSON, и `JSON.parse` в браузере упал бы. Backend разбирает телеметрию с `parse_constant`, заменяя `NaN` и `Infinity` на `null`. |
+
+## 5.2. Архитектура HUD
+
+```
+ drone-agent-N ──POST /api/ingest/N (mgmt-net, Bearer EW_TOKEN, 2 Гц)──┐
+ drone-agent-N ──MAVLink UDP 14550 (c2-net, HEARTBEAT/GPS_RAW_INT)─────┤
+ ew-injector   ◄──GET /v1/state раз в 1 с (mgmt-net)───────────────────┤
+                                                                       ▼
+                                                      ┌─────────────────────────────┐
+ браузер ◄── WS /ws (снимок 2 Гц + новые записи ленты)│ web-hud (FastAPI, :8000)    │
+ браузер ──► POST /api/ew/{action} (X-HUD, Origin) ──►│  DR{} MAV{} EW{} FEED[1000] │──► ew-injector
+                                                      └─────────────────────────────┘
+```
+
+| Элемент HUD | Источник | Примечание |
+|---|---|---|
+| Карта: позиции, трек, неопределённость σ | `pkt.pos`, `pkt.nav.sigma` | позиция это оценка самого борта |
+| Статус РЭБ GREEN/DEGRADED/JAMMED (борт и общий) | `ew-controller` `/v1/state` | истинное состояние глушения |
+| Индикатор канала C2 | MAVLink HEARTBEAT по `c2-net` | LINK LOST после 3 с тишины |
+| Граф связности P2P | `pkt.mesh.heard` каждого борта, `pkt.swarm.peers[k].q` | рёбра строятся по тому, кого борт слышит сейчас |
+| Задачи, сектора, исполнители | `pkt.swarm.{open,done,task_name}` | |
+| Консоль «мыслей» Qwen | `pkt.thoughts` (запись планировщика) | текст модели не доверенный, выводится только как `textContent` |
+| События роя | `pkt.swarm.events` | в той же ленте, фильтруется |
+
+## 5.3. API
+
+| Метод и путь | Защита | Назначение |
+|---|---|---|
+| `GET /` , `GET /static/*` | – | страница и ресурсы |
+| `GET /healthz` | – | живость |
+| `GET /api/config` | – | `scene.json`, `mission.json`, размер роя (503, пока файлы не готовы) |
+| `GET /api/state` | – | текущий снимок (то же, что в WS) |
+| `POST /api/ingest/{id}` | `Authorization: Bearer $EW_TOKEN` | приём телеметрии борта (схема п. 4.11, ≤ 64 КБ) |
+| `WS /ws` | проверка `Origin` | снимок раз в 0,5 с + новые записи ленты |
+| `GET /api/ew/scenarios` | – | список сценариев (проксируется) |
+| `POST /api/ew/{c2\|gps\|mesh\|restore\|scenario_run\|scenario_stop}` | `Origin` + заголовок `X-HUD: 1` | прокси в `ew-controller` (белый список) |
+
+Формат WS-сообщения: `{"state": {...}, "feed": [...]}`.
+- `state`: `ts`, `swarm_size`, `drones{id: {tele_age, pkt, c2{state, hb_age, armed, fix, sats}}}`, `ew`, `ew_ok`, `ew_err`.
+- `feed`: только новые записи. Запись: `{n, kind: "llm"|"event", drone, t, ...}`. Первое сообщение содержит последние 150 записей.
+- `pkt` это телеметрия борта без `thoughts` и `swarm.events` (они идут в ленте).
+
+## 5.4. Образ и Compose
+
+### 5.4.1. `docker/web-hud/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "httpx==0.27.*" \
+      "pymavlink==2.4.*" "pydantic==2.*"
+WORKDIR /app
+# Leaflet вендорится при сборке (на runtime интернет не нужен). Используются только векторные слои, картинки Leaflet не нужны.
+RUN mkdir -p static/vendor \
+ && curl -fsSL https://unpkg.com/leaflet@1.9.4/dist/leaflet.js  -o static/vendor/leaflet.js \
+ && curl -fsSL https://unpkg.com/leaflet@1.9.4/dist/leaflet.css -o static/vendor/leaflet.css
+COPY main.py /app/main.py
+COPY static/ /app/static/
+HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+```
+
+### 5.4.2. `docker-compose.hud.yml`
+
+В `.env` в `COMPOSE_FILE` добавляется `:docker-compose.hud.yml`.
+
+```yaml
+services:
+  web-hud:
+    environment:
+      SWARM_SIZE: "5"
+      EW_URL: http://172.33.0.2:8080
+      EW_TOKEN: ${EW_TOKEN:?задайте EW_TOKEN в .env}
+      SCENE_FILE: /opt/swarm/scene/scene.json
+      MISSION_FILE: /opt/swarm/config/mission.json
+      MAV_BIND: 0.0.0.0:14550
+      HUD_ALLOWED_ORIGINS: http://127.0.0.1:8000,http://localhost:8000
+    volumes:
+      - scene:/opt/swarm/scene:ro
+      - ./docker/drone-agent/config/mission.json:/opt/swarm/config/mission.json:ro
+    depends_on:
+      simulator-core: { condition: service_healthy }
+```
+
+Правка базового `docker-compose.yml` (U13): в сервисе `web-hud` строка `ports: ["8000:8000"]` заменяется на `ports: ["127.0.0.1:8000:8000"]`. Доступ с другой машины: `ssh -L 8000:127.0.0.1:8000 user@host`.
+
+## 5.5. Backend: `docker/web-hud/main.py`
+
+```python
+#!/usr/bin/env python3
+"""web-hud: Mission Control. Приём телеметрии бортов, MAVLink-индикатор C2, опрос ew-controller,
+лента «мыслей» LLM, WebSocket для браузера, прокси команд РЭБ (белый список)."""
+import asyncio
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+os.environ.setdefault("MAVLINK20", "1")
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pymavlink import mavutil
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s web-hud %(message)s")
+log = logging.getLogger("web-hud")
+
+N = int(os.environ.get("SWARM_SIZE", "5"))
+EW_URL = os.environ.get("EW_URL", "http://172.33.0.2:8080")
+TOKEN = os.environ.get("EW_TOKEN", "")
+SCENE_FILE = os.environ.get("SCENE_FILE", "/opt/swarm/scene/scene.json")
+MISSION_FILE = os.environ.get("MISSION_FILE", "/opt/swarm/config/mission.json")
+MAV_BIND = os.environ.get("MAV_BIND", "0.0.0.0:14550")
+ALLOWED = {o.strip() for o in os.environ.get(
+    "HUD_ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",") if o.strip()}
+C2_LOST_S = 3.0
+MAX_BODY = 65536
+STATIC = Path(__file__).parent / "static"
+
+DR = {i: {"pkt": None, "rx": None, "keys": set()} for i in range(1, N + 1)}
+MAV = {i: {"hb": None, "armed": None, "fix": None, "sats": None} for i in range(1, N + 1)}
+EW = {"state": None, "ok": False, "err": "not polled yet", "rx": None}
+FEED: deque = deque(maxlen=1000)
+_feed_n = 0
+CLIENT: httpx.AsyncClient | None = None
+_cache: dict = {}
+
+
+# ───────────── лента ─────────────
+
+def feed_add(kind: str, drone: int, **kw) -> None:
+    global _feed_n
+    _feed_n += 1
+    FEED.append({"n": _feed_n, "kind": kind, "drone": drone, "at": time.time(), **kw})
+
+
+def _s(v, n):
+    return None if v is None else str(v)[:n]
+
+
+# ───────────── MAVLink (c2-net) ─────────────
+
+def mav_loop() -> None:
+    while True:
+        try:
+            m = mavutil.mavlink_connection(f"udpin:{MAV_BIND}")
+            log.info("MAVLink listening on %s", MAV_BIND)
+            while True:
+                msg = m.recv_match(blocking=True, timeout=1.0)
+                if msg is None:
+                    continue
+                s = msg.get_srcSystem()
+                if not 1 <= s <= N or msg.get_srcComponent() != 1:
+                    continue          # отсекает, например, sysid=250 (ew-agent)
+                d, t = MAV[s], msg.get_type()
+                if t == "HEARTBEAT":
+                    d["hb"] = time.monotonic()
+                    d["armed"] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                elif t == "GPS_RAW_INT":
+                    d["fix"], d["sats"] = int(msg.fix_type), int(msg.satellites_visible)
+        except Exception as e:  # noqa: BLE001
+            log.warning("mavlink loop: %s", e)
+            time.sleep(2.0)
+
+
+# ───────────── опрос ew-controller ─────────────
+
+async def ew_poll() -> None:
+    while True:
+        try:
+            r = await CLIENT.get(EW_URL + "/v1/state")
+            r.raise_for_status()
+            EW.update(state=r.json(), ok=True, err=None, rx=time.monotonic())
+        except Exception as e:  # noqa: BLE001
+            EW.update(ok=False, err=f"{type(e).__name__}"[:60])
+        await asyncio.sleep(1.0)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global CLIENT
+    CLIENT = httpx.AsyncClient(timeout=8.0)
+    threading.Thread(target=mav_loop, daemon=True).start()
+    task = asyncio.create_task(ew_poll())
+    yield
+    task.cancel()
+    await CLIENT.aclose()
+
+
+app = FastAPI(title="web-hud", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def sec_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def guard(request: Request) -> None:
+    """защита мутирующих запросов от чужих страниц: Origin + кастомный заголовок (вынуждает preflight)"""
+    o = request.headers.get("origin")
+    if o and o not in ALLOWED:
+        raise HTTPException(403, "bad origin")
+    if request.headers.get("x-hud") != "1":
+        raise HTTPException(403, "missing X-HUD header")
+
+
+# ───────────── конфигурация сцены ─────────────
+
+def _load(path: str):
+    p = Path(path)
+    mt = p.stat().st_mtime
+    c = _cache.get(path)
+    if not c or c[0] != mt:
+        c = _cache[path] = (mt, json.loads(p.read_text()))
+    return c[1]
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/api/config")
+def config():
+    try:
+        return {"swarm_size": N, "scene": _load(SCENE_FILE), "mission": _load(MISSION_FILE)}
+    except (OSError, ValueError):
+        raise HTTPException(503, "scene/mission not ready")
+
+
+# ───────────── приём телеметрии ─────────────
+
+@app.post("/api/ingest/{drone}")
+async def ingest(drone: int, request: Request):
+    if TOKEN and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
+        raise HTTPException(401, "bad token")
+    if drone not in DR:
+        raise HTTPException(404, "unknown drone")
+    raw = await request.body()
+    if len(raw) > MAX_BODY:
+        raise HTTPException(413, "too large")
+    try:
+        pkt = json.loads(raw, parse_constant=lambda c: None)       # U16: NaN/Infinity -> null
+    except ValueError:
+        raise HTTPException(400, "bad json")
+    if (not isinstance(pkt, dict) or pkt.get("v") != 1 or pkt.get("drone") != drone
+            or not all(isinstance(pkt.get(k), dict) or k == "pos" for k in ("pos", "nav", "swarm", "mesh"))):
+        raise HTTPException(422, "bad schema")
+    d, keys = DR[drone], set()
+    for th in pkt.get("thoughts") or []:
+        if not isinstance(th, dict):
+            continue
+        k = ("L", th.get("id"), th.get("t"), th.get("verdict"))       # U14
+        keys.add(k)
+        if k not in d["keys"]:
+            feed_add("llm", drone, id=th.get("id"), t=th.get("t"), trigger=_s(th.get("trigger"), 40),
+                     reasoning=_s(th.get("reasoning"), 200), tool=_s(th.get("tool"), 40), args=th.get("args"),
+                     verdict=_s(th.get("verdict"), 20), reason=_s(th.get("reason"), 160),
+                     latency_ms=th.get("latency_ms"))
+    for ev in pkt["swarm"].get("events") or []:
+        if isinstance(ev, list) and len(ev) == 2:
+            k = ("E", ev[0], ev[1])
+            keys.add(k)
+            if k not in d["keys"]:
+                feed_add("event", drone, t=ev[0], text=_s(ev[1], 160))
+    d["keys"] = keys
+    stored = {k: v for k, v in pkt.items() if k != "thoughts"}
+    stored["swarm"] = {k: v for k, v in pkt["swarm"].items() if k != "events"}
+    d["pkt"], d["rx"] = stored, time.monotonic()
+    return {"ok": True}
+
+
+# ───────────── снимок и WebSocket ─────────────
+
+def snapshot() -> dict:
+    now = time.monotonic()
+    drones = {}
+    for i in range(1, N + 1):
+        d, m = DR[i], MAV[i]
+        hb_age = None if m["hb"] is None else round(now - m["hb"], 1)
+        drones[str(i)] = {
+            "tele_age": None if d["rx"] is None else round(now - d["rx"], 1),
+            "pkt": d["pkt"],
+            "c2": {"state": "NO_LINK" if hb_age is None else ("OK" if hb_age < C2_LOST_S else "LOST"),
+                   "hb_age": hb_age, "armed": m["armed"], "fix": m["fix"], "sats": m["sats"]}}
+    return {"ts": time.time(), "swarm_size": N, "drones": drones, "ew": EW["state"],
+            "ew_ok": bool(EW["ok"] and now - (EW["rx"] or 0.0) < 4.0), "ew_err": EW["err"]}
+
+
+@app.get("/api/state")
+def state():
+    return snapshot()
+
+
+@app.websocket("/ws")
+async def ws(sock: WebSocket):
+    o = sock.headers.get("origin")
+    if o and o not in ALLOWED:
+        await sock.close(code=1008)
+        return
+    await sock.accept()
+    last = max(0, _feed_n - 150)
+    try:
+        while True:
+            new = [f for f in FEED if f["n"] > last]
+            if new:
+                last = new[-1]["n"]
+            await sock.send_json({"state": snapshot(), "feed": new})
+            await asyncio.sleep(0.5)
+    except (WebSocketDisconnect, RuntimeError):
+        return
+
+
+# ───────────── прокси РЭБ (белый список) ─────────────
+
+EW_POST = {"c2": "/v1/ew/c2", "gps": "/v1/ew/gps", "mesh": "/v1/ew/mesh", "restore": "/v1/ew/restore",
+           "scenario_run": "/v1/scenarios/run", "scenario_stop": "/v1/scenarios/stop"}
+
+
+async def ew_forward(method: str, path: str, body: dict | None = None):
+    try:
+        r = await CLIENT.request(method, EW_URL + path, json=body)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"ew-controller unreachable: {type(e).__name__}")
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": r.text[:200]}
+    return JSONResponse(data, status_code=r.status_code)
+
+
+@app.get("/api/ew/scenarios")
+async def ew_scenarios():
+    return await ew_forward("GET", "/v1/scenarios")
+
+
+@app.post("/api/ew/{name}", dependencies=[Depends(guard)])
+async def ew_post(name: str, request: Request):
+    path = EW_POST.get(name)
+    if path is None:
+        raise HTTPException(404, "unknown action")
+    raw = await request.body()
+    if len(raw) > 4096:
+        raise HTTPException(413, "too large")
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError:
+        raise HTTPException(400, "bad json")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "object expected")
+    return await ew_forward("POST", path, body)
+
+
+# ───────────── статика ─────────────
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC / "index.html")
+
+
+app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+```
+
+## 5.6. Frontend
+
+### 5.6.1. Макет экрана
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ SWARM MISSION CONTROL │ EW: JAMMED │ сценарий 04_full_ew 87 с │ эпоха 7 · задач 3/9 · ... │ HUD online │
+├────────────────────────────────────────────────────────┬─────────────────────────────────┤
+│                                                        │  граф связности P2P (SVG)       │
+│        2D-карта (ENU, сетка 10 м): сектора,            ├─────────────────────────────────┤
+│        цели, препятствия, борты, треки, σ              │  D1 [GREEN][C2 OK]  GPS/NAV/... │
+│                                                        │  D2 [JAMMED][C2 LOST] ...       │
+├────────────────────────────────────────────────────────┼─────────────────────────────────┤
+│  консоль «мыслей» Qwen + события роя (фильтры)         │  панель управления РЭБ          │
+└────────────────────────────────────────────────────────┴─────────────────────────────────┘
+```
+
+### 5.6.2. `docker/web-hud/static/index.html`
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Swarm Mission Control</title>
+  <link rel="stylesheet" href="/static/vendor/leaflet.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="top">
+    <b>SWARM MISSION CONTROL</b>
+    <span id="ewb" class="b UNKNOWN">EW: —</span>
+    <span id="scn-st" class="dim"></span>
+    <span id="kpi" class="dim"></span>
+    <span class="sp"></span>
+    <span id="conn" class="b UNKNOWN">HUD offline</span>
+  </header>
+  <main>
+    <section id="map"></section>
+    <aside id="side">
+      <svg id="graph" viewBox="0 0 260 210"></svg>
+      <div id="cards"></div>
+    </aside>
+    <section id="consolebox">
+      <div class="bar">
+        <b>Бортовой планировщик (Qwen) и события роя</b>
+        <select id="fdrone"></select>
+        <label><input type="checkbox" id="showEv" checked> события роя</label>
+        <label><input type="checkbox" id="autoscroll" checked> автопрокрутка</label>
+      </div>
+      <div id="console"></div>
+    </section>
+    <section id="ctrl">
+      <h3>Управление РЭБ</h3>
+      <div class="r2">Борты: <span id="dsel"></span></div>
+      <div class="r2">
+        <label>длительность, с <input id="dur" type="number" min="1" placeholder="до снятия"></label>
+        <label><input type="checkbox" id="onb"> + onboard MAVLink</label>
+      </div>
+      <div class="btns"><button id="c2cut">Обрыв C2</button><button id="c2res">Вернуть C2</button></div>
+      <div class="btns">
+        <select id="gmode">
+          <option>denied</option><option>degraded</option><option>noise</option><option>drift</option><option>spoof</option>
+        </select>
+        <button id="gps">GPS: применить</button><button id="gpsres">Вернуть GPS</button>
+      </div>
+      <div class="r2 small">drift/spoof: скорость <input id="rate" value="1.5" size="3"> м/с,
+        курс <input id="head" value="90" size="3">°, цель N <input id="tn" value="0" size="3"> E <input id="te" value="60" size="3"> м</div>
+      <div class="btns">
+        <button data-lvl="L1">Mesh L1</button><button data-lvl="L2">L2</button>
+        <button data-lvl="L3">L3</button><button data-lvl="L4">L4</button>
+        <button id="meshres">Вернуть mesh</button>
+      </div>
+      <div class="btns"><button id="reset" class="danger">Сброс всей РЭБ</button></div>
+      <div class="btns"><select id="scn"></select><button id="scnrun">Сценарий ▶</button><button id="scnstop">■ Стоп</button></div>
+      <div id="ewmsg" class="dim"></div>
+    </section>
+  </main>
+  <script src="/static/vendor/leaflet.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+```
+
+### 5.6.3. `docker/web-hud/static/style.css`
+
+```css
+:root{--bg:#0e131a;--panel:#151c26;--line:#243040;--tx:#d7dee8;--dim:#8493a6}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:13px/1.35 system-ui,sans-serif}
+body{display:grid;grid-template-rows:46px 1fr}
+.dim{color:var(--dim)} .sp{flex:1}
+#top{display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+#top.jam{animation:blink 1s steps(2) infinite}
+@keyframes blink{0%{background:#4a1515}50%{background:var(--panel)}}
+main{display:grid;grid-template-columns:1fr 440px;grid-template-rows:minmax(380px,1fr) 300px;gap:6px;padding:6px;min-height:0}
+#map{grid-row:1;grid-column:1;background:#0a0e14;border:1px solid var(--line);min-height:0}
+#side{grid-row:1;grid-column:2;overflow:auto;background:var(--panel);border:1px solid var(--line);padding:6px}
+#consolebox{grid-row:2;grid-column:1;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);min-height:0}
+#ctrl{grid-row:2;grid-column:2;overflow:auto;background:var(--panel);border:1px solid var(--line);padding:8px}
+#ctrl h3{margin:0 0 6px}
+.bar{display:flex;gap:12px;align-items:center;padding:5px 8px;border-bottom:1px solid var(--line)}
+#console{flex:1;overflow:auto;padding:6px 8px;font:12px/1.45 ui-monospace,Menlo,monospace}
+.fi{margin-bottom:3px}
+.fi .t{color:var(--dim);margin-right:6px}.fi .d{font-weight:700;margin-right:6px}
+.fi .tool{color:#9ad1ff;margin-right:6px}.fi .args{color:var(--dim);margin-right:8px}
+.fi .why{margin-left:22px;color:#b8c4d3}.fi .why.err{color:#e0a458}
+.fi .v{padding:0 6px;border-radius:8px;font-size:11px}
+.v.ACCEPTED{background:#1e5b3a}.v.REJECTED{background:#6b5410}.v.FALLBACK{background:#5a2323}
+.fi.event{color:var(--dim)}
+.b{padding:1px 8px;border-radius:9px;font-weight:600;font-size:11px;margin-left:4px;display:inline-block}
+.GREEN{background:#1e5b3a}.DEGRADED{background:#6b5410}.JAMMED{background:#7a2020}.UNKNOWN{background:#3b4654}
+.card{border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin-top:6px}
+.card .hd{display:flex;align-items:center;gap:4px;margin-bottom:3px}
+.sw{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}
+.row{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.row span{color:var(--dim)} .row b{font-weight:500;text-align:right}
+.btns{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+.r2{margin:6px 0}.small{font-size:12px;color:var(--dim)}
+button,select,input{background:#1d2735;color:var(--tx);border:1px solid #33425a;border-radius:4px;padding:3px 8px}
+input[type=number],input[size]{width:70px} input[size]{width:48px}
+button{cursor:pointer}button:hover{background:#26344a}button.danger{border-color:#8a2c2c}
+.lbl{color:#7d8da1;font:11px ui-monospace,monospace;white-space:nowrap}
+.dlbl{background:#0e131add;border:1px solid #33425a;color:#d7dee8;font:11px ui-monospace,monospace;padding:1px 4px}
+.tlbl{background:none;border:none;box-shadow:none;color:#aab6c5;font:10px ui-monospace,monospace;padding:0}
+.tlbl::before,.dlbl::before{display:none}
+#graph{width:100%;height:auto;background:#0c1118;border-radius:6px}
+#graph text{fill:#d7dee8;font:11px system-ui,sans-serif;text-anchor:middle}
+#graph .sub{fill:#8493a6;font-size:9px}
+```
+
+### 5.6.4. `docker/web-hud/static/app.js`
+
+```js
+"use strict";
+const COLORS = ["#4cc9f0","#f72585","#b5e48c","#ffd166","#c77dff","#ff9f1c","#06d6a0","#ef476f"];
+const EWC = {GREEN:"#2ecc71", DEGRADED:"#f1c40f", JAMMED:"#e74c3c", UNKNOWN:"#7f8c8d"};
+const TCOL = ["#e63946","#2ecc71","#4dabf7","#ffd166"];
+const LEVELS = [[30,"L1"],[50,"L2"],[80,"L3"],[100,"L4"]];
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = (v, d = 1) => (typeof v === "number" && isFinite(v)) ? v.toFixed(d) : "—";
+const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+
+let cfg = null, N = 5, map = null, ws = null;
+const M = {drone: {}, trail: {}, sigma: {}, link: {}, sec: [], pos: {}, taskLayer: null};
+const splitSeen = new Set();
+const FEED = [], seenN = new Set();
+
+// ───────────── старт ─────────────
+async function loadConfig() {
+  for (;;) {
+    try { const r = await fetch("/api/config"); if (r.ok) { cfg = await r.json(); return; } } catch (e) { /* retry */ }
+    setConn("ждёт scene.json", false);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+async function init() {
+  await loadConfig();
+  N = cfg.swarm_size;
+  buildMap(); buildGraph(); buildCtrl(); buildFilter();
+  setTimeout(() => map.invalidateSize(), 100);
+  connect();
+}
+
+function setConn(text, ok) { const e = $("conn"); e.textContent = "HUD " + text; e.className = "b " + (ok ? "GREEN" : "JAMMED"); }
+
+// ───────────── карта (Leaflet CRS.Simple: lat = y(север), lng = x(восток), метры) ─────────────
+function buildMap() {
+  const sc = cfg.scene, A = cfg.mission.search_area;
+  const xs = [A.x_min, A.x_max, ...sc.drones.map((d) => d.x_m)];
+  const ys = [A.y_min, A.y_max, ...sc.drones.map((d) => d.y_m)];
+  const b = [[Math.min(...ys) - 12, Math.min(...xs) - 12], [Math.max(...ys) + 12, Math.max(...xs) + 12]];
+  map = L.map("map", {crs: L.CRS.Simple, minZoom: -4, maxZoom: 5, zoomSnap: 0.25, attributionControl: false});
+  map.fitBounds(b);
+  const gx0 = Math.floor(b[0][1] / 10) * 10, gx1 = Math.ceil(b[1][1] / 10) * 10;
+  const gy0 = Math.floor(b[0][0] / 10) * 10, gy1 = Math.ceil(b[1][0] / 10) * 10;
+  const gs = {color: "#222c3a", weight: 1, interactive: false};
+  for (let x = gx0; x <= gx1; x += 10) L.polyline([[gy0, x], [gy1, x]], gs).addTo(map);
+  for (let y = gy0; y <= gy1; y += 10) L.polyline([[y, gx0], [y, gx1]], gs).addTo(map);
+
+  const {cols, rows} = cfg.mission.grid, cw = (A.x_max - A.x_min) / cols, rh = (A.y_max - A.y_min) / rows;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const p = r * cols + c, x0 = A.x_min + c * cw, y0 = A.y_min + r * rh;
+    M.sec[p] = L.rectangle([[y0, x0], [y0 + rh, x0 + cw]],
+      {color: "#5b6b7c", weight: 1, fillColor: "#5b6b7c", fillOpacity: 0.05, interactive: false}).addTo(map);
+    L.marker([y0 + rh - 3, x0 + 4], {icon: L.divIcon({className: "lbl", html: "S" + p, iconSize: [30, 14]}), interactive: false}).addTo(map);
+  }
+  for (const o of sc.obstacles) {
+    L.rectangle([[o.y_m - o.size_m[1] / 2, o.x_m - o.size_m[0] / 2], [o.y_m + o.size_m[1] / 2, o.x_m + o.size_m[0] / 2]],
+      {color: "#8d99ae", weight: 1, fillColor: "#8d99ae", fillOpacity: 0.5, interactive: false}).addTo(map);
+  }
+  sc.targets.forEach((t, i) => L.circle([t.y_m, t.x_m], {radius: t.radius_m, color: TCOL[i % 4], weight: 2,
+    fillColor: TCOL[i % 4], fillOpacity: 0.35, interactive: false}).addTo(map));
+
+  M.taskLayer = L.layerGroup().addTo(map);
+  for (let i = 1; i <= N; i++) {
+    const col = COLORS[i - 1], sp = sc.drones.find((d) => d.id === i) || {x_m: 0, y_m: 0};
+    const ll = [sp.y_m, sp.x_m];
+    M.trail[i] = L.polyline([], {color: col, weight: 2, opacity: 0.6, interactive: false}).addTo(map);
+    M.link[i] = L.polyline([], {color: col, weight: 1, dashArray: "2 6", opacity: 0.8, interactive: false}).addTo(map);
+    M.sigma[i] = L.circle(ll, {radius: 1, color: col, weight: 1, dashArray: "3 4", fillOpacity: 0, interactive: false}).addTo(map);
+    M.drone[i] = L.circleMarker(ll, {radius: 8, color: EWC.UNKNOWN, weight: 3, fillColor: col, fillOpacity: 0.3, opacity: 0.4}).addTo(map);
+    M.drone[i].bindTooltip("D" + i, {permanent: true, direction: "right", offset: [10, 0], className: "dlbl"});
+  }
+}
+
+function refDrone(s) {
+  let best = null;
+  for (const d of Object.values(s.drones)) {
+    if (!d.pkt || d.tele_age === null) continue;
+    if (!best || d.tele_age < best.tele_age) best = d;
+  }
+  return best;
+}
+
+function updateMap(s, ref) {
+  const doneAll = new Set(), exec = {};
+  for (const [k, d] of Object.entries(s.drones)) {
+    if (!d.pkt) continue;
+    for (const t of d.pkt.swarm.done || []) doneAll.add(t);
+    if (d.pkt.swarm.task_name) exec[d.pkt.swarm.task_name] = +k;
+  }
+  const open = ref ? (ref.pkt.swarm.open || []) : [];
+  for (const t of open) { const m = /^S(\d+)\./.exec(t.name); if (m) splitSeen.add(+m[1]); }
+  for (const n of Object.keys(exec)) { const m = /^S(\d+)\./.exec(n); if (m) splitSeen.add(+m[1]); }
+
+  for (let p = 0; p < M.sec.length; p++) {
+    let st = {color: "#5b6b7c", fillColor: "#5b6b7c", fillOpacity: 0.05, weight: 1, dashArray: splitSeen.has(p) ? "4 3" : null};
+    const who = Object.keys(exec).find((n) => n === "S" + p || n.startsWith("S" + p + "."));
+    if (doneAll.has(p) && !splitSeen.has(p)) st = {...st, color: "#2ecc71", fillColor: "#2ecc71", fillOpacity: 0.18};
+    else if (who !== undefined) { const c = COLORS[exec[who] - 1]; st = {...st, color: c, fillColor: c, fillOpacity: 0.15, weight: 2}; }
+    M.sec[p].setStyle(st);
+  }
+
+  M.taskLayer.clearLayers();
+  for (const t of open) {
+    const owner = exec[t.name], col = owner ? COLORS[owner - 1] : (t.kind === "TARGET" ? TCOL[(t.id - 6) % 4] : "#8493a6");
+    L.circleMarker([t.cy, t.cx], {radius: t.kind === "TARGET" ? 6 : 4, color: col, weight: 2, fillColor: col, fillOpacity: 0.5, interactive: false})
+      .bindTooltip(t.name, {permanent: true, direction: "top", offset: [0, -4], className: "tlbl"}).addTo(M.taskLayer);
+  }
+
+  for (let i = 1; i <= N; i++) {
+    const d = s.drones[i], p = d && d.pkt;
+    if (!p) continue;
+    const st = ewOf(s, i).status || "UNKNOWN", [x, y, z] = p.pos, ll = [y, x];
+    const stale = d.tele_age === null || d.tele_age > 3, n = p.nav;
+    M.drone[i].setLatLng(ll).setStyle({color: EWC[st] || EWC.UNKNOWN, fillOpacity: stale ? 0.3 : 0.9, opacity: stale ? 0.4 : 1});
+    M.drone[i].setTooltipContent(esc(`D${i} ${fmt(z)}м ${n.src || "?"}${n.gps_suspect ? " ⚠GPS" : ""}`));
+    M.sigma[i].setLatLng(ll).setRadius(Math.max(0.5, n.sigma || 0))
+      .setStyle({color: n.gps_suspect ? "#e74c3c" : COLORS[i - 1], weight: n.gps_suspect ? 2 : 1});
+    const tr = M.trail[i], pts = tr.getLatLngs(), lp = pts[pts.length - 1];
+    if (!lp || Math.hypot(lp.lat - y, lp.lng - x) > 0.3) { pts.push(L.latLng(y, x)); if (pts.length > 200) pts.shift(); tr.setLatLngs(pts); }
+    const tk = open.find((o) => o.name === p.swarm.task_name);
+    M.link[i].setLatLngs(tk ? [ll, [tk.cy, tk.cx]] : []);
+  }
+}
+
+// ───────────── граф связности ─────────────
+function buildGraph() {
+  const cx = 130, cy = 105, R = 78;
+  let h = "";
+  for (let i = 1; i <= N; i++) { const a = -Math.PI / 2 + 2 * Math.PI * (i - 1) / N; M.pos[i] = [cx + R * Math.cos(a), cy + R * Math.sin(a)]; }
+  for (let i = 1; i <= N; i++) for (let j = i + 1; j <= N; j++) {
+    const [x1, y1] = M.pos[i], [x2, y2] = M.pos[j];
+    h += `<line id="e${i}-${j}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#333" stroke-width="1"><title></title></line>`;
+  }
+  for (let i = 1; i <= N; i++) {
+    const [x, y] = M.pos[i];
+    h += `<g id="n${i}"><circle cx="${x}" cy="${y}" r="17" fill="${COLORS[i - 1]}" fill-opacity="0.25" stroke="#7f8c8d" stroke-width="4"/>` +
+         `<text x="${x}" y="${y + 4}">D${i}</text><text class="sub" x="${x}" y="${y + 29}">q —</text></g>`;
+  }
+  $("graph").innerHTML = h;
+}
+
+function updateGraph(s) {
+  const heard = (i) => { const d = s.drones[i]; return d && d.pkt && d.tele_age !== null && d.tele_age < 3 ? new Set(d.pkt.mesh.heard) : null; };
+  const q = (i, j) => { const d = s.drones[i]; const p = d && d.pkt && d.pkt.swarm.peers[String(j)]; return p ? p.q : 0; };
+  for (let i = 1; i <= N; i++) for (let j = i + 1; j <= N; j++) {
+    const hi = heard(i), hj = heard(j), a = hi ? hi.has(j) : null, b = hj ? hj.has(i) : null;
+    const e = $(`e${i}-${j}`);
+    let col = "#333", w = 1, dash = "3 3", tip = "нет телеметрии";
+    if (a === null && b === null) { /* значения по умолчанию */ }
+    else if (a && b) { col = "#2ecc71"; w = 1 + 3 * (q(i, j) + q(j, i)) / 2; dash = ""; tip = `двусторонняя связь (q ${fmt(q(i, j), 2)} / ${fmt(q(j, i), 2)})`; }
+    else if (a || b) { col = "#f39c12"; w = 2; dash = "6 4"; tip = a ? `D${i} слышит D${j}, обратно нет` : `D${j} слышит D${i}, обратно нет`; }
+    else { col = "#c0392b"; w = 1; dash = "2 4"; tip = "связи нет"; }
+    e.setAttribute("stroke", col); e.setAttribute("stroke-width", w.toFixed(1)); e.setAttribute("stroke-dasharray", dash);
+    e.firstChild.textContent = `D${i}–D${j}: ${tip}`;
+  }
+  for (let i = 1; i <= N; i++) {
+    const d = s.drones[i], g = $("n" + i); if (!g) continue;
+    const st = ewOf(s, i).status || "UNKNOWN", stale = !d || !d.pkt || d.tele_age === null || d.tele_age > 3;
+    g.querySelector("circle").setAttribute("stroke", EWC[st] || EWC.UNKNOWN);
+    g.setAttribute("opacity", stale ? 0.4 : 1);
+    g.querySelector(".sub").textContent = d && d.pkt ? "q " + fmt(d.pkt.mesh.link_q, 2) : "q —";
+  }
+}
+
+// ───────────── карточки бортов ─────────────
+const ewOf = (s, i) => (s.ew && s.ew.drones && s.ew.drones[i]) || {};
+const badge = (t, c) => `<span class="b ${c}">${esc(t)}</span>`;
+const row = (k, v) => `<div class="row"><span>${k}</span><b>${v}</b></div>`;
+
+function meshLabel(m) {
+  if (!m || !m.active) return "норма";
+  const p = m.profile || {}, lv = LEVELS.find((l) => l[0] === Math.round(p.loss_pct));
+  return `${lv ? lv[1] : "custom"} · loss ${p.loss_pct}% · ${p.delay_ms}±${p.jitter_ms} мс · ${p.rate_kbit ?? "∞"} кбит/с`;
+}
+
+function cardHtml(i, d, ew) {
+  const st = ew.status || "UNKNOWN", p = d && d.pkt, c2 = d ? d.c2 : {state: "NO_LINK"};
+  let h = `<div class="hd"><i class="sw" style="background:${COLORS[i - 1]}"></i><b>D${i}</b>${badge(st, st)}` +
+    badge(c2.state === "OK" ? "C2 OK" : (c2.state === "LOST" ? "C2 LINK LOST" : "C2 —"), c2.state === "OK" ? "GREEN" : (c2.state === "LOST" ? "JAMMED" : "UNKNOWN"));
+  if (!p || d.tele_age === null || d.tele_age > 3) h += badge("NO TELEMETRY", "UNKNOWN");
+  h += "</div>";
+  if (!p) return h;
+  const n = p.nav, m = p.mesh, sw = p.swarm, l = p.llm || {}, ls = l.stats || {}, g = ew.gps || {}, gb = ew.gps_bridge || {};
+  let gps = `fix ${n.gps_fix}`;
+  if (g.active) gps += ` · ${g.mode}`;
+  if (gb.mode && gb.mode !== "pass") gps += ` · ${gb.mode} Δ${fmt(gb.bias_north_m, 0)}N/${fmt(gb.bias_east_m, 0)}E`;
+  if (n.gps_suspect) gps += " · ⚠ SUSPECT";
+  h += row("GPS", esc(gps));
+  h += row("NAV", esc(`${n.state} · ${n.src} · σ ${fmt(n.sigma)} м · alt ${fmt(p.pos[2])} м`));
+  h += row("Препятствие", n.obst_min < 50 ? esc(fmt(n.obst_min) + " м") : "—");
+  h += row("Задача", esc(`${sw.task_name || "—"} · эпоха ${sw.epoch} · готово ${sw.done.length}/${sw.total_tasks}`));
+  h += row("Mesh", esc(`q ${fmt(m.link_q, 2)} · peers ${m.zenoh_peers} · ${meshLabel(ew.mesh)}`));
+  h += row("LLM", esc(`${ls.calls || 0} выз. (✔${ls.accepted || 0} ✘${ls.rejected || 0} ⚠${ls.failed || 0}) · ${l.last_latency_ms ?? "—"} мс`));
+  return h;
+}
+
+function updateCards(s) {
+  const box = $("cards");
+  if (!box.childElementCount) for (let i = 1; i <= N; i++) { const c = mk("div", "card"); c.id = "card" + i; box.append(c); }
+  for (let i = 1; i <= N; i++) $("card" + i).innerHTML = cardHtml(i, s.drones[i], ewOf(s, i));
+}
+
+// ───────────── верхняя панель ─────────────
+function updateTop(s, ref) {
+  const ew = s.ew, ok = s.ew_ok, st = ok && ew ? ew.overall : "UNKNOWN", e = $("ewb");
+  e.textContent = ok ? "EW: " + st : "EW-CONTROLLER OFFLINE";
+  e.className = "b " + (EWC[st] ? st : "UNKNOWN");
+  $("top").className = ok && st === "JAMMED" ? "jam" : "";
+  const sc = ok && ew ? ew.scenario : null;
+  $("scn-st").textContent = sc && sc.running ? `сценарий ${sc.name} · ${fmt(sc.elapsed_s, 0)} с` : "";
+  if (ref) {
+    const sw = ref.pkt.swarm;
+    $("kpi").textContent = `эпоха ${sw.epoch} · задач готово ${sw.done.length}/${sw.total_tasks} · живых бортов ${sw.alive.length}`;
+  } else $("kpi").textContent = "нет телеметрии";
+}
+
+function render(s) {
+  const ref = refDrone(s);
+  updateTop(s, ref); updateMap(s, ref); updateGraph(s); updateCards(s);
+}
+
+// ───────────── консоль ─────────────
+let fDrone = "all", fEv = true;
+const vis = (f) => (fDrone === "all" || +fDrone === f.drone) && (f.kind !== "event" || fEv);
+
+function feedEl(f) {
+  const e = mk("div", "fi " + f.kind);
+  const d = mk("span", "d", "D" + f.drone); d.style.color = COLORS[(f.drone - 1) % COLORS.length];
+  e.append(mk("span", "t", `[${fmt(f.t, 0)}s]`), d);
+  if (f.kind === "llm") {
+    const lat = f.latency_ms != null ? ` ${(f.latency_ms / 1000).toFixed(1)}с` : "";
+    e.append(mk("span", "tool", f.tool || "—"), mk("span", "args", f.args ? JSON.stringify(f.args) : ""),
+             mk("span", "v " + f.verdict, (f.verdict || "?") + lat));
+    if (f.reasoning) e.append(mk("div", "why", "« " + f.reasoning + " »"));
+    if (f.reason) e.append(mk("div", "why err", "⤷ " + f.reason));
+  } else e.append(mk("span", "ev", "• " + f.text));
+  return e;
+}
+
+function addFeed(items) {
+  const box = $("console");
+  for (const f of items) {
+    if (seenN.has(f.n)) continue;
+    seenN.add(f.n); FEED.push(f);
+    if (vis(f)) box.append(feedEl(f));
+  }
+  while (FEED.length > 600) FEED.shift();
+  while (box.childElementCount > 600) box.firstChild.remove();
+  if ($("autoscroll").checked) box.scrollTop = box.scrollHeight;
+}
+
+function rerender() { $("console").replaceChildren(...FEED.filter(vis).map(feedEl)); }
+
+function buildFilter() {
+  const s = $("fdrone");
+  s.append(new Option("все борты", "all"));
+  for (let i = 1; i <= N; i++) s.append(new Option("D" + i, String(i)));
+  s.onchange = () => { fDrone = s.value; rerender(); };
+  $("showEv").onchange = (e) => { fEv = e.target.checked; rerender(); };
+}
+
+// ───────────── управление РЭБ ─────────────
+const num = (id) => { const v = parseFloat($(id).value); return isFinite(v) ? v : 0; };
+const dur = () => { const v = parseFloat($("dur").value); return v > 0 ? v : null; };
+function selDrones() {
+  const ids = [...document.querySelectorAll("#dsel input:checked")].map((e) => +e.value);
+  return ids.length === 0 || ids.length === N ? null : ids;
+}
+const countBad = (o) => (o && typeof o === "object") ? (o.ok === false ? 1 : 0) + Object.values(o).reduce((a, v) => a + countBad(v), 0) : 0;
+
+async function ew(name, body) {
+  const m = $("ewmsg"); m.textContent = "…";
+  try {
+    const r = await fetch("/api/ew/" + name, {method: "POST", headers: {"Content-Type": "application/json", "X-HUD": "1"}, body: JSON.stringify(body || {})});
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) m.textContent = `ошибка ${r.status}: ${String(data.detail || data.error || "").slice(0, 120)}`;
+    else { const bad = countBad(data); m.textContent = bad ? `выполнено, ошибок у агентов: ${bad}` : "OK"; }
+  } catch (e) { m.textContent = "сеть: " + e; }
+}
+
+async function loadScenarios() {
+  try {
+    const r = await fetch("/api/ew/scenarios"); if (!r.ok) return;
+    const list = await r.json(), s = $("scn"); s.replaceChildren();
+    for (const x of list) s.append(new Option(`${x.name} (${x.steps})`, x.name));
+  } catch (e) { /* ew-controller ещё не поднят */ }
+}
+
+function buildCtrl() {
+  const ds = $("dsel");
+  for (let i = 1; i <= N; i++) {
+    const l = mk("label"); const c = mk("input"); c.type = "checkbox"; c.value = String(i); c.checked = true;
+    l.append(c, document.createTextNode(" D" + i + "  ")); ds.append(l);
+  }
+  $("c2cut").onclick = () => ew("c2", {drones: selDrones(), duration_s: dur(), include_onboard: $("onb").checked});
+  $("c2res").onclick = () => ew("restore", {channel: "c2", drones: selDrones()});
+  $("gps").onclick = () => ew("gps", {mode: $("gmode").value, drones: selDrones(), duration_s: dur(),
+    rate_mps: num("rate"), heading_deg: num("head"), target_north_m: num("tn"), target_east_m: num("te")});
+  $("gpsres").onclick = () => ew("restore", {channel: "gps", drones: selDrones()});
+  document.querySelectorAll("button[data-lvl]").forEach((b) => b.onclick = () => ew("mesh", {level: b.dataset.lvl, drones: selDrones(), duration_s: dur()}));
+  $("meshres").onclick = () => ew("restore", {channel: "mesh", drones: selDrones()});
+  $("reset").onclick = () => ew("restore", {channel: "all", drones: null});
+  $("scnrun").onclick = () => $("scn").value && ew("scenario_run", {name: $("scn").value});
+  $("scnstop").onclick = () => ew("scenario_stop", {restore: true});
+  loadScenarios(); setInterval(loadScenarios, 15000);
+}
+
+// ───────────── WebSocket ─────────────
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { setConn("online", true); FEED.length = 0; seenN.clear(); $("console").replaceChildren(); };
+  ws.onclose = () => { setConn("offline", false); setTimeout(connect, 1500); };
+  ws.onmessage = (e) => { const m = JSON.parse(e.data); render(m.state); if (m.feed.length) addFeed(m.feed); };
+}
+
+init();
+```
+
+## 5.7. Правила отображения
+
+| Элемент | Правило |
+|---|---|
+| Рамка маркера борта | цвет статуса РЭБ из `ew-controller` (GREEN / DEGRADED / JAMMED / серый UNKNOWN) |
+| Маркер борта | полупрозрачный, если телеметрия старше 3 с |
+| Пунктирный круг вокруг борта | радиус = `nav.sigma` (м); красный при `gps_suspect` |
+| Пунктир от борта к задаче | текущая исполняемая задача (`task_name`) |
+| Сектор на карте | зелёный, если выполнен; цвет борта-исполнителя, если исполняется; штриховая рамка, если сектор делился (дочерние части показаны точками-задачами) |
+| Метки задач | открытые задачи по данным самого свежего борта; выполненные определяются объединением `done` по всем бортам |
+| Ребро графа | зелёное сплошное: двусторонний приём, толщина по среднему `q`. Оранжевый пунктир: слышит только одна сторона. Красное точечное: связи нет. Серое: нет телеметрии. |
+| Рамка узла графа | статус РЭБ борта; подпись `q` это `link_q` борта |
+| Индикатор C2 | `C2 OK` при HEARTBEAT моложе 3 с; `C2 LINK LOST` иначе; `C2 —`, если борт ни разу не отвечал |
+| Верхняя панель | общий статус РЭБ (мигает красным при JAMMED), активный сценарий, эпоха, готово/всего задач, число живых бортов; бейдж `EW-CONTROLLER OFFLINE`, если опрос не удаётся |
+| Консоль | `[t с] Dn tool args  ВЕРДИКТ время` и строка «рассуждения»; REJECTED показывает причину валидатора, FALLBACK показывает причину сбоя LLM (рой при этом продолжает работать по правилам) |
+
+Окно «слышит» в графе совпадает с `heard_mask` бортового стека: `max(5 с, 3·период Heartbeat)`, то есть при L4 рёбра гаснут за 6-8 с с учётом периода телеметрии.
+
+## 5.8. Тестовый генератор телеметрии: `scripts/fake_swarm.py`
+
+Позволяет проверить HUD без полного симулятора. Достаточно `docker compose up -d simulator-core web-hud`: `simulator-core` пишет `scene.json`, остальные контейнеры не нужны. Запуск: `EW_TOKEN=$(grep ^EW_TOKEN .env | cut -d= -f2) python3 scripts/fake_swarm.py --jam-after 30`.
+
+```python
+#!/usr/bin/env python3
+"""fake_swarm.py — синтетическая телеметрия N бортов для проверки HUD (схема п. 4.11).
+--jam-after S: через S секунд борты «перестают слышать» друг друга, у борта 1 пропадает GPS."""
+import argparse
+import json
+import math
+import os
+import time
+import urllib.request
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--url", default="http://127.0.0.1:8000")
+ap.add_argument("--n", type=int, default=5)
+ap.add_argument("--jam-after", type=float, default=0.0)
+a = ap.parse_args()
+TOKEN = os.environ["EW_TOKEN"]
+T0 = time.time()
+OPEN = [{"id": p, "name": f"S{p}", "kind": "SECTOR", "cx": 18.3 + 16.7 * (p % 3), "cy": -13.75 + 32.5 * (p // 3),
+         "area": 542, "splittable": True} for p in range(6)]
+
+
+def packet(i: int, t: float) -> dict:
+    jam = bool(a.jam_after) and t > a.jam_after
+    ang = 0.08 * t + i
+    x, y, z = 35 + 18 * math.cos(ang) + 3 * (i - 3), 3 + 20 * math.sin(ang), 3 + 0.8 * (i - 1)
+    others = [k for k in range(1, a.n + 1) if k != i]
+    peers = {str(k): {"alive": not jam, "declared_failed": False, "silent_s": 20.0 if jam else 0.3,
+                      "q": 0.1 if jam else 0.9, "x": 0, "y": 0, "z": 3, "task": 255, "state": 2, "flags": 0,
+                      "epoch": 3, "heard": []} for k in others}
+    gps_lost = jam and i == 1
+    nav = {"seq": 1, "idx": 0, "done": False, "state": "NAV", "phase": "FLY", "x": x, "y": y, "z": z, "vx": 1.0, "vy": 0.0,
+           "hdg": 0.0, "src": "VIO" if gps_lost else "PX4", "sigma": 6.0 if gps_lost else 1.5,
+           "gps_fix": 0 if gps_lost else 3, "gps_suspect": False, "vio_ok": True, "xy_valid": True, "armed": True,
+           "obst_min": 99.0}
+    ths = [{"id": k, "t": k * 15, "trigger": "SCAN_TARGET", "reasoning": "<b>test</b> open target, drone idle",
+            "tool": "SCAN_TARGET", "args": {"target": 0}, "verdict": "ACCEPTED" if k % 2 else "REJECTED",
+            "reason": "" if k % 2 else "tool not in legal list", "latency_ms": 3000 + 100 * i}
+           for k in range(1, int(t // 15) + 1)][-20:]
+    evs = [[k * 20.0, f"fake event {k}"] for k in range(1, int(t // 20) + 1)][-10:]
+    return {"v": 1, "drone": i, "ts": time.time(), "pos": [x, y, z], "nav": nav,
+            "swarm": {"epoch": 3, "task_name": f"S{(i - 1) % 6}", "winners": {}, "done": [], "open": OPEN,
+                      "alive": [i] if jam else list(range(1, a.n + 1)), "peers": peers, "events": evs,
+                      "withdrawn": False, "last_cmd": None, "total_tasks": 9},
+            "mesh": {"link_q": 0.1 if jam else 0.9, "periods": {"hb": 0.5, "claim": 1.0, "alloc": 2.0, "rate_Bps": 1500},
+                     "heard": [] if jam else others, "ready": True, "tuned": True, "zenoh_peers": 0 if jam else a.n - 1,
+                     "dropped": {"hb": 0, "claim": 0, "alloc": 0, "fail": 0}, "bad_tag": 0, "tx_bytes": {}},
+            "llm": {"stats": {"calls": len(ths), "accepted": len(ths) // 2, "rejected": len(ths) // 2, "failed": 0},
+                    "last_latency_ms": 3100, "model": "qwen2.5-0.5b-instruct-q4_k_m"},
+            "thoughts": ths}
+
+
+while True:
+    t = time.time() - T0
+    for i in range(1, a.n + 1):
+        req = urllib.request.Request(f"{a.url}/api/ingest/{i}", json.dumps(packet(i, t)).encode(),
+                                     {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"})
+        try:
+            urllib.request.urlopen(req, timeout=2).read()
+        except Exception as e:  # noqa: BLE001
+            print("post failed:", e)
+    time.sleep(0.5)
+```
+
+В тексте рассуждения умышленно есть `<b>test</b>`: консоль обязана показать его как текст, а не как разметку.
+
+## 5.9. Критерии приёмки раздела
+
+| № | Критерий | Метод проверки |
+|---|---|---|
+| E1 | Образ собирается, `GET /healthz` = 200, страница открывается на `http://127.0.0.1:8000`; порт 8000 недоступен с другой машины (U13) | `docker compose build web-hud`; `curl` с хоста и с соседнего узла |
+| E2 | С `fake_swarm.py`: 5 маркеров движутся, карточки показывают GPS/NAV/задачу/mesh/LLM, возраст телеметрии < 1,5 с | браузер, `GET /api/state` |
+| E3 | `ewctl c2 cut 2`: борт 2 получает статус JAMMED за ≤ 2 с, `C2 LINK LOST` за ≤ 5 с, общий статус JAMMED (верхняя панель мигает). После `restore` `C2 OK` за ≤ 5 с | HUD на боевом стеке |
+| E4 | Граф: `mesh L4` на всех бортах, рёбра становятся красными за ≤ 10 с; после `restore` зелёными за ≤ 20 с. При `peers`-деградации одной пары (`POST /v1/ew/mesh` с `peers`) ребро становится оранжевым | HUD, `ewctl` |
+| E5 | `gps denied 1`: в карточке D1 `fix 0 · denied`, `src` меняется на VIO/DR за ≤ 3 с. `gps drift 3`: вокруг D3 красный круг и `⚠ SUSPECT` за ≤ 20 с, в карточке виден `drift Δ…N/…E` | HUD |
+| E6 | Консоль показывает решение LLM: инструмент, аргументы, вердикт, задержку, «рассуждение»; фильтр по борту и переключатель событий работают; строка с `<b>test</b>` выводится как текст; записи не дублируются при росте окна телеметрии (U14) | `fake_swarm.py`; боевой стек |
+| E7 | Безопасность прокси: POST `/api/ew/c2` без `X-HUD` → 403; с чужим `Origin` → 403; `/api/ew/unknown` → 404; WS с чужим `Origin` закрывается (1008) | `curl -H` |
+| E8 | Ingest: без токена 401; неверная схема 422; пакет с `NaN` принимается, в WS уходит `null` и страница не падает (U16) | `curl` |
+| E9 | Устойчивость: остановка `ew-injector` → бейдж `EW-CONTROLLER OFFLINE` за ≤ 5 с, карта и консоль продолжают работать; перезапуск `web-hud` → страница переподключается за ≤ 5 с, консоль очищается и наполняется заново | `docker compose stop ew-injector` / `restart web-hud` |
+| E10 | Ресурсы: 5 бортов телеметрии + 1 браузер: CPU `web-hud` < 0,5 vCPU, RAM < 256 MiB, размер WS-кадра ≤ 64 КБ | `docker stats`, DevTools |
+| E11 | Ответы содержат заголовок `Content-Security-Policy` и `X-Content-Type-Options` | `curl -I` |
+| E12 | Сценарий `04_full_ew` запускается кнопкой, в верхней панели идёт время сценария, статусы бортов совпадают с `GET /v1/state` контроллера | HUD, `ewctl state` |
+
+## 5.10. Точки риска
+
+Раздел написан без возможности собрать и запустить HUD в этой среде.
+
+| Место | Ожидание | Признак | Действие |
+|---|---|---|---|
+| Сборка `curl` с `unpkg.com` | доступен при `docker build` | сборка падает на `curl -f` | положить `leaflet.js` и `leaflet.css` 1.9.4 в `docker/web-hud/static/vendor/` и убрать `RUN curl` |
+| `L.circle` в `CRS.Simple` | радиус в «метрах» карты (единицах CRS) | круг σ слишком мал или велик | заменить на `L.circleMarker` с радиусом в пикселях, пересчитанным по `map.getZoom()` |
+| Приём MAVLink от 5 источников на одном `udpin`-порту | pymavlink разбирает пакеты всех отправителей по `sysid` | `NO_LINK` у части бортов при живых HEARTBEAT | проверить `tcpdump -ni <c2> udp port 14550`; запасной вариант: свой `socket` + `mavlink.MAVLink.parse_char` на каждый адрес источника |
+| HEARTBEAT от PX4 проходит `mavlink-router` | `[UdpEndpoint gcs]` получает все сообщения FC | HUD всегда `LOST` | в `main.conf` проверить `Mode`, `Address`, `Port`; временно сделать `gcs` серверным endpoint'ом |
+| Поле `heard` | список ID, услышанных за `max(5 с, 3·hb)` | граф «мигает» на L2/L3 | ожидаемо при потерях; сглаживание на стороне JS (удержание ребра 2 с) добавляется при необходимости |
+| Телеметрия при потере `mgmt-net` | канал РЭБ не затрагивается | все борты сразу NO TELEMETRY | проверить `HUD_URL`, токен и сеть (`curl` из `drone-agent-N`) |
+| `scene.json` пуст при старте | `simulator-core` healthy ⇒ файл есть | `/api/config` отвечает 503 | страница повторяет запрос каждые 2 с; после смены `SWARM_SIZE` перезапустить `web-hud` |
+| Объём WS-кадра | ≈ 20-30 КБ при 5 бортах | кадр > 64 КБ | урезать `peers` в телеметрии или снизить частоту снимка до 1 Гц |
+
+---

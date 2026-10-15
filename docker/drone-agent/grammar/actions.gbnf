@@ -1,0 +1,13 @@
+root     ::= "{" ws "\"reasoning\":" ws text "," ws "\"tool\":" ws call ws "}"
+call     ::= navigate | scan | split | failover | hold | home
+navigate ::= "\"NAVIGATE_TO\"," ws "\"args\":" ws "{" ws "\"x\":" ws num "," ws "\"y\":" ws num ws "}"
+scan     ::= "\"SCAN_TARGET\"," ws "\"args\":" ws "{" ws "\"target\":" ws dig ws "}"
+split    ::= "\"SPLIT_SECTOR\"," ws "\"args\":" ws "{" ws "\"sector\":" ws dig "," ws "\"parts\":" ws ("2" | "3") ws "}"
+failover ::= "\"DECLARE_FAILOVER\"," ws "\"args\":" ws "{" ws "\"failed\":" ws dig "," ws "\"reason\":" ws reason ws "}"
+hold     ::= "\"HOLD_POSITION\"," ws "\"args\":" ws "{}"
+home     ::= "\"RETURN_HOME\"," ws "\"args\":" ws "{}"
+reason   ::= "\"NO_HEARTBEAT\"" | "\"GPS_LOST\"" | "\"LINK_DEGRADED\"" | "\"NAV_DRIFT\""
+text     ::= "\"" [^"\\\x7F\x00-\x1F]{1,140} "\""
+num      ::= "-"? [0-9]{1,3} ("." [0-9]{1,2})?
+dig      ::= [0-9]
+ws       ::= " "?

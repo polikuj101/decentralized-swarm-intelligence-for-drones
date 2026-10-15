@@ -1,0 +1,193 @@
+name: swarm-sitl
+
+x-agent: &agent
+  build:
+    context: ./docker/drone-agent
+    args:
+      QWEN_VARIANT: "0.5b"            # "0.5b" | "1.5b"
+  image: swarm/drone-agent:latest
+  cap_add: [NET_ADMIN]
+  mem_swappiness: 0
+  memswap_limit: 2g
+  mem_limit: 2g
+  cpus: "4.0"
+  pids_limit: 512
+  restart: unless-stopped
+  depends_on:
+    simulator-core: { condition: service_healthy }
+
+x-fc: &fc
+  build:
+    context: ./docker/px4-sitl
+  image: swarm/px4-sitl:1.15
+  cpus: "1.0"
+  mem_limit: 1g
+  restart: unless-stopped
+  depends_on:
+    simulator-core: { condition: service_healthy }
+
+services:
+  simulator-core:
+    build:
+      context: ./docker/simulator-core
+    image: swarm/simulator-core:latest
+    cpus: "6.0"
+    mem_limit: 8g
+    restart: unless-stopped
+    environment:
+      GZ_PARTITION: swarm
+      GZ_IP: 172.30.0.2
+      SWARM_SIZE: "5"
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.2 }
+      mgmt-net: { ipv4_address: 172.33.0.3 }
+    healthcheck:
+      test: ["CMD-SHELL", "gz topic -l | grep -q \"/world/swarm_world/model/x500_swarm_$$SWARM_SIZE/link/base_link/sensor/imu_sensor/imu\""]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  fc-1:
+    <<: *fc
+    environment: { PX4_INSTANCE: "0", PX4_SYS_ID: "1", PX4_GZ_MODEL_NAME: x500_swarm_1, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.11 }
+    networks: { sim-net: { ipv4_address: 172.30.0.11 } }
+  fc-2:
+    <<: *fc
+    environment: { PX4_INSTANCE: "1", PX4_SYS_ID: "2", PX4_GZ_MODEL_NAME: x500_swarm_2, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.12 }
+    networks: { sim-net: { ipv4_address: 172.30.0.12 } }
+  fc-3:
+    <<: *fc
+    environment: { PX4_INSTANCE: "2", PX4_SYS_ID: "3", PX4_GZ_MODEL_NAME: x500_swarm_3, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.13 }
+    networks: { sim-net: { ipv4_address: 172.30.0.13 } }
+  fc-4:
+    <<: *fc
+    environment: { PX4_INSTANCE: "3", PX4_SYS_ID: "4", PX4_GZ_MODEL_NAME: x500_swarm_4, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.14 }
+    networks: { sim-net: { ipv4_address: 172.30.0.14 } }
+  fc-5:
+    <<: *fc
+    environment: { PX4_INSTANCE: "4", PX4_SYS_ID: "5", PX4_GZ_MODEL_NAME: x500_swarm_5, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.15 }
+    networks: { sim-net: { ipv4_address: 172.30.0.15 } }
+
+  drone-agent-1:
+    <<: *agent
+    hostname: drone-agent-1
+    environment: { DRONE_ID: "1", PX4_INSTANCE: "0", FC_ADDR: 172.30.0.11, XRCE_PORT: "8888", MAVLINK_ONBOARD_PORT: "14540", PEERS: "172.31.0.12,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.11 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.21 }
+      mesh-net: { ipv4_address: 172.31.0.11 }
+      c2-net:   { ipv4_address: 172.32.0.11 }
+      mgmt-net: { ipv4_address: 172.33.0.11 }
+  drone-agent-2:
+    <<: *agent
+    hostname: drone-agent-2
+    environment: { DRONE_ID: "2", PX4_INSTANCE: "1", FC_ADDR: 172.30.0.12, XRCE_PORT: "8889", MAVLINK_ONBOARD_PORT: "14541", PEERS: "172.31.0.11,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.12 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.22 }
+      mesh-net: { ipv4_address: 172.31.0.12 }
+      c2-net:   { ipv4_address: 172.32.0.12 }
+      mgmt-net: { ipv4_address: 172.33.0.12 }
+  drone-agent-3:
+    <<: *agent
+    hostname: drone-agent-3
+    environment: { DRONE_ID: "3", PX4_INSTANCE: "2", FC_ADDR: 172.30.0.13, XRCE_PORT: "8890", MAVLINK_ONBOARD_PORT: "14542", PEERS: "172.31.0.11,172.31.0.12,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.13 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.23 }
+      mesh-net: { ipv4_address: 172.31.0.13 }
+      c2-net:   { ipv4_address: 172.32.0.13 }
+      mgmt-net: { ipv4_address: 172.33.0.13 }
+  drone-agent-4:
+    <<: *agent
+    hostname: drone-agent-4
+    environment: { DRONE_ID: "4", PX4_INSTANCE: "3", FC_ADDR: 172.30.0.14, XRCE_PORT: "8891", MAVLINK_ONBOARD_PORT: "14543", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.15", SELF_MESH_IP: 172.31.0.14 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.24 }
+      mesh-net: { ipv4_address: 172.31.0.14 }
+      c2-net:   { ipv4_address: 172.32.0.14 }
+      mgmt-net: { ipv4_address: 172.33.0.14 }
+  drone-agent-5:
+    <<: *agent
+    hostname: drone-agent-5
+    environment: { DRONE_ID: "5", PX4_INSTANCE: "4", FC_ADDR: 172.30.0.15, XRCE_PORT: "8892", MAVLINK_ONBOARD_PORT: "14544", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.14", SELF_MESH_IP: 172.31.0.15 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.25 }
+      mesh-net: { ipv4_address: 172.31.0.15 }
+      c2-net:   { ipv4_address: 172.32.0.15 }
+      mgmt-net: { ipv4_address: 172.33.0.15 }
+
+  ew-injector:
+    build: { context: ./docker/ew-injector }
+    image: swarm/ew-injector:latest
+    cpus: "0.5"
+    mem_limit: 256m
+    restart: unless-stopped
+    environment:
+      AGENT_URLS: "http://172.33.0.11:9090,http://172.33.0.12:9090,http://172.33.0.13:9090,http://172.33.0.14:9090,http://172.33.0.15:9090"
+      SIM_BRIDGE_URL: "http://172.33.0.3:9100"
+    networks:
+      mgmt-net: { ipv4_address: 172.33.0.2 }
+
+  web-hud:
+    build: { context: ./docker/web-hud }
+    image: swarm/web-hud:latest
+    cpus: "1.0"
+    mem_limit: 512m
+    restart: unless-stopped
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      EW_URL: "http://172.33.0.2:8080"
+    networks:
+      ui-net:   {}
+      c2-net:   { ipv4_address: 172.32.0.2 }
+      mgmt-net: { ipv4_address: 172.33.0.5 }
+
+networks:
+  sim-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.30.0.0/24, gateway: 172.30.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-sim
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "simulation" }
+
+  mesh-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.31.0.0/24, gateway: 172.31.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-mesh
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "p2p-mesh", swarm.ew: "netem" }
+
+  c2-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.32.0.0/24, gateway: 172.32.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-c2
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "c2-link", swarm.ew: "nft" }
+
+  mgmt-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.33.0.0/24, gateway: 172.33.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-mgmt
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "management" }
+
+  ui-net:
+    driver: bridge
+    ipam: { config: [{ subnet: 172.34.0.0/24, gateway: 172.34.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-ui

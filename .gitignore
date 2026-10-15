@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+logs/
+docker/drone-agent/models/embed/*
+!docker/drone-agent/models/embed/.gitkeep
+Swarm

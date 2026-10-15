@@ -1,0 +1,8 @@
+name: mesh_degradation
+description: Ступенчатое ухудшение межбортовой связи L1 -> L2 -> L3 -> блэкаут, затем восстановление
+steps:
+  - {at: 10,  action: mesh, params: {level: L1}}
+  - {at: 40,  action: mesh, params: {level: L2}}
+  - {at: 70,  action: mesh, params: {level: L3}}
+  - {at: 100, action: mesh, params: {level: L4, duration_s: 20}}
+  - {at: 130, action: restore, params: {channel: mesh}}

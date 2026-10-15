@@ -1,0 +1,987 @@
+# Раздел 3. Стек PX4 SITL + Gazebo
+
+## 3.1. Версии и допущения
+
+| Компонент | Версия | Примечание |
+|---|---|---|
+| Ubuntu (все образы) | 22.04 | базовый образ `ubuntu:22.04` |
+| PX4 Autopilot | **v1.15.4** (`ARG PX4_REF`) | если такого тега нет, меняется один аргумент сборки |
+| Gazebo | **Harmonic** (gz-sim 8, gz-transport 13, gz-msgs 10) | пакет `gz-harmonic` из `packages.osrfoundation.org` |
+| ROS 2 | **Humble** | `px4_msgs` из ветки `release/1.15`; ветка должна совпадать с тегом PX4, иначе сообщения XRCE-DDS не сопоставятся |
+| Micro XRCE-DDS Agent | **v2.4.2** | версия из документации PX4 для 1.15 |
+| Рендеринг без GPU | ogre2 + Mesa llvmpipe (`LIBGL_ALWAYS_SOFTWARE=1`) | с GPU переменную убирают |
+
+PX4, Gazebo и точные версии внутренних файлов PX4 (rcS, `GZBridge.cpp`, `x500_base`) мне недоступны для сверки. Поэтому все изменения PX4 оформлены не как diff по номерам строк, а как **скрипт-патчер с якорями и проверками** (п. 3.4.4). Если upstream отличается от ожидаемого, сборка образа падает с понятным сообщением, а не даёт молча неработающий симулятор. Список мест, где это возможно, в п. 3.11.
+
+## 3.2. Уточнения к разделам 1–2
+
+При детализации стека нужны шесть поправок.
+
+| № | Было | Стало |
+|---|---|---|
+| U1 | `PX4_SYS_AUTOSTART=4001` (п. 1.6, 1.8) | **`4901`**. Это кастомный airframe `4901_gz_x500_swarm`, он наследует `4001_gz_x500` и добавляет параметры роя (п. 3.4.5). |
+| U2 | п. 1.3, принцип 5: «companion видит только XRCE-DDS и MAVLink» | Камера и дальномеры физически стоят на борту. Их данные доставляет на companion процесс **`gz-sensor-bridge`** (п. 3.6.3), подписанный только на топики `/swarm/<свой N>/…`. Ground truth (позы, состояние мира) недоступен. Изоляция обеспечивается кодом: у gz-transport нет списков доступа. |
+| U3 | не оговорено | Каждый companion изолирован как отдельный ROS 2-граф: `ROS_LOCALHOST_ONLY=1`, а XRCE-агент запускается с Fast DDS-профилем «только loopback» (п. 3.8.3). Иначе DDS-участники разных бортов находят друг друга через `sim-net`. Единственный канал между бортами это Zenoh по `mesh-net`. |
+| U4 | namespace «вида `/px4_N/fmu/...`» | Фиксируется явно: **`-n px4_N`**, где N = `MAV_SYS_ID`. Это нужно, чтобы тесты п. 2.9 (B2) и раздел 4 использовали одни и те же имена. |
+| U5 | PX4 → companion по MAVLink 14540+i | По умолчанию upstream шлёт на `127.0.0.1` внутри `fc-N`. Патчер добавляет `-t $PX4_ONBOARD_HOST`. |
+| U6 | `x500_swarm_N` | Это 5 **отдельных** сгенерированных SDF-моделей: у каждой свои топики сенсоров (`/swarm/N/...`, в том числе сырой GPS из п. 2.5). |
+
+## 3.3. Схема параметризации экземпляров
+
+Для борта N ≥ 1 индекс экземпляра PX4 равен `i = N−1`.
+
+| N | `px4 -i` | `MAV_SYS_ID` | Модель Gazebo | IP `fc-N` | IP `drone-agent-N` (sim-net) | XRCE UDP (fc → agent) | Namespace ROS 2 | MAVLink onboard: PX4 local → agent |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0 | 1 | `x500_swarm_1` | 172.30.0.11 | 172.30.0.21 | 8888 | `px4_1` | 14580 → 14540 |
+| 2 | 1 | 2 | `x500_swarm_2` | 172.30.0.12 | 172.30.0.22 | 8889 | `px4_2` | 14581 → 14541 |
+| 3 | 2 | 3 | `x500_swarm_3` | 172.30.0.13 | 172.30.0.23 | 8890 | `px4_3` | 14582 → 14542 |
+| 4 | 3 | 4 | `x500_swarm_4` | 172.30.0.14 | 172.30.0.24 | 8891 | `px4_4` | 14583 → 14543 |
+| 5 | 4 | 5 | `x500_swarm_5` | 172.30.0.15 | 172.30.0.25 | 8892 | `px4_5` | 14584 → 14544 |
+
+Формулы:
+- XRCE-порт = `8888 + i`
+- MAVLink onboard remote = `14540 + i`, PX4 local = `14580 + i`
+- Остальные внутренние порты PX4 (`14550+i` для GCS-линка, `14280+i` payload, `13280+i` gimbal) отправляют на 127.0.0.1 внутри `fc-N`. Наружу они не идут и ни на что не влияют.
+- Пара «PX4 local 14580+i → agent 14540+i» это то, что принимает `mavlink-router` (`[UdpEndpoint fc]`, п. 2.4.4).
+
+Топики ROS 2 борта N: `/px4_N/fmu/out/*` (от PX4) и `/px4_N/fmu/in/*` (в PX4). Отсюда тест B2: `/px4_1/fmu/out/vehicle_gps_position`.
+
+## 3.4. Образ `fc-N` (PX4 SITL)
+
+### 3.4.1. `docker/px4-sitl/Dockerfile`
+
+```dockerfile
+FROM ubuntu:22.04
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PX4_REF=v1.15.4
+ARG BUILD_JOBS=4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget gnupg lsb-release git sudo build-essential cmake ninja-build \
+      python3 python3-pip python3-dev python3-setuptools python3-wheel \
+      iproute2 procps netcat-openbsd gettext-base \
+    && rm -rf /var/lib/apt/lists/*
+
+# Gazebo Harmonic (нужны dev-библиотеки gz-transport/gz-msgs/gz-sim для сборки gz_bridge и gz_plugins)
+RUN wget -q https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/gazebo-stable.list \
+ && apt-get update && apt-get install -y --no-install-recommends gz-harmonic \
+ && rm -rf /var/lib/apt/lists/*
+
+# PX4 нужного тега + системные зависимости самого PX4 (без NuttX и без установки симуляторов)
+RUN git clone --recursive --shallow-submodules --depth 1 --branch ${PX4_REF} \
+      https://github.com/PX4/PX4-Autopilot.git /opt/px4 \
+ && bash /opt/px4/Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools \
+ && rm -rf /var/lib/apt/lists/*
+
+# Патчи роя (применяются по якорям; при несовпадении upstream сборка падает)
+COPY apply_swarm_patches.py /opt/swarm-patches/apply_swarm_patches.py
+COPY airframes/ /opt/swarm-patches/airframes/
+COPY params/ /opt/swarm-patches/params/
+RUN python3 /opt/swarm-patches/apply_swarm_patches.py /opt/px4
+
+RUN cd /opt/px4 && make px4_sitl_default -j${BUILD_JOBS}
+
+COPY entrypoint.sh /usr/local/bin/px4-entrypoint.sh
+COPY px4-shell /usr/local/bin/px4-shell
+COPY verify_params.sh /usr/local/bin/verify_params.sh
+RUN chmod +x /usr/local/bin/px4-entrypoint.sh /usr/local/bin/px4-shell /usr/local/bin/verify_params.sh
+
+ENV GZ_PARTITION=swarm HEADLESS=1
+ENTRYPOINT ["/usr/local/bin/px4-entrypoint.sh"]
+```
+
+Сборка требует около 6 ГБ RAM и 10–20 минут. Образ получается большим (несколько ГБ) из-за `gz-harmonic`. Для первой версии это принято.
+
+### 3.4.2. `docker/px4-sitl/entrypoint.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PX4_INSTANCE:?}" "${PX4_SYS_ID:?}" "${PX4_GZ_MODEL_NAME:?}" \
+  "${PX4_ONBOARD_HOST:?}" "${PX4_XRCE_HOST:?}"
+
+export PX4_SYS_AUTOSTART="${PX4_SYS_AUTOSTART:-4901}"
+export PX4_SIMULATOR=gz PX4_GZ_STANDALONE=1 HEADLESS=1
+export PX4_GZ_WORLD="${PX4_GZ_WORLD:-swarm_world}"
+export PX4_XRCE_PORT="${PX4_XRCE_PORT:-8888}"
+BUILD=/opt/px4/build/px4_sitl_default
+
+# 1. Чистое состояние при каждом старте: SIM_GPS_JAM и прочие параметры не «залипают» между перезапусками
+find "$BUILD/rootfs" -maxdepth 3 \( -name 'parameters*' -o -name dataman -o -name 'eeprom*' \) \
+     -exec rm -rf {} + 2>/dev/null || true
+
+# 2. Ждём, пока simulator-core опубликует модель этого борта (до 3 минут)
+topic="/world/${PX4_GZ_WORLD}/model/${PX4_GZ_MODEL_NAME}/link/base_link/sensor/imu_sensor/imu"
+ready=0
+for _ in $(seq 1 90); do
+  if gz topic -l 2>/dev/null | grep -qx "$topic"; then ready=1; break; fi
+  sleep 2
+done
+if [ "$ready" != 1 ]; then
+  echo "FATAL: $topic не виден через gz-transport (GZ_PARTITION=${GZ_PARTITION:-?} GZ_IP=${GZ_IP:-?})" >&2
+  exit 1
+fi
+
+# 3. Запуск экземпляра в standalone-режиме (gz sim уже работает в simulator-core)
+cd /opt/px4
+exec ./build/px4_sitl_default/bin/px4 -d -i "$PX4_INSTANCE"
+```
+
+Команда запуска `px4 -d -i N` соответствует документированному способу запуска дополнительных экземпляров PX4. Её нужно сверить с `Tools/simulation/sitl_run.sh` выбранного тега (п. 3.11).
+
+### 3.4.3. `docker/px4-sitl/px4-shell` и `verify_params.sh`
+
+```bash
+#!/usr/bin/env bash
+# px4-shell <команда PX4> [аргументы] — выполнить команду в работающем экземпляре, напр.: px4-shell commander status
+exec /opt/px4/build/px4_sitl_default/bin/px4-"$1" --instance "${PX4_INSTANCE:-0}" "${@:2}"
+```
+
+```bash
+#!/usr/bin/env bash
+# verify_params.sh — проверка ключевых параметров в запущенном экземпляре. Запуск: docker compose exec fc-1 verify_params.sh
+set -u
+declare -A expect=(
+  [MAV_SYS_ID]="${PX4_SYS_ID:-1}" [SIM_GPS_JAM]=0 [NAV_DLL_ACT]=0 [NAV_RCL_ACT]=0
+  [COM_RC_IN_MODE]=4 [COM_RCL_EXCEPT]=7 [COM_ARM_WO_GPS]=1 [EKF2_HGT_REF]=0 [EKF2_EV_CTRL]=4
+)
+for p in SIM_GPS_JAM_EPH COM_OF_LOSS_T EKF2_EV_DELAY EKF2_EVV_NOISE EKF2_NOAID_TOUT EKF2_GPS_CTRL SDLOG_MODE; do
+  expect[$p]=""   # достаточно существования
+done
+fail=0
+for p in "${!expect[@]}"; do
+  line=$(px4-shell param show "$p" 2>&1 | grep -m1 "$p" || true)
+  if [ -z "$line" ]; then echo "MISSING $p"; fail=1; continue; fi
+  want="${expect[$p]}"
+  if [ -n "$want" ] && ! grep -Eq ":[[:space:]]*${want}([[:space:]]|$)" <<<"$line"; then
+    echo "MISMATCH $p (want $want): $line"; fail=1
+  else
+    echo "ok       $p"
+  fi
+done
+exit $fail
+```
+
+### 3.4.4. `docker/px4-sitl/apply_swarm_patches.py`
+
+```python
+#!/usr/bin/env python3
+"""apply_swarm_patches.py <PX4_ROOT>
+Патчи SITL-роя по якорям (regex), а не по номерам строк. Якорь не найден или найден не там, где
+ожидается — сборка образа падает. Повторный запуск безопасен (маркер 'swarm-sitl')."""
+import pathlib
+import re
+import shutil
+import sys
+
+if len(sys.argv) != 2:
+    sys.exit("usage: apply_swarm_patches.py <PX4_ROOT>")
+ROOT = pathlib.Path(sys.argv[1]).resolve()
+HERE = pathlib.Path(__file__).resolve().parent
+MARK = "swarm-sitl"
+
+
+def die(msg: str):
+    sys.exit(f"PATCH FAILED: {msg}")
+
+
+def need(p: pathlib.Path) -> pathlib.Path:
+    if not p.exists():
+        die(f"{p} не найден (другая версия PX4?)")
+    return p
+
+
+# ── P1. airframe 4901_gz_x500_swarm ──────────────────────────────────────────────────────────
+af_dir = need(ROOT / "ROMFS/px4fmu_common/init.d-posix/airframes")
+shutil.copy(HERE / "airframes/4901_gz_x500_swarm", af_dir / "4901_gz_x500_swarm")
+cmake = need(af_dir / "CMakeLists.txt")
+txt = cmake.read_text()
+if "4901_gz_x500_swarm" not in txt:
+    txt, n = re.subn(r"^([ \t]*)4001_gz_x500[ \t]*$", r"\g<0>\n\g<1>4901_gz_x500_swarm", txt, count=1, flags=re.M)
+    if n != 1:
+        die("в airframes/CMakeLists.txt нет строки '4001_gz_x500' (куда регистрировать 4901?)")
+    cmake.write_text(txt)
+print("P1 airframe 4901: ok")
+
+# ── P2. MAVLink onboard: адрес партнёра (-t) вместо 127.0.0.1 ────────────────────────────────
+rc_mav = need(ROOT / "ROMFS/px4fmu_common/init.d-posix/px4-rc.mavlink")
+t = rc_mav.read_text()
+if MARK not in t:
+    pat = re.compile(r"^([ \t]*mavlink start\b[^\n]*?-o \$udp_offboard_port_remote)([^\n]*)$", re.M)
+    t, n = pat.subn(lambda m: f"{m.group(1)} -t ${{PX4_ONBOARD_HOST:-127.0.0.1}}{m.group(2)}  # {MARK}", t)
+    if n != 1:
+        die(f"px4-rc.mavlink: ожидалась ровно 1 строка 'mavlink start … -o $udp_offboard_port_remote', найдено {n}. "
+            "Откройте файл и найдите onboard/offboard-линк на порт 14540+instance.")
+    rc_mav.write_text(t)
+print("P2 mavlink partner IP: ok")
+
+# ── P3. uxrce_dds_client: хост агента, порт, namespace из окружения ──────────────────────────
+DDS_LINE = ("uxrce_dds_client start -t udp -h ${PX4_XRCE_HOST:-127.0.0.1} "
+            "-p ${PX4_XRCE_PORT:-8888} ${PX4_XRCE_NS:+-n ${PX4_XRCE_NS}}  # " + MARK)
+dds_pat = re.compile(r"^([ \t]*)uxrce_dds_client[ \t]+start\b[^\n]*-t[ \t]+udp[^\n]*$", re.M)
+candidates = list((ROOT / "ROMFS/px4fmu_common/init.d-posix").rglob("*")) + \
+             list((ROOT / "ROMFS/px4fmu_common/init.d").glob("rc.*"))
+dds_done = 0
+for f in candidates:
+    if not f.is_file():
+        continue
+    try:
+        s = f.read_text()
+    except UnicodeDecodeError:
+        continue
+    if "uxrce_dds_client" not in s:
+        continue
+    if MARK in s and DDS_LINE in s:
+        dds_done += 1
+        continue
+    s2, n = dds_pat.subn(lambda m: m.group(1) + DDS_LINE, s)
+    if n:
+        f.write_text(s2)
+        dds_done += n
+        print(f"   dds line patched in {f.relative_to(ROOT)} ({n})")
+if dds_done < 1:
+    die("не найдена строка запуска 'uxrce_dds_client start -t udp …' (grep -rn uxrce_dds_client ROMFS/)")
+print("P3 uxrce_dds_client: ok")
+
+# ── P4. gz_bridge: инъекция глушения GPS (контракт — п. 2.5.2) ──────────────────────────────
+gz_dir = need(ROOT / "src/modules/simulation/gz_bridge")
+cpp = need(gz_dir / "GZBridge.cpp")
+shutil.copy(HERE / "params/gps_jam_params.c", gz_dir / "gps_jam_params.c")   # имя обязано заканчиваться на params.c
+
+msg_file = next((p for p in (ROOT / "msg/SensorGps.msg", ROOT / "msg/sensor_gps.msg") if p.exists()), None)
+if msg_file is None:
+    die("не найден msg/SensorGps.msg (sensor_gps.msg)")
+has_jam_state = re.search(r"^\s*uint8\s+jamming_state\b", msg_file.read_text(), re.M) is not None
+print(f"   sensor_gps: jamming_state {'есть' if has_jam_state else 'ОТСУТСТВУЕТ (поле пропускается)'}")
+
+HELPER = r'''
+// ---- swarm-sitl: инъекция глушения GPS (SIM_GPS_JAM / SIM_GPS_JAM_EPH) ----
+#include <parameters/param.h>
+
+static void swarm_apply_gps_jam(sensor_gps_s &g)
+{
+	static const param_t p_mode = param_find("SIM_GPS_JAM");
+	static const param_t p_eph = param_find("SIM_GPS_JAM_EPH");
+	int32_t mode = 0;
+	float eph = 5.f;
+
+	if (p_mode == PARAM_INVALID || param_get(p_mode, &mode) != 0 || mode == 0) {
+		return;
+	}
+
+	if (p_eph != PARAM_INVALID) {
+		param_get(p_eph, &eph);
+	}
+
+	if (mode == 1) {            // denied
+		g.fix_type = 0;
+		g.satellites_used = 0;
+		g.eph = 9999.f;
+		g.epv = 9999.f;
+		g.s_variance_m_s = 100.f;
+@@JAM3@@
+	} else if (mode == 2) {     // degraded
+		g.fix_type = 2;
+		g.satellites_used = 4;
+		g.eph = eph;
+		g.epv = 1.5f * eph;
+@@JAM2@@
+	}
+}
+// ---- /swarm-sitl ----
+'''
+HELPER = HELPER.replace("@@JAM3@@", "\t\tg.jamming_state = 3;" if has_jam_state else "")
+HELPER = HELPER.replace("@@JAM2@@", "\t\tg.jamming_state = 2;" if has_jam_state else "")
+
+c = cpp.read_text()
+if MARK not in c:
+    inc = list(re.finditer(r"^#include[^\n]*$", c, re.M))
+    if not inc:
+        die("GZBridge.cpp: нет #include")
+    pos = inc[-1].end()
+    c = c[:pos] + "\n" + HELPER + c[pos:]
+    call = re.compile(r"^([ \t]*)_sensor_gps_pub\.publish\(sensor_gps\);", re.M)
+    if len(call.findall(c)) != 1:
+        die("GZBridge.cpp: ожидался ровно один вызов '_sensor_gps_pub.publish(sensor_gps);' в navSatCallback. "
+            "Откройте GZBridge::navSatCallback и поправьте якорь.")
+    c = call.sub(lambda m: f"{m.group(1)}swarm_apply_gps_jam(sensor_gps); // {MARK}\n{m.group(0)}", c)
+    cpp.write_text(c)
+print("P4 gz_bridge GPS jam: ok")
+print("ALL PATCHES APPLIED")
+```
+
+### 3.4.5. `docker/px4-sitl/params/gps_jam_params.c`
+
+```c
+/**
+ * Swarm SITL: GPS jamming mode injected by gz_bridge
+ *
+ * @min 0
+ * @max 2
+ * @value 0 Off
+ * @value 1 Denied (fix_type = 0)
+ * @value 2 Degraded (fix_type = 2, eph from SIM_GPS_JAM_EPH)
+ * @group Simulator
+ */
+PARAM_DEFINE_INT32(SIM_GPS_JAM, 0);
+
+/**
+ * Swarm SITL: reported horizontal accuracy in degraded GPS mode
+ *
+ * @unit m
+ * @min 0.5
+ * @max 10000
+ * @decimal 1
+ * @group Simulator
+ */
+PARAM_DEFINE_FLOAT(SIM_GPS_JAM_EPH, 5.0f);
+```
+
+### 3.4.6. Airframe: `docker/px4-sitl/airframes/4901_gz_x500_swarm`
+
+```sh
+#!/bin/sh
+#
+# @name Gazebo x500 swarm (SITL, companion-driven)
+#
+# @type Quadrotor
+# @class Copter
+#
+# @maintainer swarm-sitl
+#
+
+# Базовый airframe: геометрия, моторы, SIM_GZ_*, PID
+. ${R}etc/init.d-posix/airframes/4001_gz_x500
+
+# Идентичность борта (в мульти-режиме приходит из окружения fc-N)
+param set-default MAV_SYS_ID ${PX4_SYS_ID:=1}
+
+# Поведение при потере C2 / RC (сценарии п. 2.8): рой управляется бортовыми агентами, а не оператором
+param set-default NAV_DLL_ACT 0
+param set-default NAV_RCL_ACT 0
+param set-default COM_RC_IN_MODE 4
+param set-default COM_RCL_EXCEPT 7
+param set-default COM_ARM_WO_GPS 1
+param set-default COM_OF_LOSS_T 1.0
+
+# Оценка состояния при отказе GPS: высота по барометру, внешнее зрение (VIO) по скорости
+param set-default EKF2_HGT_REF 0
+param set-default EKF2_GPS_CTRL 7
+param set-default EKF2_EV_CTRL 4
+param set-default EKF2_EV_DELAY 40
+param set-default EKF2_EV_NOISE_MD 0
+param set-default EKF2_EVV_NOISE 0.15
+param set-default EKF2_NOAID_TOUT 5000000
+
+# Инъекция глушения GPS (патч P4): по умолчанию выключена
+param set-default SIM_GPS_JAM 0
+param set-default SIM_GPS_JAM_EPH 5.0
+
+# Лог только при взведённых моторах (экономит диск при долгих прогонах)
+param set-default SDLOG_MODE 1
+```
+
+`EKF2_EV_CTRL=4` включает слияние только **скорости** от внешнего зрения (биты: 0 горизонтальная позиция, 1 вертикальная позиция, 2 скорость, 3 рыскание). Для VIO, дающего позицию и ориентацию, значение меняется на 15. Имена и допустимые значения всех параметров проверяет `verify_params.sh` (п. 3.10, C5).
+
+## 3.5. Образ `simulator-core` (Gazebo Harmonic)
+
+### 3.5.1. `docker/simulator-core/Dockerfile`
+
+```dockerfile
+FROM ubuntu:22.04
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PX4_REF=v1.15.4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates wget gnupg lsb-release git supervisor \
+      python3 python3-pip python3-lxml python3-numpy python3-pil \
+      libegl1 libgl1-mesa-dri libglx-mesa0 libegl-mesa0 mesa-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/gazebo-stable.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gz-harmonic python3-gz-transport13 python3-gz-msgs10 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "pydantic==2.*"
+
+# Только модели из PX4 (меши x500_base), без остального дерева
+RUN git clone --depth 1 --filter=blob:none --sparse --branch ${PX4_REF} \
+      https://github.com/PX4/PX4-Autopilot.git /tmp/px4 \
+ && git -C /tmp/px4 sparse-checkout set Tools/simulation/gz \
+ && mkdir -p /opt/px4-gz && cp -r /tmp/px4/Tools/simulation/gz/models /opt/px4-gz/models \
+ && rm -rf /tmp/px4
+
+COPY gen_swarm.py /opt/swarm/gen_swarm.py
+COPY gps_jam_bridge.py /opt/gps_jam_bridge.py
+COPY supervisord.conf /etc/supervisor/conf.d/swarm.conf
+COPY entrypoint.sh /usr/local/bin/sim-entrypoint.sh
+RUN chmod +x /usr/local/bin/sim-entrypoint.sh
+
+ENV GZ_PARTITION=swarm
+ENTRYPOINT ["/usr/local/bin/sim-entrypoint.sh"]
+```
+
+`entrypoint.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p /opt/swarm/generated /opt/swarm/scene
+python3 /opt/swarm/gen_swarm.py          # модели, текстура, мир, scene.json (размер роя берётся из SWARM_SIZE)
+export GZ_SIM_RESOURCE_PATH="/opt/px4-gz/models:/opt/swarm/generated/models"
+exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf
+```
+
+`supervisord.conf` (подключается из `conf.d`):
+
+```ini
+[program:gz-sim]
+command=gz sim -s -r --headless-rendering -v 3 /opt/swarm/generated/swarm_world.sdf
+priority=10
+autorestart=true
+startsecs=5
+redirect_stderr=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+
+[program:gps-jam-bridge]
+command=/bin/bash -c "until gz topic -l | grep -q '^/swarm/1/navsat_raw$'; do sleep 2; done; exec python3 /opt/gps_jam_bridge.py"
+priority=20
+autorestart=true
+startsecs=5
+redirect_stderr=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+```
+
+Мост из п. 2.5.3 стартует, только когда сенсор GPS первого борта уже публикует сырой топик.
+
+### 3.5.2. `docker/simulator-core/gen_swarm.py`
+
+Скрипт строит всё, что зависит от размера роя: 5 моделей, текстуру земли (без неё нижней камере нечего отслеживать), мир и `scene.json` для HUD и планировщика.
+
+```python
+#!/usr/bin/env python3
+"""gen_swarm.py — генерация x500_swarm_1..N, swarm_ground, swarm_world.sdf и scene.json.
+Любое расхождение с ожидаемой структурой x500_base => завершение с ошибкой."""
+import json
+import os
+import pathlib
+import sys
+
+from lxml import etree as ET
+
+N = int(os.environ.get("SWARM_SIZE", "5"))
+WORLD = os.environ.get("GZ_WORLD", "swarm_world")
+SPACING = float(os.environ.get("SWARM_SPACING_M", "5.0"))
+BASE = pathlib.Path(os.environ.get("PX4_GZ_DIR", "/opt/px4-gz")) / "models/x500_base/model.sdf"
+OUT = pathlib.Path(os.environ.get("SWARM_OUT", "/opt/swarm/generated"))
+SCENE_DIR = pathlib.Path(os.environ.get("SWARM_SCENE_DIR", "/opt/swarm/scene"))
+LAT, LON, ELEV = 47.397971057728974, 8.546163739800146, 535.0   # как в стандартных мирах PX4
+
+CAM = dict(w=320, h=240, hfov=1.2, rate=15)            # нижняя камера, моно 8 бит
+RING = dict(samples=36, rmin=0.2, rmax=15.0, rate=10)  # кольцевой дальномер, шаг 10°
+DOWN = dict(rmin=0.1, rmax=30.0, rate=20)              # нисходящий однолучевой дальномер
+
+# (имя, x, y, размер x, y, z) — ENU, метры
+OBSTACLES = [("obst_1", 25, 8, 3, 3, 6), ("obst_2", 30, -10, 4, 2, 5),
+             ("obst_3", 40, 2, 2, 8, 4), ("obst_4", 18, -18, 3, 3, 7)]
+# (имя, x, y, r, цвет RGB)
+TARGETS = [("target_A", 40, 15, 1.5, (1, 0, 0)), ("target_B", 45, -12, 1.5, (0, 1, 0)),
+           ("target_C", 20, 30, 1.5, (0, 0, 1))]
+
+
+def die(msg: str):
+    sys.exit(f"gen_swarm: {msg}")
+
+
+def noise(std, bias_mean=None, bias_std=None):
+    s = f'<noise type="gaussian"><mean>0</mean><stddev>{std}</stddev>'
+    if bias_mean is not None:
+        s += f'<bias_mean>{bias_mean}</bias_mean><bias_stddev>{bias_std}</bias_stddev>'
+    return s + '</noise>'
+
+
+def imu_xml():
+    ang = "".join(f"<{a}>{noise(0.0003394, 3.88e-05, 3.88e-06)}</{a}>" for a in "xyz")
+    lin = "".join(f"<{a}>{noise(0.004, 0.1, 0.001)}</{a}>" for a in "xyz")
+    return ('<sensor name="imu_sensor" type="imu"><always_on>1</always_on><update_rate>250</update_rate>'
+            f'<imu><angular_velocity>{ang}</angular_velocity><linear_acceleration>{lin}</linear_acceleration></imu></sensor>')
+
+
+def navsat_xml(n):
+    return (f'<sensor name="navsat_sensor" type="navsat"><always_on>1</always_on><update_rate>10</update_rate>'
+            f'<topic>/swarm/{n}/navsat_raw</topic><navsat>'
+            f'<position_sensing><horizontal>{noise(0.3)}</horizontal><vertical>{noise(0.5)}</vertical></position_sensing>'
+            f'<velocity_sensing><horizontal>{noise(0.05)}</horizontal><vertical>{noise(0.05)}</vertical></velocity_sensing>'
+            f'</navsat></sensor>')
+
+
+def camera_xml(n):
+    return (f'<sensor name="cam_down" type="camera"><pose>0 0 -0.05 0 1.5708 0</pose><always_on>1</always_on>'
+            f'<update_rate>{CAM["rate"]}</update_rate><topic>/swarm/{n}/cam_down/image</topic>'
+            f'<camera><horizontal_fov>{CAM["hfov"]}</horizontal_fov>'
+            f'<image><width>{CAM["w"]}</width><height>{CAM["h"]}</height><format>L8</format></image>'
+            f'<clip><near>0.1</near><far>100</far></clip>{noise(0.007)}</camera></sensor>')
+
+
+def ring_xml(n):
+    step = 6.283185307 / RING["samples"]
+    amin, amax = -3.14159265, -3.14159265 + step * (RING["samples"] - 1)
+    return (f'<sensor name="lidar_ring" type="gpu_lidar"><pose>0 0 0.08 0 0 0</pose><always_on>1</always_on>'
+            f'<update_rate>{RING["rate"]}</update_rate><topic>/swarm/{n}/lidar_ring/scan</topic><lidar><scan>'
+            f'<horizontal><samples>{RING["samples"]}</samples><resolution>1</resolution>'
+            f'<min_angle>{amin:.6f}</min_angle><max_angle>{amax:.6f}</max_angle></horizontal>'
+            f'<vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>'
+            f'</scan><range><min>{RING["rmin"]}</min><max>{RING["rmax"]}</max><resolution>0.01</resolution></range>'
+            f'{noise(0.02)}</lidar></sensor>')
+
+
+def down_xml(n):
+    return (f'<sensor name="lidar_down" type="gpu_lidar"><pose>0 0 -0.06 0 1.5708 0</pose><always_on>1</always_on>'
+            f'<update_rate>{DOWN["rate"]}</update_rate><topic>/swarm/{n}/lidar_down/scan</topic><lidar><scan>'
+            f'<horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>'
+            f'<vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>'
+            f'</scan><range><min>{DOWN["rmin"]}</min><max>{DOWN["rmax"]}</max><resolution>0.01</resolution></range>'
+            f'{noise(0.02)}</lidar></sensor>')
+
+
+def build_model(n: int):
+    if not BASE.exists():
+        die(f"{BASE} не найден")
+    root = ET.parse(str(BASE)).getroot()
+    model = root.find("model")
+    if model is None:
+        die("x500_base/model.sdf: нет <model>")
+    model.set("name", f"x500_swarm_{n}")   # эквивалент переименования при spawn в px4-rc.gzsim
+    base = model.find("link[@name='base_link']")
+    if base is None:
+        die("x500_base: нет link base_link")
+    for name in ("imu_sensor", "navsat_sensor"):          # эти сенсоры определяем сами
+        for s in [s for s in model.iter("sensor") if s.get("name") == name]:
+            s.getparent().remove(s)
+    for need in ("air_pressure_sensor", "magnetometer_sensor"):   # эти берём из upstream
+        if not any(s.get("name") == need for s in model.iter("sensor")):
+            die(f"x500_base: нет сенсора {need} (изменилась структура модели PX4?)")
+    for xml in (imu_xml(), navsat_xml(n), camera_xml(n), ring_xml(n), down_xml(n)):
+        base.append(ET.fromstring(xml))
+    d = OUT / "models" / f"x500_swarm_{n}"
+    d.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(root).write(str(d / "model.sdf"), xml_declaration=True, encoding="UTF-8", pretty_print=True)
+    (d / "model.config").write_text(
+        f'<?xml version="1.0"?><model><name>x500_swarm_{n}</name><version>1.0</version>'
+        f'<sdf version="1.9">model.sdf</sdf><description>x500 + swarm sensors #{n}</description></model>')
+
+
+def ground_texture(path: pathlib.Path):
+    import numpy as np
+    from PIL import Image
+    rng = np.random.default_rng(7)
+    size = 2048
+    acc = np.zeros((size, size), dtype=np.float32)
+    for k, w in ((8, 1.0), (16, 0.8), (32, 0.6), (64, 0.5), (128, 0.4), (256, 0.3), (512, 0.2)):
+        layer = (rng.random((k, k)) * 255).astype(np.uint8)
+        acc += w * np.asarray(Image.fromarray(layer).resize((size, size), Image.BICUBIC), dtype=np.float32)
+    acc = (acc - acc.min()) / (acc.max() - acc.min())
+    Image.fromarray((40 + acc * 175).astype(np.uint8)).save(str(path))
+
+
+def build_ground():
+    d = OUT / "models/swarm_ground"
+    (d / "textures").mkdir(parents=True, exist_ok=True)
+    ground_texture(d / "textures/ground.png")
+    (d / "model.config").write_text('<?xml version="1.0"?><model><name>swarm_ground</name><version>1.0</version>'
+                                    '<sdf version="1.9">model.sdf</sdf></model>')
+    (d / "model.sdf").write_text(
+        '<?xml version="1.0"?><sdf version="1.9"><model name="swarm_ground"><static>true</static><pose>25 0 0 0 0 0</pose>'
+        '<link name="link"><collision name="c"><geometry><plane><normal>0 0 1</normal><size>300 300</size></plane></geometry></collision>'
+        '<visual name="v"><geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>'
+        '<material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse><specular>0 0 0 1</specular>'
+        '<pbr><metal><albedo_map>model://swarm_ground/textures/ground.png</albedo_map>'
+        '<metalness>0</metalness><roughness>1</roughness></metal></pbr></material></visual></link></model></sdf>')
+
+
+def static_box(name, x, y, sx, sy, sz):
+    return (f'<model name="{name}"><static>true</static><pose>{x} {y} {sz / 2} 0 0 0</pose><link name="link">'
+            f'<collision name="c"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry></collision>'
+            f'<visual name="v"><geometry><box><size>{sx} {sy} {sz}</size></box></geometry>'
+            f'<material><ambient>0.45 0.45 0.5 1</ambient><diffuse>0.45 0.45 0.5 1</diffuse></material></visual></link></model>')
+
+
+def static_pad(name, x, y, r, rgb):
+    c = f"{rgb[0]} {rgb[1]} {rgb[2]} 1"
+    return (f'<model name="{name}"><static>true</static><pose>{x} {y} 0.01 0 0 0</pose><link name="link">'
+            f'<visual name="v"><geometry><cylinder><radius>{r}</radius><length>0.02</length></cylinder></geometry>'
+            f'<material><ambient>{c}</ambient><diffuse>{c}</diffuse></material></visual></link></model>')
+
+
+def build_world():
+    drones = "\n".join(
+        f'<include><uri>model://x500_swarm_{n}</uri><name>x500_swarm_{n}</name><pose>{(n - 1) * SPACING} 0 0 0 0 0</pose></include>'
+        for n in range(1, N + 1))
+    boxes = "\n".join(static_box(*o) for o in OBSTACLES)
+    pads = "\n".join(static_pad(t[0], t[1], t[2], t[3], t[4]) for t in TARGETS)
+    sdf = f'''<?xml version="1.0"?>
+<sdf version="1.9">
+<world name="{WORLD}">
+  <physics type="ode"><max_step_size>0.004</max_step_size><real_time_factor>1.0</real_time_factor><real_time_update_rate>250</real_time_update_rate></physics>
+  <gravity>0 0 -9.8066</gravity>
+  <magnetic_field>6.0e-06 2.3e-05 -4.2e-05</magnetic_field>
+  <atmosphere type="adiabatic"/>
+  <scene><grid>false</grid><ambient>0.8 0.8 0.8 1</ambient><background>0.7 0.8 0.9 1</background><shadows>false</shadows></scene>
+  <spherical_coordinates>
+    <surface_model>EARTH_WGS84</surface_model><world_frame_orientation>ENU</world_frame_orientation>
+    <latitude_deg>{LAT}</latitude_deg><longitude_deg>{LON}</longitude_deg><elevation>{ELEV}</elevation><heading_deg>0</heading_deg>
+  </spherical_coordinates>
+  <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+  <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+  <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+  <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+  <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+  <plugin filename="gz-sim-air-pressure-system" name="gz::sim::systems::AirPressure"/>
+  <plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer"/>
+  <plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+  <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"><render_engine>ogre2</render_engine></plugin>
+  <light name="sun" type="directional"><cast_shadows>false</cast_shadows><pose>0 0 100 0 0 0</pose>
+    <diffuse>0.9 0.9 0.9 1</diffuse><specular>0.2 0.2 0.2 1</specular><direction>-0.5 0.1 -0.9</direction></light>
+  <include><uri>model://swarm_ground</uri></include>
+  {boxes}
+  {pads}
+  {drones}
+</world>
+</sdf>'''
+    (OUT / "swarm_world.sdf").write_text(sdf)
+
+
+def build_scene():
+    scene = {
+        "world": WORLD, "swarm_size": N,
+        "origin": {"lat_deg": LAT, "lon_deg": LON, "elevation_m": ELEV, "frame": "ENU"},
+        "drones": [{"id": n, "model": f"x500_swarm_{n}", "x_m": (n - 1) * SPACING, "y_m": 0.0} for n in range(1, N + 1)],
+        "obstacles": [dict(name=o[0], x_m=o[1], y_m=o[2], size_m=[o[3], o[4], o[5]]) for o in OBSTACLES],
+        "targets": [dict(name=t[0], x_m=t[1], y_m=t[2], radius_m=t[3]) for t in TARGETS],
+        "sensors": {"cam_down": CAM, "lidar_ring": RING, "lidar_down": DOWN},
+    }
+    SCENE_DIR.mkdir(parents=True, exist_ok=True)
+    (SCENE_DIR / "scene.json").write_text(json.dumps(scene, indent=2))
+
+
+if __name__ == "__main__":
+    OUT.mkdir(parents=True, exist_ok=True)
+    for i in range(1, N + 1):
+        build_model(i)
+    build_ground()
+    build_world()
+    build_scene()
+    print(f"gen_swarm: ok, N={N}, world={WORLD}")
+```
+
+Заметки к генератору:
+- `x500_base` берётся из PX4 без копирования вручную: меняется только имя модели, набор сенсоров и топики.
+- Барометр и магнитометр остаются upstream, IMU и GPS переопределены явно (параметры шума в п. 3.6).
+- Координаты препятствий и целей в ENU-метрах. `scene.json` читают HUD (раздел 5) и миссия (раздел 4).
+- Генерация идёт при каждом старте контейнера (секунды), поэтому размер роя меняется одной переменной `SWARM_SIZE`.
+
+## 3.6. Модели сенсоров
+
+### 3.6.1. Сводная таблица (на каждый борт)
+
+| Сенсор | Тип SDF | Частота | Ключевые параметры | Топик Gazebo | Потребитель |
+|---|---|---|---|---|---|
+| IMU | `imu` | 250 Гц | гироскоп σ=3,4·10⁻⁴ рад/с, смещение 3,9·10⁻⁵; акселерометр σ=0,004 м/с², смещение 0,1 | `/world/swarm_world/model/x500_swarm_N/link/base_link/sensor/imu_sensor/imu` | PX4 (`gz_bridge`) |
+| Барометр, магнитометр | upstream | upstream | не меняются | аналогично, `air_pressure_sensor`, `magnetometer_sensor` | PX4 |
+| GPS (NavSat) | `navsat` | 10 Гц | σ гор. 0,3 м, верт. 0,5 м, скорость 0,05 м/с | сырой: `/swarm/N/navsat_raw` → (`gps-jam-bridge`) → `…/navsat_sensor/navsat` | PX4 |
+| Нижняя камера (VIO) | `camera` | 15 Гц | 320×240, mono8 (`L8`), HFOV 1,2 рад (≈69°), смотрит вниз, σ=0,007 | `/swarm/N/cam_down/image` | `gz-sensor-bridge` → companion |
+| Кольцевой дальномер (обход препятствий) | `gpu_lidar` | 10 Гц | 360°, 36 лучей (шаг 10°), 0,2–15 м, σ=0,02 м | `/swarm/N/lidar_ring/scan` | `gz-sensor-bridge` → companion |
+| Нисходящий дальномер (высота над землёй, масштаб VIO) | `gpu_lidar` | 20 Гц | 1 луч вниз, 0,1–30 м, σ=0,02 м | `/swarm/N/lidar_down/scan` | `gz-sensor-bridge` → companion |
+
+Значения шума ориентировочные, класса MEMS-датчиков бюджетных автопилотов. Для воспроизводимости экспериментов их фиксируют и не меняют между прогонами.
+
+Нагрузка на рендеринг: на борт приходится 1 камера и 2 `gpu_lidar`, на рой из 5 бортов 15 рендерящих сенсоров на llvmpipe. Если RTF ниже 0,7, первым снижают `CAM.rate` и `RING.rate` в `gen_swarm.py`, потом число бортов.
+
+### 3.6.2. Отключение GPS (программно)
+
+| Способ | Что делает | Включает |
+|---|---|---|
+| `SIM_GPS_JAM` = 1 / 2 (патч P4) | PX4 видит `fix_type` 0 или 2, растущий `eph` | `ew-agent` (п. 2.4) |
+| `gps-jam-bridge` (`noise`, `drift`, `spoof`) | координаты искажаются при формально хорошем фиксе | `ew-controller` (п. 2.6) |
+
+Оба слоя независимы и совместимы. Слой B проверяет, замечает ли бортовой стек расхождение GPS с VIO.
+
+### 3.6.3. `gz-sensor-bridge` (в образе `drone-agent`)
+
+Процесс запускается в `drone-agent-N` и публикует данные **только своих** сенсоров в ROS 2.
+
+`docker/drone-agent/sensors/gz_sensor_bridge.py`:
+
+```python
+#!/usr/bin/env python3
+"""gz-sensor-bridge: сенсоры борта N (Gazebo gz-transport) -> ROS 2.
+Подписывается только на /swarm/<DRONE_ID>/...; штампы сохраняются как есть (время симуляции = время PX4)."""
+import math
+import os
+
+import rclpy
+from gz.msgs10.image_pb2 import Image as GzImage
+from gz.msgs10.laserscan_pb2 import LaserScan as GzScan
+from gz.transport13 import Node as GzNode
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image, LaserScan, Range
+
+N = int(os.environ["DRONE_ID"])
+HFOV = float(os.environ.get("CAM_HFOV_RAD", "1.2"))   # = CAM.hfov в gen_swarm.py
+
+
+class Bridge(Node):
+    def __init__(self):
+        super().__init__("gz_sensor_bridge")
+        self.p_img = self.create_publisher(Image, "/sensors/cam_down/image_raw", qos_profile_sensor_data)
+        self.p_info = self.create_publisher(CameraInfo, "/sensors/cam_down/camera_info", qos_profile_sensor_data)
+        self.p_ring = self.create_publisher(LaserScan, "/sensors/lidar_ring/scan", qos_profile_sensor_data)
+        self.p_down = self.create_publisher(Range, "/sensors/lidar_down/range", qos_profile_sensor_data)
+        self.gz = GzNode()
+        for topic, typ, cb in ((f"/swarm/{N}/cam_down/image", GzImage, self.on_image),
+                               (f"/swarm/{N}/lidar_ring/scan", GzScan, self.on_ring),
+                               (f"/swarm/{N}/lidar_down/scan", GzScan, self.on_down)):
+            if not self.gz.subscribe(typ, topic, cb):
+                raise RuntimeError(f"gz subscribe failed: {topic}")
+        self.get_logger().info(f"bridging /swarm/{N}/* -> /sensors/*")
+
+    @staticmethod
+    def stamp(msg, header):
+        header.stamp.sec = int(msg.header.stamp.sec)
+        header.stamp.nanosec = int(msg.header.stamp.nsec)
+
+    def on_image(self, g: GzImage):
+        w, h, n = int(g.width), int(g.height), len(g.data)
+        out = Image()
+        self.stamp(g, out.header)
+        out.header.frame_id = "cam_down_link"
+        out.width, out.height = w, h
+        if n == w * h:
+            out.encoding, out.step = "mono8", w
+        elif n == 3 * w * h:
+            out.encoding, out.step = "rgb8", 3 * w
+        else:
+            return
+        out.data = bytes(g.data)
+        self.p_img.publish(out)
+        info = CameraInfo()
+        info.header = out.header
+        info.width, info.height = w, h
+        fx = w / (2.0 * math.tan(HFOV / 2.0))
+        info.k = [fx, 0.0, w / 2.0, 0.0, fx, h / 2.0, 0.0, 0.0, 1.0]
+        info.p = [fx, 0.0, w / 2.0, 0.0, 0.0, fx, h / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.distortion_model = "plumb_bob"
+        info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self.p_info.publish(info)
+
+    def on_ring(self, g: GzScan):
+        out = LaserScan()
+        self.stamp(g, out.header)
+        out.header.frame_id = "lidar_ring_link"
+        out.angle_min, out.angle_max = float(g.angle_min), float(g.angle_max)
+        out.angle_increment = float(g.angle_step)
+        out.range_min, out.range_max = float(g.range_min), float(g.range_max)
+        out.scan_time = 0.1
+        out.ranges = [float(r) for r in g.ranges]
+        self.p_ring.publish(out)
+
+    def on_down(self, g: GzScan):
+        if not g.ranges:
+            return
+        out = Range()
+        self.stamp(g, out.header)
+        out.header.frame_id = "lidar_down_link"
+        out.radiation_type = Range.INFRARED
+        out.field_of_view = 0.03
+        out.min_range, out.max_range = float(g.range_min), float(g.range_max)
+        out.range = float(g.ranges[0])
+        self.p_down.publish(out)
+
+
+def main():
+    rclpy.init()
+    node = Bridge()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Правила для раздела 4:
+- Штампы в сообщениях ROS 2 этого моста **не wall-clock**. Это время симуляции Gazebo, оно же временная база PX4 при lockstep. Узлы companion не должны использовать `use_sim_time` и не должны подмешивать системное время в штампы данных для PX4.
+- Статические преобразования для `cam_down_link`, `lidar_ring_link` и `lidar_down_link` публикуются в разделе 4. Позы сенсоров относительно `base_link` берутся из `gen_swarm.py`: камера и нисходящий дальномер на 0,05–0,06 м ниже центра, смотрят вниз (pitch +90°), кольцевой дальномер на 0,08 м выше.
+
+Дополнение к `supervisord.conf` в `drone-agent` (после `xrce-agent`, до планировщика):
+
+```ini
+[program:gz-sensor-bridge]
+command=bash -lc "source /opt/ros/humble/setup.bash && exec python3 /opt/sensors/gz_sensor_bridge.py"
+priority=25
+autorestart=true
+startsecs=5
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+```
+
+Дополнение к Dockerfile `drone-agent` (Gazebo apt-репозиторий и Python-привязки):
+
+```dockerfile
+RUN wget -q https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/gazebo-stable.list \
+ && apt-get update && apt-get install -y --no-install-recommends python3-gz-transport13 python3-gz-msgs10 \
+ && rm -rf /var/lib/apt/lists/*
+COPY sensors/gz_sensor_bridge.py /opt/sensors/gz_sensor_bridge.py
+COPY dds/fastdds_loopback.xml /opt/dds/fastdds_loopback.xml
+```
+
+## 3.7. Контракт VIO (сторона PX4)
+
+Реализация узла `vio_node` относится к разделу 4. Здесь фиксируется, что должен предоставить PX4 и что должен сделать узел.
+
+| Элемент | Значение |
+|---|---|
+| Вход | `/sensors/cam_down/image_raw` (+ `camera_info`), `/sensors/lidar_down/range`, `/px4_N/fmu/out/vehicle_attitude` |
+| Выход | `px4_msgs/VehicleOdometry` в `/px4_N/fmu/in/vehicle_visual_odometry` |
+| Что подаётся в EKF2 | скорость (с `EKF2_EV_CTRL=4`); при выходе с позицией и ориентацией параметр меняется на 15 |
+| Шум | `EKF2_EV_NOISE_MD=0`: используется фиксированный `EKF2_EVV_NOISE` (0,15 м/с), поля ковариации в сообщении не читаются |
+| Задержка | `EKF2_EV_DELAY=40` мс, подгоняется под измеренную задержку узла |
+| Режим по умолчанию | «VIO-lite»: оптический поток нижней камеры + высота с нисходящего дальномера + ориентация PX4. Подключаемая замена (OpenVINS и др.) должна выдавать то же сообщение. |
+
+При `SIM_GPS_JAM=1` EKF2 перестаёт использовать GPS. Пока приходит скорость от VIO, решение по горизонтали остаётся валидным (горизонт `EKF2_NOAID_TOUT`), положение дрейфует. Это ожидаемое поведение для сценария п. 2.8.
+
+## 3.8. Изоляция DDS и конфигурация Compose
+
+### 3.8.1. Файл `docker-compose.px4.yml`
+
+Подключается без изменения команды запуска: в `.env` добавляется строка
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.px4.yml
+```
+
+(достаточно дописать её в `scripts/preflight.sh` рядом с генерацией `EW_TOKEN`).
+
+```yaml
+x-fc-env: &fc-env
+  PX4_SYS_AUTOSTART: "4901"
+  PX4_GZ_WORLD: swarm_world
+  GZ_PARTITION: swarm
+
+services:
+  simulator-core:
+    environment:
+      SWARM_SIZE: "5"
+      SWARM_SPACING_M: "5.0"
+      GZ_WORLD: swarm_world
+      LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE:-1}   # на хосте с NVIDIA-GPU: LIBGL_ALWAYS_SOFTWARE=0 в .env
+    volumes: ["scene:/opt/swarm/scene"]
+    healthcheck:       # «здоров» только когда загружены модели всех бортов
+      test: ["CMD-SHELL", "gz topic -l | grep -q \"/world/swarm_world/model/x500_swarm_$$SWARM_SIZE/link/base_link/sensor/imu_sensor/imu\""]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  fc-1: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.21, PX4_XRCE_HOST: 172.30.0.21, PX4_XRCE_PORT: "8888", PX4_XRCE_NS: px4_1 } }
+  fc-2: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.22, PX4_XRCE_HOST: 172.30.0.22, PX4_XRCE_PORT: "8889", PX4_XRCE_NS: px4_2 } }
+  fc-3: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.23, PX4_XRCE_HOST: 172.30.0.23, PX4_XRCE_PORT: "8890", PX4_XRCE_NS: px4_3 } }
+  fc-4: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.24, PX4_XRCE_HOST: 172.30.0.24, PX4_XRCE_PORT: "8891", PX4_XRCE_NS: px4_4 } }
+  fc-5: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.25, PX4_XRCE_HOST: 172.30.0.25, PX4_XRCE_PORT: "8892", PX4_XRCE_NS: px4_5 } }
+
+  drone-agent-1: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_1, GZ_PARTITION: swarm, GZ_IP: 172.30.0.21 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-2: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_2, GZ_PARTITION: swarm, GZ_IP: 172.30.0.22 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-3: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_3, GZ_PARTITION: swarm, GZ_IP: 172.30.0.23 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-4: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_4, GZ_PARTITION: swarm, GZ_IP: 172.30.0.24 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-5: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_5, GZ_PARTITION: swarm, GZ_IP: 172.30.0.25 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+
+volumes:
+  scene: {}
+```
+
+### 3.8.2. Запасной вариант, если gz-transport не работает через multicast
+
+Если C2 (п. 3.10) показывает, что `fc-N` не видит топики `simulator-core` (на некоторых хостах и VM multicast через Linux-bridge отфильтрован), сначала проверьте, что `GZ_IP` совпадает с адресом контейнера в `sim-net` и что все участники используют `GZ_PARTITION=swarm`. Затем включается unicast-режим gz-transport (`GZ_RELAY` со списком адресов `sim-net`). Формат переменной нужно сверить с документацией gz-transport 13, я его проверить не могу. Последняя мера: перевести только `simulator-core` и `fc-N` в общий отдельный bridge без `internal: true`.
+
+### 3.8.3. Изоляция DDS на борту: `docker/drone-agent/dds/fastdds_loopback.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>lo_udp</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="lo_only" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <userTransports><transport_id>lo_udp</transport_id></userTransports>
+    </rtps>
+  </participant>
+</profiles>
+```
+
+Профиль нужен только процессу `MicroXRCEAgent`. Его DDS-участник не знает про `ROS_LOCALHOST_ONLY`, а UDP-сервер XRCE (порт 8888+i) от этого профиля не зависит. В `supervisord.conf` агента добавляется:
+
+```ini
+environment=FASTRTPS_DEFAULT_PROFILES_FILE="/opt/dds/fastdds_loopback.xml"
+```
+
+## 3.9. Что получает каждый слой
+
+| Слой | Получает | Не получает |
+|---|---|---|
+| PX4 (`fc-N`) | IMU, барометр, магнитометр, GPS (после слоя B и патча P4) | камеры и дальномеры |
+| Companion (`drone-agent-N`) | выходы PX4 через XRCE, MAVLink через `mavlink-router`, камеры и дальномеры своего борта | чужие сенсоры, ground truth, DDS соседей |
+| Рой | Zenoh по `mesh-net` (раздел 4) | ничего по `sim-net` и ROS 2 |
+
+## 3.10. Критерии приёмки раздела
+
+| № | Критерий | Метод проверки |
+|---|---|---|
+| C1 | Образ `fc-N` собирается; патчер печатает `ALL PATCHES APPLIED` (патчи P1–P4 найдены по якорям) | `docker compose build fc-1` |
+| C2 | `fc-N` видит модель своего борта в gz-transport и стартует PX4 без ошибки `FATAL` в entrypoint | `docker compose logs fc-1`; `docker compose exec fc-1 gz topic -l \| grep x500_swarm_1` |
+| C3 | У всех 5 бортов разные `MAV_SYS_ID` 1–5; `ew-agent` получает `PARAM_VALUE` | `px4-shell param show MAV_SYS_ID` в каждом `fc-N`; лог `ew-agent` |
+| C4 | Топики `/px4_N/fmu/out/*` есть и содержат данные, топиков без префикса `/px4_N` нет | `ros2 topic list \| grep '/fmu/'`; `ros2 topic hz /px4_1/fmu/out/sensor_combined` |
+| C5 | `verify_params.sh` на каждом борту завершается кодом 0 (нет `MISSING`/`MISMATCH`) | `docker compose exec fc-1 verify_params.sh` |
+| C6 | Сенсорные топики борта N: `/sensors/cam_down/image_raw` ≥ 10 Гц, `/sensors/lidar_ring/scan` ≥ 6 Гц, `/sensors/lidar_down/range` ≥ 12 Гц (при RTF ≥ 0,7) | `ros2 topic hz` внутри `drone-agent-N` |
+| C7 | Патч GPS: `ewctl gps denied 1` → `fix_type = 0` в `vehicle_gps_position` борта 1 за ≤ 2 с, у остальных 3; `ewctl gps degraded` → `fix_type = 2`, `eph` растёт | `ros2 topic echo --once /px4_1/fmu/out/vehicle_gps_position`; `px4-shell listener sensor_gps` |
+| C8 | Изоляция ROS-графа: `ros2 node list` в `drone-agent-1` не показывает узлы других бортов | `ros2 node list` в двух контейнерах |
+| C9 | Базовый полёт: arm и takeoff на каждом борту, высота ≈ целевой, дрон не выходит в failsafe | `px4-shell commander arm`, `px4-shell commander takeoff`; `px4-shell listener vehicle_local_position` |
+| C10 | Перезапуск `fc-1` после `gps denied 1` возвращает `SIM_GPS_JAM = 0`; экземпляры других бортов не затронуты | `docker compose restart fc-1`; `px4-shell param show SIM_GPS_JAM` |
+
+## 3.11. Точки риска и что делать
+
+Раздел написан без возможности собрать и запустить PX4 в этом окружении. Известные места, где upstream мог отличаться от моих ожиданий, и их признаки:
+
+| Место | Ожидание | Признак расхождения | Действие |
+|---|---|---|---|
+| `px4-rc.mavlink`, строка onboard-линка | содержит `-o $udp_offboard_port_remote` | патчер падает на P2 | найти строку запуска onboard-линка, поправить регулярку якоря |
+| Запуск клиента XRCE | строка `uxrce_dds_client start -t udp …` в `init.d-posix` или `init.d/rc.*` | патчер падает на P3 | `grep -rn uxrce_dds_client ROMFS/`, поправить якорь |
+| `GZBridge::navSatCallback` | ровно один вызов `_sensor_gps_pub.publish(sensor_gps);` | патчер падает на P4 | открыть `GZBridge.cpp`, поправить якорь |
+| `x500_base` | сенсоры `air_pressure_sensor`, `magnetometer_sensor` в `base_link` | `gen_swarm.py` завершается с ошибкой | сверить имена сенсоров в `Tools/simulation/gz/models/x500_base/model.sdf` |
+| Команда запуска PX4 | `px4 -d -i N` из корня PX4 | `fc-N` падает сразу после старта | сверить с блоком `sitl_command` в `Tools/simulation/sitl_run.sh` |
+| Имена и значения параметров (`COM_RC_IN_MODE`, `EKF2_EV_CTRL` и т. д.) | как в п. 3.4.6 | C5 показывает `MISSING` или `MISMATCH` | сверить со справочником параметров выбранного тега |
+| Рендеринг `gpu_lidar` и камер на llvmpipe | RTF ≥ 0,7 при 5 бортах | C6 или A3 не проходят | снизить частоты сенсоров, затем число бортов |
+
+---

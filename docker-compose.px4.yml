@@ -1,0 +1,35 @@
+x-fc-env: &fc-env
+  PX4_SYS_AUTOSTART: "4901"
+  PX4_GZ_WORLD: swarm_world
+  GZ_PARTITION: swarm
+  GZ_RELAY: 172.30.0.2
+
+services:
+  simulator-core:
+    environment:
+      SWARM_SIZE: "5"
+      SWARM_SPACING_M: "5.0"
+      GZ_WORLD: swarm_world
+      LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE:-1}   # на хосте с NVIDIA-GPU: LIBGL_ALWAYS_SOFTWARE=0 в .env
+    volumes: ["scene:/opt/swarm/scene"]
+    healthcheck:       # «здоров» только когда загружены модели всех бортов
+      test: ["CMD-SHELL", "gz topic -l | grep -q \"/world/swarm_world/model/x500_swarm_$$SWARM_SIZE/link/base_link/sensor/imu_sensor/imu\""]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  fc-1: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.21, PX4_XRCE_HOST: 172.30.0.21, PX4_XRCE_PORT: "8888", PX4_XRCE_NS: px4_1 } }
+  fc-2: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.22, PX4_XRCE_HOST: 172.30.0.22, PX4_XRCE_PORT: "8889", PX4_XRCE_NS: px4_2 } }
+  fc-3: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.23, PX4_XRCE_HOST: 172.30.0.23, PX4_XRCE_PORT: "8890", PX4_XRCE_NS: px4_3 } }
+  fc-4: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.24, PX4_XRCE_HOST: 172.30.0.24, PX4_XRCE_PORT: "8891", PX4_XRCE_NS: px4_4 } }
+  fc-5: { environment: { <<: *fc-env, PX4_ONBOARD_HOST: 172.30.0.25, PX4_XRCE_HOST: 172.30.0.25, PX4_XRCE_PORT: "8892", PX4_XRCE_NS: px4_5 } }
+
+  drone-agent-1: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_1, GZ_PARTITION: swarm, GZ_IP: 172.30.0.21, GZ_RELAY: 172.30.0.2 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-2: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_2, GZ_PARTITION: swarm, GZ_IP: 172.30.0.22, GZ_RELAY: 172.30.0.2 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-3: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_3, GZ_PARTITION: swarm, GZ_IP: 172.30.0.23, GZ_RELAY: 172.30.0.2 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-4: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_4, GZ_PARTITION: swarm, GZ_IP: 172.30.0.24, GZ_RELAY: 172.30.0.2 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+  drone-agent-5: { environment: { ROS_LOCALHOST_ONLY: "1", PX4_NS: px4_5, GZ_PARTITION: swarm, GZ_IP: 172.30.0.25, GZ_RELAY: 172.30.0.2 }, volumes: ["scene:/opt/swarm/scene:ro"] }
+
+volumes:
+  scene: {}

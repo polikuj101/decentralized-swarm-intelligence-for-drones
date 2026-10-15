@@ -1,0 +1,4 @@
+name: c2_cut
+description: Полный обрыв C2 на всех бортах на 60 с, начиная с 20-й секунды
+steps:
+  - {at: 20, action: c2, params: {duration_s: 60}}

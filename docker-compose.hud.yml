@@ -1,0 +1,21 @@
+services:
+  web-hud:
+    build:
+      context: ./docker/web-hud
+    image: swarm/web-hud:latest
+    environment:
+      SWARM_SIZE: "5"
+      EW_URL: http://172.33.0.2:8080
+      EW_TOKEN: ${EW_TOKEN:?задайте EW_TOKEN в .env}
+      SCENE_FILE: /opt/swarm/scene/scene.json
+      MISSION_FILE: /opt/swarm/config/mission.json
+      MAV_BIND: 0.0.0.0:14550
+      HUD_ALLOWED_ORIGINS: http://127.0.0.1:8000,http://localhost:8000
+    volumes:
+      - scene:/opt/swarm/scene:ro
+      - ./docker/drone-agent/config/mission.json:/opt/swarm/config/mission.json:ro
+    depends_on:
+      simulator-core: { condition: service_healthy }
+
+volumes:
+  scene: {}

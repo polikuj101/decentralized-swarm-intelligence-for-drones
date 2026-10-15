@@ -1,0 +1,10 @@
+{
+  "search_area": { "x_min": 10.0, "x_max": 60.0, "y_min": -30.0, "y_max": 35.0 },
+  "grid": { "cols": 3, "rows": 2 },
+  "lane_spacing_m": 4.0,
+  "cruise_speed_mps": 3.0,
+  "base_alt_m": 3.0,
+  "alt_step_m": 0.8,
+  "target_dwell_s": 5.0,
+  "wp_radius_m": 1.5
+}

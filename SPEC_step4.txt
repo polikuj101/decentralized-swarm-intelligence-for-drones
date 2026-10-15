@@ -1,0 +1,2158 @@
+# Раздел 4. Бортовой стек агента (Companion Computer Software)
+
+## 4.1. Версии и допущения
+
+| Компонент | Версия / решение | Примечание |
+|---|---|---|
+| Базовый образ | `ros:humble-ros-base-jammy` | ROS 2 Humble, Python 3.10 |
+| llama.cpp | `ARG LLAMA_CPP_REF=b4600`, статическая сборка `llama-server` | любой более новый тег допустим, нужны `llama-server` и поддержка `{m,n}` в GBNF |
+| Модель | `Qwen2.5-0.5B-Instruct` Q4_K_M (по умолчанию) или `Qwen2.5-1.5B-Instruct` Q4_K_M | GGUF из репозиториев `Qwen/Qwen2.5-*-Instruct-GGUF` на Hugging Face, скачивается при сборке |
+| P2P | Eclipse Zenoh (`eclipse-zenoh>=1.0,<2`), peer-режим, статические UDP-endpoints | брокера нет |
+| Консенсус | CBAA (Consensus-Based Auction Algorithm) с эпохами | выбран из трёх вариантов ТЗ |
+| Сообщения роя | 4 типа, все ≤ 64 байт, в каждом 4-байтовый HMAC-тег | п. 4.6 |
+| Микро-агент XRCE, mavlink-router, px4_msgs | `v2.4.2`, master, `release/1.15` | как в разделах 1–3 |
+
+Рамки раздела:
+- **LLM только советует.** Рой полностью работоспособен без LLM. Модель выбирает одно действие из списка допустимых, а детерминированный валидатор принимает или отклоняет его (п. 4.10).
+- **Восприятие не моделируется.** `SCAN_TARGET` означает пролёт к цели и зависание на `target_dwell_s`. Детекция цели по изображению в ТЗ не входит.
+- **Код написан без возможности запуска.** Места, где поведение зависит от версии библиотеки или от неопределённого знака, собраны в п. 4.13 и проверяются тестами п. 4.12.
+
+## 4.2. Поправки к разделам 1–3
+
+| № | Было | Стало |
+|---|---|---|
+| U7 | п. 3.6.3: узлы companion не подмешивают системное время в штампы для PX4 | **Неверно.** При `UXRCE_DDS_SYNCT=1` (по умолчанию) клиент XRCE пересчитывает `timestamp` между временной базой PX4 и базой агента. Поэтому `timestamp` в `px4_msgs`, отправляемых в PX4, берётся из ROS-часов (`get_clock().now()`, µs). Штампы Gazebo из `gz-sensor-bridge` используются только для расчёта `dt` между кадрами. |
+| U8 | п. 1.10, A4: решение LLM ≤ 4 с (0.5B) и ≤ 8 с (1.5B) | Пересмотрено: **≤ 6 с (0.5B) и ≤ 12 с (1.5B)** при ≈ 300 токенах промпта и ≤ 90 сгенерированных токенах. Цель проектная, измеряется в D13. |
+| U9 | п. 2.3.2: на L3 канал перегружен ещё до учёта потерь | Неточно. В `netem` потери применяются **до** ограничения полосы, и на L3 в очередь попадает ≈ 20 % трафика. К тому же Zenoh добавляет ≈ 20 байт, поэтому на проводе пакет равен payload + ≈ 48 байт (Zenoh + UDP/IP). Узкое место на L3 это потери и задержка, а не полоса. В п. 4.7 заложен токен-бакет на стороне отправителя. |
+| U10 | п. 3.8.3: `ROS_LOCALHOST_ONLY=1` достаточно | В контейнере на `lo` обычно выключен multicast, и DDS-участники внутри борта не находят друг друга. `entrypoint.sh` включает multicast на `lo` и добавляет маршрут `224.0.0.0/4`. |
+| U11 | п. 3.6.3: статические TF для `*_link` публикуются в разделе 4 | TF не используются. Геометрия сенсоров вшита константами в `vio_node` и `flight_ctrl`. |
+| U12 | п. 3.6.3: `gz-sensor-bridge` запускается через `bash -lc` | Заменено на единую обёртку `ros-run.sh` (п. 4.4.3). |
+
+## 4.3. Процессы борта и межузловые интерфейсы
+
+Один `drone-agent-N` (лимит 4 vCPU / 2 GiB) запускает 10 процессов под `supervisord`.
+
+| Процесс | Назначение | Основная нагрузка |
+|---|---|---|
+| `MicroXRCEAgent` | мост DDS ↔ PX4 | малая |
+| `llama-server` | LLM, `-t 3`, 127.0.0.1:8080 | 3 потока, пики на время генерации |
+| `gz_sensor_bridge` | камеры и дальномеры → ROS 2 (раздел 3) | малая |
+| `vio_node` | оптический поток → `VehicleOdometry` | 15 Гц на кадре 320×240 |
+| `flight_ctrl` | offboard-управление, навигация, обход препятствий, монитор GPS | 20 Гц |
+| `coordinator` | P2P, liveness, CBAA, исполнение миссии | 10 Гц |
+| `planner_bridge` | вызовы LLM, валидатор | событийная |
+| `telemetry` | отправка состояния на `web-hud` | 2 Гц |
+| `mavlink-routerd` | MAVLink fc ↔ GCS/ew-agent | малая |
+| `ew-agent` | исполнитель РЭБ (раздел 2) | малая |
+
+**Локальные темы ROS 2** (все `std_msgs/String` с JSON, доступны только внутри борта):
+
+| Тема | Направление | Содержание |
+|---|---|---|
+| `/swarm/local/nav_goal` | coordinator → flight_ctrl | `{seq, kind: WAYPOINTS\|HOLD\|HOME, wps:[[x,y],…], dwell_s, task, alt}` (повтор каждые 2 с, идемпотентно по `seq`) |
+| `/swarm/local/nav_status` | flight_ctrl → coordinator, telemetry | `{seq, idx, done, state, x, y, z, vx, vy, hdg, src, sigma, gps_fix, gps_suspect, vio_ok, xy_valid, armed, obst_min}` 5 Гц |
+| `/swarm/local/state` | coordinator → planner, telemetry | сводка роя, 2 Гц (п. 4.7.4) |
+| `/swarm/local/planner_cmd` | planner → coordinator | `{id, tool, args}` |
+| `/swarm/local/planner_log` | planner → coordinator, telemetry | запись о вызове LLM |
+| `/swarm/local/vio_disp` | vio_node → flight_ctrl | `PointStamped`: x = E, y = N (м, накопленное смещение), z = высота |
+
+Все координаты роя это **мировые ENU-метры**, как в `scene.json`: x на восток, y на север, 0 в центре мира. Преобразование из локальной NED-системы PX4 лежит в `common.py` (п. 4.5): `x_world = spawn_x + east`, `y_world = spawn_y + north`.
+
+## 4.4. Образ `drone-agent`
+
+Раздел заменяет фрагменты Dockerfile из п. 2.4.5 и 3.6.3.
+
+### 4.4.1. `docker/drone-agent/Dockerfile`
+
+```dockerfile
+# syntax=docker/dockerfile:1
+ARG QWEN_VARIANT=0.5b
+ARG LLAMA_CPP_REF=b4600
+ARG XRCE_REF=v2.4.2
+ARG PX4_MSGS_REF=release/1.15
+ARG GGML_FLAGS="-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
+
+# ───────── stage 1: llama.cpp + модель ─────────
+FROM ubuntu:22.04 AS llama
+ARG DEBIAN_FRONTEND=noninteractive
+ARG LLAMA_CPP_REF
+ARG QWEN_VARIANT
+ARG GGML_FLAGS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${LLAMA_CPP_REF} https://github.com/ggml-org/llama.cpp /src \
+ && cmake -S /src -B /src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_CURL=OFF ${GGML_FLAGS} \
+ && cmake --build /src/build --target llama-server -j4
+RUN case "${QWEN_VARIANT}" in \
+      0.5b) R=Qwen/Qwen2.5-0.5B-Instruct-GGUF; F=qwen2.5-0.5b-instruct-q4_k_m.gguf ;; \
+      1.5b) R=Qwen/Qwen2.5-1.5B-Instruct-GGUF; F=qwen2.5-1.5b-instruct-q4_k_m.gguf ;; \
+      *) echo "QWEN_VARIANT must be 0.5b or 1.5b"; exit 1 ;; esac \
+ && curl -fL --retry 5 --retry-delay 3 -o /model.gguf "https://huggingface.co/${R}/resolve/main/${F}" \
+ && test "$(stat -c %s /model.gguf)" -gt 100000000
+
+# ───────── stage 2: XRCE-агент, mavlink-router, px4_msgs ─────────
+FROM ros:humble-ros-base-jammy AS rosbuild
+ARG DEBIAN_FRONTEND=noninteractive
+ARG XRCE_REF
+ARG PX4_MSGS_REF
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ninja-build meson pkg-config libssl-dev \
+      python3-colcon-common-extensions && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${XRCE_REF} https://github.com/eProsima/Micro-XRCE-DDS-Agent.git /xrce \
+ && cmake -S /xrce -B /xrce/build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build /xrce/build -j4 && cmake --install /xrce/build
+RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/mavlink-router/mavlink-router.git /mr \
+ && cd /mr && meson setup build . --buildtype=release && ninja -C build install
+RUN mkdir -p /px4_ws/src \
+ && git clone --depth 1 --branch ${PX4_MSGS_REF} https://github.com/PX4/px4_msgs.git /px4_ws/src/px4_msgs \
+ && cd /px4_ws && . /opt/ros/humble/setup.sh \
+ && colcon build --packages-select px4_msgs --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+# ───────── stage 3: итоговый образ ─────────
+FROM ros:humble-ros-base-jammy
+ARG DEBIAN_FRONTEND=noninteractive
+ARG QWEN_VARIANT
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      supervisor gettext-base iproute2 nftables iputils-ping iperf3 curl tcpdump \
+      python3-pip python3-opencv python3-numpy lsb-release wget gnupg ca-certificates \
+ && wget -q https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] http://packages.osrfoundation.org/gazebo/ubuntu-stable $(lsb_release -cs) main" \
+      > /etc/apt/sources.list.d/gazebo-stable.list \
+ && apt-get update && apt-get install -y --no-install-recommends python3-gz-transport13 python3-gz-msgs10 \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "pydantic==2.*" \
+      "pymavlink==2.4.*" "eclipse-zenoh>=1.0,<2"
+
+COPY --from=rosbuild /usr/local /usr/local
+COPY --from=rosbuild /px4_ws/install /opt/px4_ws/install
+COPY --from=llama /src/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=llama /model.gguf /opt/models/model.gguf
+RUN ldconfig
+
+COPY grammar/actions.gbnf /opt/grammar/actions.gbnf
+COPY dds/fastdds_loopback.xml /opt/dds/fastdds_loopback.xml
+COPY ew/ew_agent.py /opt/ew/ew_agent.py
+COPY ew/ew-tc.sh /usr/local/bin/ew-tc.sh
+COPY sensors/gz_sensor_bridge.py /opt/sensors/gz_sensor_bridge.py
+COPY swarm/ /opt/swarm_agent/swarm/
+COPY config/mission.json /opt/swarm/config/mission.json
+COPY mavlink-router/main.conf.tpl /etc/mavlink-router/main.conf.tpl
+COPY supervisord.conf /etc/supervisor/conf.d/swarm.conf
+COPY ros-run.sh /usr/local/bin/ros-run.sh
+COPY entrypoint.sh /usr/local/bin/agent-entrypoint.sh
+RUN chmod +x /usr/local/bin/ew-tc.sh /usr/local/bin/ros-run.sh /usr/local/bin/agent-entrypoint.sh
+
+ENV QWEN_VARIANT=${QWEN_VARIANT} RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENTRYPOINT ["/usr/local/bin/agent-entrypoint.sh"]
+```
+
+### 4.4.2. `entrypoint.sh`, `ros-run.sh`
+
+```bash
+#!/usr/bin/env bash
+# entrypoint.sh
+set -euo pipefail
+# U10: multicast на loopback для DDS-discovery внутри борта (нужен NET_ADMIN, он есть)
+ip link set lo multicast on || true
+ip route add 224.0.0.0/4 dev lo 2>/dev/null || true
+mkdir -p /etc/mavlink-router
+envsubst '${MAVLINK_ONBOARD_PORT}' < /etc/mavlink-router/main.conf.tpl > /etc/mavlink-router/main.conf
+exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf
+```
+
+```bash
+#!/usr/bin/env bash
+# ros-run.sh <команда…> — окружение ROS 2 + px4_msgs + пакет swarm
+set -eo pipefail
+source /opt/ros/humble/setup.bash
+source /opt/px4_ws/install/setup.bash
+export PYTHONPATH="/opt/swarm_agent:${PYTHONPATH:-}"
+exec "$@"
+```
+
+### 4.4.3. `supervisord.conf` (полный, заменяет секции из п. 2.4.5 и 3.6.3)
+
+```ini
+[program:xrce-agent]
+command=MicroXRCEAgent udp4 -p %(ENV_XRCE_PORT)s
+environment=FASTRTPS_DEFAULT_PROFILES_FILE="/opt/dds/fastdds_loopback.xml"
+priority=10
+autorestart=true
+startsecs=3
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:llama-server]
+command=/usr/local/bin/llama-server -m /opt/models/model.gguf -c 2048 -t 3 -tb 3 -np 1 -b 256 -ub 256 --host 127.0.0.1 --port 8080 --grammar-file /opt/grammar/actions.gbnf
+priority=15
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:gz-sensor-bridge]
+command=/usr/local/bin/ros-run.sh python3 /opt/sensors/gz_sensor_bridge.py
+priority=25
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:vio]
+command=/usr/local/bin/ros-run.sh python3 -m swarm.vio_node
+priority=30
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:flight]
+command=/usr/local/bin/ros-run.sh python3 -m swarm.flight_ctrl
+priority=35
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:coordinator]
+command=/usr/local/bin/ros-run.sh python3 -m swarm.coordinator
+priority=40
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:planner]
+command=/usr/local/bin/ros-run.sh python3 -m swarm.planner_bridge
+priority=45
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:telemetry]
+command=/usr/local/bin/ros-run.sh python3 -m swarm.telemetry
+priority=46
+autorestart=true
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:mavlink-router]
+command=/usr/local/bin/mavlink-routerd -c /etc/mavlink-router/main.conf
+priority=48
+autorestart=true
+startsecs=3
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:ew-agent]
+command=uvicorn ew_agent:app --host %(ENV_SELF_MGMT_IP)s --port 9090 --log-level info
+directory=/opt/ew
+priority=50
+autorestart=true
+startsecs=3
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+```
+
+Конфигурация `mavlink-router/main.conf.tpl` совпадает с п. 2.4.4. Файл `swarm/__init__.py` пустой.
+
+### 4.4.4. Миссия: `docker/drone-agent/config/mission.json`
+
+```json
+{
+  "search_area": { "x_min": 10.0, "x_max": 60.0, "y_min": -30.0, "y_max": 35.0 },
+  "grid": { "cols": 3, "rows": 2 },
+  "lane_spacing_m": 4.0,
+  "cruise_speed_mps": 3.0,
+  "base_alt_m": 3.0,
+  "alt_step_m": 0.8,
+  "target_dwell_s": 5.0,
+  "wp_radius_m": 1.5
+}
+```
+
+Дроны летят на разных высотах: `3,0 + 0,8·(N−1)` м, то есть от 3,0 до 6,2 м. Это единственная защита от столкновений между бортами: позиции соседей по mesh ненадёжны, и репульсия по ним не используется. Препятствия из `scene.json` высотой 4–7 м лежат на этих высотах, поэтому кольцевой дальномер работает.
+
+### 4.4.5. Фрагмент Compose: `docker-compose.swarm.yml`
+
+В `.env` добавляется `COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.px4.yml:docker-compose.swarm.yml`. Генерация `SWARM_KEY` дописывается в `preflight.sh`: `grep -q '^SWARM_KEY=' .env || echo "SWARM_KEY=$(openssl rand -hex 16)" >> .env`.
+
+```yaml
+x-swarm-env: &swarm-env
+  SWARM_SIZE: "5"
+  SWARM_KEY: ${SWARM_KEY:?задайте SWARM_KEY в .env}
+  MISSION_FILE: /opt/swarm/config/mission.json
+  SCENE_FILE: /opt/swarm/scene/scene.json
+  HUD_URL: http://172.33.0.5:8000/api/ingest
+  EW_TOKEN: ${EW_TOKEN:?}
+  LLM_URL: http://127.0.0.1:8080
+  LLM_TIMEOUT_S: "20"
+
+services:
+  drone-agent-1: { environment: *swarm-env }
+  drone-agent-2: { environment: *swarm-env }
+  drone-agent-3: { environment: *swarm-env }
+  drone-agent-4: { environment: *swarm-env }
+  drone-agent-5: { environment: *swarm-env }
+```
+
+Переменные `DRONE_ID`, `PEERS`, `SELF_MESH_IP`, `XRCE_PORT`, `PX4_NS` и `ROS_LOCALHOST_ONLY` заданы в разделах 1 и 3. Compose объединяет `environment` из разных файлов по ключам.
+
+## 4.5. Общие определения: `swarm/common.py`
+
+```python
+"""swarm/common.py — конфигурация, геометрия, детерминированная таблица задач (одинакова на всех бортах)."""
+import json
+import math
+import os
+import time
+from dataclasses import dataclass
+
+DRONE_ID = int(os.environ.get("DRONE_ID", "1"))
+SWARM_SIZE = int(os.environ.get("SWARM_SIZE", "5"))
+PX4_NS = os.environ.get("PX4_NS", f"px4_{DRONE_ID}")
+MISSION_FILE = os.environ.get("MISSION_FILE", "/opt/swarm/config/mission.json")
+SCENE_FILE = os.environ.get("SCENE_FILE", "/opt/swarm/scene/scene.json")
+TASK_COUNT = 22          # 0..5 секторы, 6..9 цели, 10..21 дочерние сектора (10 + 2p + (q-1))
+NONE = 255
+
+
+def load_json(path, wait_s=90.0):
+    t0 = time.monotonic()
+    while True:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            if time.monotonic() - t0 > wait_s:
+                raise
+            time.sleep(1.0)
+
+
+MISSION = load_json(MISSION_FILE, 5)
+SCENE = load_json(SCENE_FILE)
+AREA = MISSION["search_area"]
+COLS, ROWS = MISSION["grid"]["cols"], MISSION["grid"]["rows"]
+assert COLS * ROWS <= 6, "поддерживается не более 6 базовых секторов"
+SPAWN = next((d["x_m"], d["y_m"]) for d in SCENE["drones"] if d["id"] == DRONE_ID)
+HOME = SPAWN
+ALT = MISSION["base_alt_m"] + MISSION["alt_step_m"] * (DRONE_ID - 1)
+OBSTACLES = SCENE.get("obstacles", [])
+
+
+def world_to_ned(x, y):
+    """мир ENU (x восток, y север) -> локальная NED PX4 (north, east); начало в точке старта борта"""
+    return y - SPAWN[1], x - SPAWN[0]
+
+
+def ned_to_world(n, e):
+    return SPAWN[0] + e, SPAWN[1] + n
+
+
+@dataclass(frozen=True)
+class Task:
+    id: int
+    kind: str          # SECTOR | TARGET
+    name: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @property
+    def cx(self):
+        return (self.x0 + self.x1) / 2.0
+
+    @property
+    def cy(self):
+        return (self.y0 + self.y1) / 2.0
+
+    @property
+    def area(self):
+        return abs((self.x1 - self.x0) * (self.y1 - self.y0))
+
+
+def build_tasks(split2=0, split3=0):
+    """split2 — битовая маска разделённых базовых секторов; split3 — из них разделённых на 3 части (иначе на 2)."""
+    tasks = {}
+    cw = (AREA["x_max"] - AREA["x_min"]) / COLS
+    rh = (AREA["y_max"] - AREA["y_min"]) / ROWS
+    for r in range(ROWS):
+        for c in range(COLS):
+            p = r * COLS + c
+            x0, y0 = AREA["x_min"] + c * cw, AREA["y_min"] + r * rh
+            x1, y1 = x0 + cw, y0 + rh
+            parts = (3 if (split3 >> p) & 1 else 2) if (split2 >> p) & 1 else 1
+            along_x = (x1 - x0) >= (y1 - y0)
+            for q in range(parts):
+                tid = p if q == 0 else 10 + 2 * p + (q - 1)
+                if along_x:
+                    box = (x0 + q * (x1 - x0) / parts, y0, x0 + (q + 1) * (x1 - x0) / parts, y1)
+                else:
+                    box = (x0, y0 + q * (y1 - y0) / parts, x1, y0 + (q + 1) * (y1 - y0) / parts)
+                tasks[tid] = Task(tid, "SECTOR", f"S{p}" if parts == 1 else f"S{p}.{q}", *box)
+    for i, t in enumerate(SCENE.get("targets", [])[:4]):
+        tasks[6 + i] = Task(6 + i, "TARGET", f"T{i}", t["x_m"], t["y_m"], t["x_m"], t["y_m"])
+    return tasks
+
+
+def task_waypoints(t):
+    """цель — одна точка; сектор — «газонокосилка» с шагом lane_spacing_m вдоль длинной стороны"""
+    if t.kind == "TARGET":
+        return [(t.x0, t.y0)]
+    lane, m = MISSION["lane_spacing_m"], 1.0
+    w, h = t.x1 - t.x0, t.y1 - t.y0
+    pts = []
+    if h >= w:
+        n = max(1, math.ceil(w / lane))
+        ya, yb = t.y0 + m, t.y1 - m
+        for i in range(n):
+            x = t.x0 + (i + 0.5) * w / n
+            pts += [(x, ya), (x, yb)] if i % 2 == 0 else [(x, yb), (x, ya)]
+    else:
+        n = max(1, math.ceil(h / lane))
+        xa, xb = t.x0 + m, t.x1 - m
+        for i in range(n):
+            y = t.y0 + (i + 0.5) * h / n
+            pts += [(xa, y), (xb, y)] if i % 2 == 0 else [(xb, y), (xa, y)]
+    return [(round(px, 2), round(py, 2)) for px, py in pts]
+```
+
+## 4.6. P2P-слой: формат сообщений и Zenoh
+
+### 4.6.1. Формат пакетов
+
+Порядок байт little-endian. Каждое сообщение: заголовок (8 байт) + тело + **тег (4 байта)**, то есть первые 4 байта HMAC-SHA256 от «заголовок + тело» на общем ключе `SWARM_KEY`. Пакет с неверным тегом отбрасывается молча.
+
+**Заголовок (общий)**
+
+| Смещение | Поле | Тип | Смысл |
+|---|---|---|---|
+| 0 | `type` | u8 | 1 HEARTBEAT, 2 TARGET_CLAIM, 3 SECTOR_ALLOC, 4 FAILOVER |
+| 1 | `sender` | u8 | ID борта 1..8 |
+| 2 | `seq` | u16 | счётчик отправителя по типу (для оценки потерь) |
+| 4 | `t_ms` | u32 | монотонное время отправителя, мс (диагностика) |
+
+**HEARTBEAT (26 байт)**
+
+| Смещение | Поле | Тип | Смысл |
+|---|---|---|---|
+| 8 | `x_dm`, `y_dm`, `z_dm` | i16×3 | позиция в мировых ENU, дм (z вверх) |
+| 14 | `state` | u8 | 0 IDLE, 1 TAKEOFF, 2 NAV, 3 HOLD, 4 DWELL, 5 RTB, 6 LANDED |
+| 15 | `flags` | u8 | бит0 GPS_OK, 1 VIO_OK, 2 NAV_DEG, 3 LLM_OK, 4 AIRBORNE, 5 GPS_SUSPECT |
+| 16 | `sigma` | u8 | неопределённость позиции, шаг 0,5 м |
+| 17 | `task` | u8 | текущая задача исполнения, 255 — нет |
+| 18 | `epoch` | u8 | известная эпоха распределения |
+| 19 | `link_q` | u8 | качество mesh по оценке отправителя, 0..100 |
+| 20 | `heard` | u8 | маска бортов, услышанных недавно (бит `id−1`) |
+| 21 | `hb_ds` | u8 | период Heartbeat, 0,1 с |
+| 22 | `tag` | 4 B | HMAC |
+
+**TARGET_CLAIM (≤ 58 байт при 22 задачах)**: вектор консенсуса CBAA.
+
+| Смещение | Поле | Тип | Смысл |
+|---|---|---|---|
+| 8 | `epoch` | u8 | эпоха |
+| 9 | `n` | u8 | число задач (22) |
+| 10 | `entry[j]` | u16×n | биты 15..12 — победитель задачи `j` (0 — нет), биты 11..0 — ставка (0..4095) |
+| 10+2n | `tag` | 4 B | HMAC |
+
+**SECTOR_ALLOC (28 байт)**: сводка распределения. Маски выполненных и разделённых секторов объединяются по OR на всех бортах без привязки к эпохе.
+
+| Смещение | Поле | Тип | Смысл |
+|---|---|---|---|
+| 8 | `epoch` | u8 | эпоха |
+| 9 | `done` | u32 | маска выполненных задач |
+| 13 | `split2` | u8 | маска разделённых базовых секторов |
+| 14 | `split3` | u8 | из них делённых на 3 части (иначе на 2) |
+| 15 | `assign[8]` | u8×8 | задача борта `k+1` (255 — нет) |
+| 23 | `alive` | u8 | маска бортов, считающихся живыми |
+| 24 | `tag` | 4 B | HMAC |
+
+**FAILOVER (15 байт)**
+
+| Смещение | Поле | Тип | Смысл |
+|---|---|---|---|
+| 8 | `failed` | u8 | ID объявленного отказавшим |
+| 9 | `reason` | u8 | 0 NO_HEARTBEAT, 1 GPS_LOST, 2 LINK_DEGRADED, 3 NAV_DRIFT |
+| 10 | `epoch` | u8 | эпоха после объявления |
+| 11 | `tag` | 4 B | HMAC |
+
+### 4.6.2. `swarm/wire.py`
+
+```python
+"""swarm/wire.py — бинарный протокол роя. Любой пакет <= 64 байт, включая 4-байтовый HMAC-тег."""
+import hashlib
+import hmac
+import os
+import struct
+
+KEY = bytes.fromhex(os.environ.get("SWARM_KEY", "00" * 16))
+MAX_PAYLOAD = 64
+TAG_LEN = 4
+HDR = struct.Struct("<BBHI")
+T_HB, T_CLAIM, T_ALLOC, T_FAIL = 1, 2, 3, 4
+NONE = 255
+FL_GPS_OK, FL_VIO_OK, FL_NAV_DEG, FL_LLM_OK, FL_AIRBORNE, FL_GPS_SUSPECT = 1, 2, 4, 8, 16, 32
+REASONS = {"NO_HEARTBEAT": 0, "GPS_LOST": 1, "LINK_DEGRADED": 2, "NAV_DRIFT": 3}
+
+_HB = struct.Struct("<hhhBBBBBBBB")
+_AL = struct.Struct("<BIBB8sB")
+_FL = struct.Struct("<BBB")
+
+assert HDR.size + _HB.size + TAG_LEN <= MAX_PAYLOAD
+assert HDR.size + _AL.size + TAG_LEN <= MAX_PAYLOAD
+assert HDR.size + _FL.size + TAG_LEN <= MAX_PAYLOAD
+assert HDR.size + 2 + 2 * 22 + TAG_LEN <= MAX_PAYLOAD
+
+
+def _i16(v):
+    return max(-32768, min(32767, int(round(v))))
+
+
+def _u8(v):
+    return max(0, min(255, int(round(v))))
+
+
+def _tag(raw):
+    return hmac.new(KEY, raw, hashlib.sha256).digest()[:TAG_LEN]
+
+
+def seal(mtype, sender, seq, t_ms, body):
+    raw = HDR.pack(mtype, sender, seq & 0xFFFF, t_ms & 0xFFFFFFFF) + body
+    out = raw + _tag(raw)
+    if len(out) > MAX_PAYLOAD:
+        raise ValueError(f"message {len(out)} B > {MAX_PAYLOAD} B")
+    return out
+
+
+def unseal(data):
+    """-> (type, sender, seq, t_ms, body) или None при неверной длине/теге"""
+    if len(data) < HDR.size + TAG_LEN or len(data) > MAX_PAYLOAD:
+        return None
+    raw, tag = data[:-TAG_LEN], data[-TAG_LEN:]
+    if not hmac.compare_digest(_tag(raw), tag):
+        return None
+    mtype, sender, seq, t_ms = HDR.unpack_from(raw)
+    return mtype, sender, seq, t_ms, raw[HDR.size:]
+
+
+def enc_hb(x, y, z, state, flags, sigma_m, task, epoch, link_q, heard, hb_s):
+    return _HB.pack(_i16(x * 10), _i16(y * 10), _i16(z * 10), state & 0xFF, flags & 0xFF,
+                    _u8(sigma_m * 2), task & 0xFF, epoch & 0xFF, _u8(link_q), heard & 0xFF, _u8(hb_s * 10))
+
+
+def dec_hb(b):
+    x, y, z, st, fl, sg, tk, ep, lq, hd, hp = _HB.unpack(b)
+    return {"x": x / 10.0, "y": y / 10.0, "z": z / 10.0, "state": st, "flags": fl, "sigma": sg / 2.0,
+            "task": tk, "epoch": ep, "link_q": lq, "heard": hd, "hb_s": hp / 10.0}
+
+
+def enc_claim(epoch, y, z):
+    b = bytearray(struct.pack("<BB", epoch & 0xFF, len(y)))
+    for yy, zz in zip(y, z):
+        b += struct.pack("<H", ((zz & 0xF) << 12) | min(int(yy), 4095))
+    return bytes(b)
+
+
+def dec_claim(b):
+    epoch, n = struct.unpack_from("<BB", b)
+    if len(b) != 2 + 2 * n:
+        raise ValueError("claim length")
+    y, z = [], []
+    for i in range(n):
+        (v,) = struct.unpack_from("<H", b, 2 + 2 * i)
+        y.append(v & 0x0FFF)
+        z.append(v >> 12)
+    return {"epoch": epoch, "y": y, "z": z}
+
+
+def enc_alloc(epoch, done, split2, split3, assign, alive):
+    a = bytes((assign + [NONE] * 8)[:8])
+    return _AL.pack(epoch & 0xFF, done & 0xFFFFFFFF, split2 & 0xFF, split3 & 0xFF, a, alive & 0xFF)
+
+
+def dec_alloc(b):
+    ep, dn, s2, s3, a, al = _AL.unpack(b)
+    return {"epoch": ep, "done": dn, "split2": s2, "split3": s3, "assign": list(a), "alive": al}
+
+
+def enc_fail(failed, reason, epoch):
+    return _FL.pack(failed & 0xFF, reason & 0xFF, epoch & 0xFF)
+
+
+def dec_fail(b):
+    f, r, e = _FL.unpack(b)
+    return {"failed": f, "reason": r, "epoch": e}
+```
+
+### 4.6.3. `swarm/mesh.py` (Zenoh)
+
+Параметры:
+- **Тип сессии.** Peer, статические `connect`/`listen` по UDP, multicast-scouting и gossip выключены.
+- **`lease` 60 с, `keep_alive` 20 раз за lease.** По умолчанию lease равен 10 с, и при потерях 80 % сессия рвалась бы постоянно.
+- **`CongestionControl.DROP`.** Ничего не ставится в очередь повторной отправки, протокол сам устойчив к потерям.
+
+Если версия Zenoh не принимает часть ключей конфигурации, `Mesh` откатывается на минимальный конфиг и пишет предупреждение. Сессия открывается в фоновом потоке, чтобы запуск не блокировался при отсутствии пиров.
+
+```python
+"""swarm/mesh.py — Zenoh peer-сессия по mesh-net. Только доставка байтов; логика протокола — в coordinator."""
+import json
+import logging
+import threading
+import time
+
+import zenoh
+
+log = logging.getLogger("mesh")
+PRIO = {"fail": "REAL_TIME", "claim": "INTERACTIVE_HIGH", "alloc": "INTERACTIVE_LOW", "hb": "DATA"}
+
+
+def _cfg(own_ip, peer_ips, tuned):
+    d = {
+        "mode": "peer",
+        "listen": {"endpoints": [f"udp/{own_ip}:7447"]},
+        "connect": {"endpoints": [f"udp/{ip}:7447" for ip in peer_ips]},
+        "scouting": {"multicast": {"enabled": False}, "gossip": {"enabled": False}},
+    }
+    if tuned:
+        d["transport"] = {"link": {"tx": {"lease": 60000, "keep_alive": 20}}}
+        d["connect"]["retry"] = {"period_init_ms": 1000, "period_max_ms": 4000, "period_increase_factor": 2}
+    return json.dumps(d)
+
+
+class Mesh:
+    def __init__(self, me, own_ip, peer_ips, on_msg):
+        self.me, self.on_msg = me, on_msg
+        self.ready = False
+        self.tuned = None
+        self.tx_bytes = {k: 0 for k in PRIO}
+        self.rx_bad = 0
+        self.session = None
+        self.pubs = {}
+        threading.Thread(target=self._open, args=(own_ip, peer_ips), daemon=True).start()
+
+    def _open(self, own_ip, peer_ips):
+        while self.session is None:
+            for tuned in (True, False):
+                try:
+                    self.session = zenoh.open(zenoh.Config.from_json5(_cfg(own_ip, peer_ips, tuned)))
+                    self.tuned = tuned
+                    break
+                except Exception as e:  # noqa: BLE001
+                    log.warning("zenoh open (tuned=%s) failed: %s", tuned, e)
+            if self.session is None:
+                time.sleep(2.0)
+        self.session.declare_subscriber("swarm/v1/**", self._cb)
+        for kind, prio in PRIO.items():
+            self.pubs[kind] = self.session.declare_publisher(
+                f"swarm/v1/{kind}/{self.me}",
+                congestion_control=zenoh.CongestionControl.DROP,
+                priority=getattr(zenoh.Priority, prio))
+        self.ready = True
+        log.info("zenoh ready, tuned=%s", self.tuned)
+
+    def _cb(self, sample):
+        try:
+            data = sample.payload.to_bytes()
+        except AttributeError:
+            data = bytes(sample.payload)
+        self.on_msg(data)
+
+    def send(self, kind, data):
+        if not self.ready:
+            return False
+        try:
+            self.pubs[kind].put(data)
+            self.tx_bytes[kind] += len(data)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("put failed: %s", e)
+            return False
+
+    def peers_connected(self):
+        try:
+            return len(list(self.session.info.peers_zid()))
+        except Exception:  # noqa: BLE001
+            return -1
+```
+
+### 4.6.4. Режимы связи и бюджет
+
+Режим выбирается по оценке качества mesh `q` (доля доставленных Heartbeat по сквозной нумерации, EWMA с коэффициентом 0,9, усреднённая по пирам с прямым приёмом за последние 12 с).
+
+| `q` | Heartbeat | CLAIM (при нестабильном векторе) | ALLOC | Бюджет, Б/с |
+|---|---|---|---|---|
+| ≥ 0,7 | 0,5 с | 1 с | 2 с | 1500 |
+| 0,4–0,7 | 1 с | 2 с | 4 с | 800 |
+| < 0,4 | 2 с | 3 с | 6 с | 450 |
+
+Стоимость отправки считается как `(len + 48) · (N−1)` байт (по копии на каждого пира) и списывается из токен-бакета. При нехватке токенов пакет не ставится в очередь, а отбрасывается. Порядок приоритета: FAILOVER (отправляется всегда) > Heartbeat > CLAIM > ALLOC. Худший случай на `q < 0,4` и 5 бортах: HB 296/2 + CLAIM 424/3 + ALLOC 304/6 ≈ 340 Б/с, что укладывается в 450.
+
+## 4.7. Распределение ролей: CBAA
+
+### 4.7.1. Задачи и ставки
+
+Множество задач (`TASK_COUNT = 22`): базовые секторы 0–5 (сетка 3×2), цели 6–9, дочерние сектора 10–21 (после `SPLIT_SECTOR`). Деление детерминировано (п. 4.5), поэтому его можно передать двумя битами на сектор.
+
+Ставка борта `i` на задачу `j` фиксируется в начале эпохи:
+
+```
+s = value_j / (1 + dist_ij / 25)           value: цель 1.0, сектор 0.8
+s ×= 0.6  если навигация деградирована (нет GPS или GPS_SUSPECT)
+s ×= 1.4  если j — моя текущая исполняемая задача (гистерезис)
+s ×= 1.5  если j выбрана командой SCAN_TARGET от LLM (60 с)
+bid = max(1, round(min(1.5, s) · 2700))     # ≤ 4050 < 4095 (12 бит)
+```
+
+### 4.7.2. Алгоритм
+
+В каждой **эпохе** (u8 с арифметикой по модулю 256) борт ведёт вектор выигравших ставок `y[j]` и победителей `z[j]`.
+1. **Выбор.** Свободный борт берёт задачу с максимальной ставкой среди тех, где его ставка лучше `(y[j], z[j])`. Порядок: большая ставка, при равенстве меньший ID.
+2. **Консенсус.** При получении чужого вектора `(y, z)` для каждой задачи принимается лучшая пара. Если борт потерял свою задачу, он освобождается и выбирает заново.
+3. **Новая эпоха** (`bump`) наступает при завершении задачи, смене состава живых бортов, `SPLIT_SECTOR`, `DECLARE_FAILOVER`, `SCAN_TARGET`, `RETURN_HOME`. Более высокая эпоха в любом полученном пакете (Heartbeat, CLAIM, ALLOC, FAILOVER) заставляет борт перейти на неё и пересчитать ставки.
+4. **Исполнение** начинается, когда задача не менялась `SETTLE_S = 2,5` с.
+
+Свойства и ограничения:
+- **Раздельные части сети.** Каждая часть сходится независимо, возможна дублирующая работа. При слиянии любой из бортов видит возвращение пира, создаёт новую эпоху, и рой перераспределяется. Маски `done` и `split` объединяются по OR всегда.
+- **Одновременные `bump`.** Два борта могут независимо назначить одну и ту же эпоху с разными картинами живых бортов. Это допускается: максимум по ставкам всё равно приводит к единому выбору, а лишнее различие исчезает на следующей эпохе.
+- **Частично выполненный сектор** при переназначении начинается новым исполнителем с начала. Состояние обхода по mesh не передаётся.
+- **Борт сильнее 4 соседей по ставкам** не делает ничего особенного: при задач меньше, чем бортов, лишние бортов простаивают (зависание на высоте своего слоя).
+
+### 4.7.3. Liveness
+
+- Борт `j` считается **живым**, если его Heartbeat приходил напрямую за последние `T_DEAD = 12` с **или** какой-либо другой живой пир недавно объявил `j` в своей маске `heard` (непрямое свидетельство).
+- Непрямое свидетельство нужно потому, что на L3 при потерях 80 % и периоде 2 с вероятность 12 с без единого прямого пакета заметна. Четыре соседа с независимыми потерями дают гораздо более надёжный сигнал.
+- Для DECLARE_FAILOVER от LLM порог тишины `T_SUSPECT = 6` с, и борт при этом не должен быть жив по непрямым свидетельствам. Таким образом, LLM **ускоряет** отказоустойчивость (6 с против 12 с), а без LLM всё работает по `T_DEAD`.
+
+### 4.7.4. `swarm/cbaa.py`
+
+```python
+"""swarm/cbaa.py — Consensus-Based Auction Algorithm (один тип назначения на борт). Чистая логика, без ROS."""
+
+
+class CBAA:
+    def __init__(self, me, m):
+        self.me, self.m = me, m
+        self.reset({}, set())
+
+    def reset(self, scores, avail):
+        self.avail = set(avail)
+        self.c = [int(scores.get(j, 0)) if j in self.avail else 0 for j in range(self.m)]
+        self.y = [0] * self.m
+        self.z = [0] * self.m
+        self.x = None
+
+    @staticmethod
+    def _better(y1, z1, y2, z2):
+        """(y1,z1) лучше (y2,z2): большая ставка; при равенстве — меньший ID победителя"""
+        if y1 != y2:
+            return y1 > y2
+        return z1 != 0 and (z2 == 0 or z1 < z2)
+
+    def select(self):
+        if self.x is not None:
+            return False
+        best, bj = 0, None
+        for j in sorted(self.avail):
+            cj = self.c[j]
+            if cj > best and self._better(cj, self.me, self.y[j], self.z[j]):
+                best, bj = cj, j
+        if bj is None:
+            return False
+        self.x = bj
+        self.y[bj], self.z[bj] = best, self.me
+        return True
+
+    def merge(self, y, z):
+        """слияние чужого вектора; True, если локальное состояние изменилось"""
+        changed = False
+        for j in range(self.m):
+            if j in self.avail and self._better(y[j], z[j], self.y[j], self.z[j]):
+                self.y[j], self.z[j] = y[j], z[j]
+                changed = True
+        if self.x is not None and self.z[self.x] != self.me:
+            self.x = None
+            changed = True
+        if self.select():
+            changed = True
+        return changed
+
+    def drop(self, done_tasks):
+        """задачи выполнены кем-то ещё"""
+        self.avail -= set(done_tasks)
+        if self.x in done_tasks:
+            self.x = None
+        for j in done_tasks:
+            self.c[j], self.y[j], self.z[j] = 0, 0, 0
+        self.select()
+```
+
+### 4.7.5. `swarm/coordinator.py`
+
+```python
+#!/usr/bin/env python3
+"""coordinator: P2P-слой роя (Heartbeat, liveness, CBAA, исполнение миссии, команды LLM)."""
+import json
+import os
+import threading
+import time
+from collections import deque
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from swarm import common, wire
+from swarm.cbaa import CBAA
+from swarm.mesh import Mesh
+
+ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
+T_DEAD, T_SUSPECT, SETTLE_S = 12.0, 6.0, 2.5
+STATE_CODE = {"IDLE": 0, "TAKEOFF": 1, "NAV": 2, "HOLD": 3, "DWELL": 4, "RTB": 5, "LANDED": 6}
+CODE_STATE = {v: k for k, v in STATE_CODE.items()}
+
+
+def sgt(a, b):
+    """a новее b в арифметике u8"""
+    return 1 <= ((a - b) & 0xFF) <= 127
+
+
+class Peer:
+    __slots__ = ("last_rx", "seq", "q", "x", "y", "z", "state", "flags", "sigma", "task", "epoch",
+                 "link_q", "heard", "heard_rx", "hb_s", "rx")
+
+    def __init__(self):
+        self.last_rx = None
+        self.seq = None
+        self.q = 0.5
+        self.x = self.y = self.z = 0.0
+        self.state, self.flags, self.sigma, self.task = 0, 0, 0.0, wire.NONE
+        self.epoch, self.link_q, self.heard, self.heard_rx = 0, 0, 0, None
+        self.hb_s, self.rx = 0.5, 0
+
+
+class Coordinator(Node):
+    def __init__(self):
+        super().__init__("coordinator")
+        now = time.monotonic()
+        self.t0 = now
+        self.lock = threading.RLock()
+        self.peers = {i: Peer() for i in range(1, N + 1) if i != ME}
+        self.epoch, self.done, self.split2, self.split3 = 0, 0, 0, 0
+        self.tasks = common.build_tasks()
+        self.cbaa = CBAA(ME, M)
+        self.force_dead, self.prefer = set(), {}
+        self.withdrawn = False
+        self.nav = {}
+        self.goal, self.goal_seq = None, int(time.time()) % 1000000
+        self.exec_task, self.override, self.mission_done_sent = None, None, False
+        self.alive_prev = {ME}
+        self.last_bump, self.pending_bump = -99.0, False
+        self.vec_changed, self.claim_dirty = 0.0, False
+        self._x_last, self.x_since = None, now
+        self.seqs = {wire.T_HB: 0, wire.T_CLAIM: 0, wire.T_ALLOC: 0, wire.T_FAIL: 0}
+        self.t_hb = self.t_claim = self.t_alloc = self.t_claim_last = 0.0
+        self.alloc_now, self.fail_tx = False, []
+        self.tokens, self.t_refill = 600.0, now
+        self.dropped = {"hb": 0, "claim": 0, "alloc": 0, "fail": 0}
+        self.bad_tag = 0
+        self.events, self.last_cmd = deque(maxlen=40), None
+        self.llm_ok_t, self.t_state, self.t_goal_pub = 0.0, 0.0, 0.0
+
+        peers_ips = [ip for ip in os.environ.get("PEERS", "").split(",") if ip]
+        self.mesh = Mesh(ME, os.environ["SELF_MESH_IP"], peers_ips, self._on_wire)
+        self.pub_goal = self.create_publisher(String, "/swarm/local/nav_goal", 10)
+        self.pub_state = self.create_publisher(String, "/swarm/local/state", 10)
+        self.create_subscription(String, "/swarm/local/nav_status", self._on_nav, 10)
+        self.create_subscription(String, "/swarm/local/planner_cmd", self._on_cmd, 10)
+        self.create_subscription(String, "/swarm/local/planner_log", self._on_plog, 10)
+        with self.lock:
+            self.reset_cbaa(now)
+        self.create_timer(0.1, self.tick)
+        self.log("coordinator started")
+
+    # ───────── утилиты ─────────
+    def log(self, text):
+        self.events.append((round(time.monotonic() - self.t0, 1), text))
+        self.get_logger().info(text)
+
+    def pos(self):
+        n = self.nav
+        return n.get("x", common.SPAWN[0]), n.get("y", common.SPAWN[1]), n.get("z", 0.0)
+
+    def nav_degraded(self):
+        n = self.nav
+        return bool(n) and (n.get("gps_fix", 3) < 3 or n.get("gps_suspect", False))
+
+    def peer_q(self, p, now):
+        if p.last_rx is None:
+            return 0.0
+        return p.q * (0.9 ** ((now - p.last_rx) / max(0.5, p.hb_s)))
+
+    def link_quality(self, now):
+        qs = [self.peer_q(p, now) for p in self.peers.values()
+              if p.last_rx is not None and now - p.last_rx < T_DEAD]
+        return sum(qs) / len(qs) if qs else 0.0
+
+    def periods(self, q):
+        if q >= 0.7:
+            return 0.5, 1.0, 2.0, 1500.0
+        if q >= 0.4:
+            return 1.0, 2.0, 4.0, 800.0
+        return 2.0, 3.0, 6.0, 450.0
+
+    def alive_set(self, now):
+        alive = {ME}
+        for j, p in self.peers.items():
+            if j in self.force_dead:
+                continue
+            if p.last_rx is not None and now - p.last_rx < T_DEAD:
+                alive.add(j)
+                continue
+            for k, pk in self.peers.items():
+                if (k != j and k not in self.force_dead and pk.heard_rx is not None
+                        and now - pk.heard_rx < T_DEAD and (pk.heard >> (j - 1)) & 1):
+                    alive.add(j)
+                    break
+        return alive
+
+    def heard_mask(self, now):
+        m = 0
+        for j, p in self.peers.items():
+            if p.last_rx is not None and now - p.last_rx < max(5.0, 3.0 * p.hb_s):
+                m |= 1 << (j - 1)
+        return m
+
+    def open_tasks(self):
+        return [j for j in sorted(self.tasks) if not (self.done >> j) & 1]
+
+    # ───────── ставки и CBAA ─────────
+    def bid_for(self, j, now):
+        if self.withdrawn:
+            return 0
+        t = self.tasks[j]
+        x, y, _ = self.pos()
+        s = (1.0 if t.kind == "TARGET" else 0.8) / (1.0 + ((t.cx - x) ** 2 + (t.cy - y) ** 2) ** 0.5 / 25.0)
+        if self.nav_degraded():
+            s *= 0.6
+        if j == self.exec_task:
+            s *= 1.4
+        if self.prefer.get(j, 0.0) > now:
+            s *= 1.5
+        return max(1, int(round(min(1.5, s) * 2700)))
+
+    def _track_x(self, now):
+        if self.cbaa.x != self._x_last:
+            self._x_last, self.x_since = self.cbaa.x, now
+
+    def reset_cbaa(self, now):
+        avail = set(self.open_tasks())
+        self.cbaa.reset({j: self.bid_for(j, now) for j in avail}, avail)
+        self.cbaa.select()
+        self.vec_changed, self.claim_dirty = now, True
+        self._track_x(now)
+
+    def adopt(self, epoch, now, why):
+        self.epoch = epoch & 0xFF
+        self.reset_cbaa(now)
+        self.log(f"epoch -> {self.epoch} ({why})")
+
+    def bump(self, why, now):
+        self.epoch = (self.epoch + 1) & 0xFF
+        self.last_bump, self.alloc_now = now, True
+        self.reset_cbaa(now)
+        self.log(f"epoch -> {self.epoch} bump: {why}")
+
+    def mark_done(self, j, now):
+        self.done |= 1 << j
+        self.exec_task = None
+        self.log(f"task {self.tasks[j].name} DONE")
+        self.bump("task-done", now)
+
+    # ───────── приём из сети (поток Zenoh) ─────────
+    def _on_wire(self, data):
+        m = wire.unseal(data)
+        if m is None:
+            self.bad_tag += 1
+            return
+        mtype, s, seq, _t, body = m
+        if s == ME or not 1 <= s <= N:
+            return
+        try:
+            with self.lock:
+                now = time.monotonic()
+                if mtype == wire.T_HB:
+                    self._on_hb(s, seq, body, now)
+                elif mtype == wire.T_CLAIM:
+                    self._on_claim(s, body, now)
+                elif mtype == wire.T_ALLOC:
+                    self._on_alloc(s, body, now)
+                elif mtype == wire.T_FAIL:
+                    self._on_fail(s, body, now)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f"rx error type={mtype} from {s}: {e}")
+
+    def _on_hb(self, s, seq, body, now):
+        d, p = wire.dec_hb(body), self.peers[s]
+        if p.seq is not None:
+            gap = (seq - p.seq) & 0xFFFF
+            if gap == 0:
+                return
+            if gap <= 200:
+                for _ in range(gap - 1):
+                    p.q *= 0.9
+            p.q = p.q * 0.9 + 0.1
+        p.seq, p.last_rx, p.rx = seq, now, p.rx + 1
+        p.x, p.y, p.z, p.state, p.flags = d["x"], d["y"], d["z"], d["state"], d["flags"]
+        p.sigma, p.task, p.epoch, p.link_q = d["sigma"], d["task"], d["epoch"], d["link_q"]
+        p.heard, p.heard_rx, p.hb_s = d["heard"], now, max(0.5, d["hb_s"])
+        self.force_dead.discard(s)
+        if sgt(d["epoch"], self.epoch):
+            self.adopt(d["epoch"], now, f"hb from {s}")
+
+    def _on_claim(self, s, body, now):
+        d = wire.dec_claim(body)
+        if sgt(d["epoch"], self.epoch):
+            self.adopt(d["epoch"], now, f"claim from {s}")
+        if d["epoch"] != self.epoch:
+            return
+        y = (d["y"] + [0] * M)[:M]
+        z = (d["z"] + [0] * M)[:M]
+        if self.cbaa.merge(y, z):
+            self.vec_changed, self.claim_dirty = now, True
+            self._track_x(now)
+
+    def _on_alloc(self, s, body, now):
+        d = wire.dec_alloc(body)
+        if sgt(d["epoch"], self.epoch):
+            self.adopt(d["epoch"], now, f"alloc from {s}")
+        new_done = d["done"] & ~self.done
+        new_split = (d["split2"] & ~self.split2) or (d["split3"] & ~self.split3)
+        self.done |= d["done"]
+        self.split2 |= d["split2"]
+        self.split3 |= d["split3"]
+        if new_split:
+            self.tasks = common.build_tasks(self.split2, self.split3)
+            self.reset_cbaa(now)
+        elif new_done:
+            self.cbaa.drop([j for j in range(M) if (new_done >> j) & 1])
+            self.claim_dirty = True
+            self._track_x(now)
+
+    def _on_fail(self, s, body, now):
+        d = wire.dec_fail(body)
+        if sgt(d["epoch"], self.epoch):
+            self.adopt(d["epoch"], now, f"failover from {s}")
+        f = d["failed"]
+        if f in self.peers and f != s:
+            self.force_dead.add(f)
+            self.log(f"peer {f} declared FAILED by {s}")
+
+    # ───────── ROS-вход ─────────
+    def _on_nav(self, msg):
+        try:
+            with self.lock:
+                self.nav = json.loads(msg.data)
+        except json.JSONDecodeError:
+            pass
+
+    def _on_plog(self, msg):
+        try:
+            d = json.loads(msg.data)
+            if d.get("verdict") in ("ACCEPTED", "REJECTED"):
+                with self.lock:
+                    self.llm_ok_t = time.monotonic()
+        except json.JSONDecodeError:
+            pass
+
+    def _on_cmd(self, msg):
+        try:
+            cmd = json.loads(msg.data)
+            with self.lock:
+                ok, text = self._apply_cmd(cmd, time.monotonic())
+                self.last_cmd = {"id": cmd.get("id"), "tool": cmd.get("tool"), "ok": ok, "msg": text}
+                self.log(f"cmd {cmd.get('tool')} -> {'OK' if ok else 'REJECT'}: {text}")
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f"bad cmd: {e}")
+
+    def _apply_cmd(self, cmd, now):
+        tool, a = cmd.get("tool"), cmd.get("args", {})
+        if tool == "NAVIGATE_TO":
+            self._send_goal("WAYPOINTS", [(float(a["x"]), float(a["y"]))])
+            self.override = {"seq": self.goal_seq, "until": now + 90.0, "kind": "WAYPOINTS"}
+            return True, f"override to ({a['x']},{a['y']})"
+        if tool == "SCAN_TARGET":
+            tid = 6 + int(a["target"])
+            if tid not in self.tasks or (self.done >> tid) & 1:
+                return False, "target not open"
+            self.prefer[tid] = now + 60.0
+            self.bump("scan-target", now)
+            return True, f"prefer {self.tasks[tid].name}"
+        if tool == "SPLIT_SECTOR":
+            p, parts = int(a["sector"]), int(a["parts"])
+            if not 0 <= p < common.COLS * common.ROWS or parts not in (2, 3):
+                return False, "bad sector/parts"
+            if (self.done >> p) & 1 or (self.split2 >> p) & 1:
+                return False, "sector done or already split"
+            self.split2 |= 1 << p
+            if parts == 3:
+                self.split3 |= 1 << p
+            self.tasks = common.build_tasks(self.split2, self.split3)
+            self.bump("split-sector", now)
+            return True, f"S{p} split into {parts}"
+        if tool == "DECLARE_FAILOVER":
+            f = int(a["failed"])
+            p = self.peers.get(f)
+            if p is None:
+                return False, "unknown peer"
+            if f in self.alive_set(now):
+                return False, "peer still alive"
+            self.force_dead.add(f)
+            reason = wire.REASONS.get(a.get("reason", "NO_HEARTBEAT"), 0)
+            self.bump("failover", now)
+            self.fail_tx = [(now + i * 1.0, f, reason) for i in range(5)]
+            return True, f"peer {f} declared failed"
+        if tool == "HOLD_POSITION":
+            self._send_goal("HOLD")
+            self.override = {"seq": self.goal_seq, "until": now + 15.0, "kind": "HOLD"}
+            return True, "hold 15 s"
+        if tool == "RETURN_HOME":
+            self.withdrawn, self.exec_task = True, None
+            self._send_goal("HOME", [common.HOME])
+            self.bump("withdraw", now)
+            return True, "returning home"
+        return False, "unknown tool"
+
+    # ───────── цели полёта ─────────
+    def _send_goal(self, kind, wps=None, dwell=0.0, task=wire.NONE, alt=None):
+        self.goal_seq += 1
+        self.goal = {"seq": self.goal_seq, "kind": kind, "wps": [list(w) for w in (wps or [])],
+                     "dwell_s": dwell, "task": task, "alt": alt if alt is not None else common.ALT}
+        self._pub_goal()
+
+    def _pub_goal(self):
+        if self.goal:
+            self.pub_goal.publish(String(data=json.dumps(self.goal)))
+            self.t_goal_pub = time.monotonic()
+
+    def _start_task(self, j, now):
+        t = self.tasks[j]
+        dwell = common.MISSION["target_dwell_s"] if t.kind == "TARGET" else 0.0
+        self._send_goal("WAYPOINTS", common.task_waypoints(t), dwell, j)
+        self.exec_task = j
+        self.log(f"start task {t.name} ({len(self.goal['wps'])} wps)")
+
+    # ───────── главный цикл ─────────
+    def tick(self):
+        with self.lock:
+            now = time.monotonic()
+            self._liveness(now)
+            self._exec(now)
+            self._tx(now)
+            if self.goal and now - self.t_goal_pub > 2.0:
+                self._pub_goal()
+            if now - self.t_state >= 0.5:
+                self.t_state = now
+                self._publish_state(now)
+
+    def _liveness(self, now):
+        alive = self.alive_set(now)
+        if alive != self.alive_prev:
+            for g in sorted(self.alive_prev - alive):
+                self.log(f"peer {g} DEAD")
+            for g in sorted(alive - self.alive_prev):
+                self.log(f"peer {g} ALIVE")
+            self.alive_prev = alive
+            self.pending_bump = True
+        if self.pending_bump and now - self.last_bump > 3.0:
+            self.pending_bump = False
+            self.bump("alive-set", now)
+
+    def _exec(self, now):
+        if not self.nav:
+            return
+        if self.exec_task is not None and (self.done >> self.exec_task) & 1:
+            self.exec_task = None
+            self._send_goal("HOLD")
+        ov = self.override
+        if ov:
+            fin = ov["kind"] == "WAYPOINTS" and self.nav.get("seq") == ov["seq"] and self.nav.get("done")
+            if fin or now > ov["until"]:
+                self.override, self.exec_task = None, None
+                self.log("override finished")
+            else:
+                return
+        if (self.exec_task is not None and self.goal and self.goal["kind"] == "WAYPOINTS"
+                and self.nav.get("seq") == self.goal_seq and self.nav.get("done")):
+            self.mark_done(self.exec_task, now)
+            return
+        if self.withdrawn:
+            return
+        if not self.open_tasks():
+            if not self.mission_done_sent:
+                self.mission_done_sent, self.exec_task = True, None
+                self._send_goal("HOME", [common.HOME])
+                self.log("mission complete, returning home")
+            return
+        x = self.cbaa.x
+        if now - self.x_since < SETTLE_S:
+            return
+        if x is None:
+            if self.exec_task is not None:
+                self.exec_task = None
+                self._send_goal("HOLD")
+        elif x != self.exec_task:
+            self._start_task(x, now)
+
+    def _tx(self, now):
+        q = self.link_quality(now)
+        hb_p, cl_p, al_p, rate = self.periods(q)
+        self.tokens = min(600.0, self.tokens + rate * (now - self.t_refill))
+        self.t_refill = now
+        while self.fail_tx and self.fail_tx[0][0] <= now:
+            _, f, r = self.fail_tx.pop(0)
+            self._send("fail", wire.T_FAIL, wire.enc_fail(f, r, self.epoch), force=True)
+        if now >= self.t_hb:
+            self.t_hb = now + hb_p
+            x, y, z = self.pos()
+            n = self.nav
+            fl = ((wire.FL_GPS_OK if n.get("gps_fix", 0) >= 3 else 0)
+                  | (wire.FL_VIO_OK if n.get("vio_ok") else 0)
+                  | (wire.FL_NAV_DEG if self.nav_degraded() else 0)
+                  | (wire.FL_LLM_OK if now - self.llm_ok_t < 90.0 else 0)
+                  | (wire.FL_AIRBORNE if z > 0.5 else 0)
+                  | (wire.FL_GPS_SUSPECT if n.get("gps_suspect") else 0))
+            body = wire.enc_hb(x, y, z, STATE_CODE.get(n.get("state", "IDLE"), 0), fl, n.get("sigma", 0.0),
+                               self.exec_task if self.exec_task is not None else wire.NONE,
+                               self.epoch, q * 100.0, self.heard_mask(now), hb_p)
+            self._send("hb", wire.T_HB, body)
+        unstable = now - self.vec_changed < 8.0
+        if now >= self.t_claim or (self.claim_dirty and now - self.t_claim_last >= cl_p / 2.0):
+            self.t_claim, self.t_claim_last, self.claim_dirty = now + (cl_p if unstable else 3 * cl_p), now, False
+            self._send("claim", wire.T_CLAIM, wire.enc_claim(self.epoch, self.cbaa.y, self.cbaa.z))
+        if now >= self.t_alloc or self.alloc_now:
+            self.t_alloc, self.alloc_now = now + al_p, False
+            alive = self.alive_set(now)
+            assign = [wire.NONE] * 8
+            for a in range(1, N + 1):
+                if a == ME:
+                    assign[a - 1] = self.exec_task if self.exec_task is not None else wire.NONE
+                elif a in alive:
+                    assign[a - 1] = self.peers[a].task
+            amask = sum(1 << (a - 1) for a in alive)
+            self._send("alloc", wire.T_ALLOC,
+                       wire.enc_alloc(self.epoch, self.done, self.split2, self.split3, assign, amask))
+
+    def _send(self, kind, mtype, body, force=False):
+        cost = (len(body) + wire.HDR.size + wire.TAG_LEN + 48) * (N - 1)
+        if self.tokens < cost and not force:
+            self.dropped[kind] += 1
+            return
+        self.tokens -= cost
+        self.seqs[mtype] = (self.seqs[mtype] + 1) & 0xFFFF
+        data = wire.seal(mtype, ME, self.seqs[mtype], int(time.monotonic() * 1000), body)
+        self.mesh.send(kind, data)
+
+    def _publish_state(self, now):
+        alive = self.alive_set(now)
+        q = self.link_quality(now)
+        hb_p, cl_p, al_p, rate = self.periods(q)
+        peers = {}
+        for j, p in self.peers.items():
+            silent = now - (p.last_rx if p.last_rx is not None else self.t0)
+            peers[str(j)] = {
+                "alive": j in alive, "declared_failed": j in self.force_dead, "silent_s": round(silent, 1),
+                "q": round(self.peer_q(p, now), 2), "x": p.x, "y": p.y, "z": p.z,
+                "task": p.task, "state": wire.NONE if p.last_rx is None else p.state,
+                "flags": p.flags, "epoch": p.epoch,
+                "heard": [k for k in range(1, 9) if (p.heard >> (k - 1)) & 1]}
+        opn = [{"id": j, "name": self.tasks[j].name, "kind": self.tasks[j].kind,
+                "cx": round(self.tasks[j].cx, 1), "cy": round(self.tasks[j].cy, 1),
+                "area": round(self.tasks[j].area),
+                "splittable": j < common.COLS * common.ROWS and not (self.split2 >> j) & 1}
+               for j in self.open_tasks()]
+        x, y, z = self.pos()
+        st = {"t": round(now - self.t0, 1), "me": ME, "epoch": self.epoch, "pos": [x, y, z], "nav": self.nav,
+              "task": self.exec_task, "task_name": self.tasks[self.exec_task].name if self.exec_task is not None else None,
+              "cbaa_x": self.cbaa.x, "winners": {str(j): self.cbaa.z[j] for j in range(M) if self.cbaa.z[j]},
+              "done": [j for j in range(M) if (self.done >> j) & 1], "total_tasks": len(self.tasks),
+              "open": opn, "alive": sorted(alive), "link_q": round(q, 2),
+              "periods": {"hb": hb_p, "claim": cl_p, "alloc": al_p, "rate_Bps": rate},
+              "heard": [k for k in range(1, 9) if (self.heard_mask(now) >> (k - 1)) & 1],
+              "peers": peers, "events": list(self.events)[-10:], "last_cmd": self.last_cmd,
+              "override": self.override["kind"] if self.override else None, "withdrawn": self.withdrawn,
+              "mesh": {"ready": self.mesh.ready, "tuned": self.mesh.tuned, "zenoh_peers": self.mesh.peers_connected(),
+                       "dropped": self.dropped, "bad_tag": self.bad_tag, "tx_bytes": self.mesh.tx_bytes}}
+        self.pub_state.publish(String(data=json.dumps(st)))
+
+
+def main():
+    rclpy.init()
+    node = Coordinator()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 4.8. Полёт и навигация: `swarm/flight_ctrl.py`
+
+Принципы:
+- **Управление скоростью.** В offboard-режиме подаются только уставки скорости (`OffboardControlMode.velocity = True`, позиция NaN). Режим скорости требует только валидной оценки скорости (`v_xy_valid`), поэтому он переживает потерю позиции при глушении GPS. Горизонтальную позицию компаньон считает сам.
+- **Источник позиции.** Приоритет: оценка PX4 (`xy_valid` и нет подозрения на подмену), затем VIO-смещение от якоря, затем интегрирование скорости EKF2.
+- **Монитор GPS (слой B из п. 2.5.1).** Раз в секунду сравнивается смещение позиции PX4 за последние 10 с со смещением VIO. Если расхождение превышает `3 м + 15 % пути VIO` в трёх проверках подряд, поднимается `gps_suspect`, и позиция берётся от VIO с якорем 8 с назад. Подозрение снимается после 8 нормальных проверок подряд.
+- **Обход препятствий.** Потенциальные поля по кольцевому дальномеру (радиус 4 м, аварийный 1,3 м) плюс тангенциальная составляющая против локального минимума. Это простой реактивный механизм без гарантий для вогнутых препятствий.
+
+```python
+#!/usr/bin/env python3
+"""flight_ctrl: offboard-управление PX4 по скорости, навигация по целям от coordinator, обход, монитор GPS."""
+import json
+import math
+import time
+from collections import deque
+
+import rclpy
+from geometry_msgs.msg import PointStamped
+from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleGpsPosition,
+                          VehicleLocalPosition, VehicleStatus)
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
+
+from swarm import common
+
+MS = common.MISSION
+VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, common.ALT
+KP, KZ, VZ_UP, VZ_DN = 0.8, 1.0, 1.2, 0.8
+R_AVOID, R_STOP, K_REP = 4.0, 1.3, 2.0
+PX4_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                     history=HistoryPolicy.KEEP_LAST, depth=1)
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class Flight(Node):
+    def __init__(self):
+        super().__init__("flight_ctrl")
+        ns = f"/{common.PX4_NS}/fmu"
+        self.p_mode = self.create_publisher(OffboardControlMode, f"{ns}/in/offboard_control_mode", PX4_QOS)
+        self.p_sp = self.create_publisher(TrajectorySetpoint, f"{ns}/in/trajectory_setpoint", PX4_QOS)
+        self.p_cmd = self.create_publisher(VehicleCommand, f"{ns}/in/vehicle_command", PX4_QOS)
+        self.p_status = self.create_publisher(String, "/swarm/local/nav_status", 10)
+        self.create_subscription(VehicleLocalPosition, f"{ns}/out/vehicle_local_position", self._on_lpos, qos_profile_sensor_data)
+        self.create_subscription(VehicleStatus, f"{ns}/out/vehicle_status", self._on_vs, qos_profile_sensor_data)
+        self.create_subscription(VehicleGpsPosition, f"{ns}/out/vehicle_gps_position", self._on_gps, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/sensors/lidar_ring/scan", self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(PointStamped, "/swarm/local/vio_disp", self._on_vio, 10)
+        self.create_subscription(String, "/swarm/local/nav_goal", self._on_goal, 10)
+
+        self.lp = self.vs = self.scan = self.vio = self.anc = None
+        self.gps_fix, self.scan_t = 0, 0.0
+        self.px, self.py = common.SPAWN
+        self.pz, self.hdg, self.ve, self.vn, self.sigma, self.src = 0.0, 0.0, 0.0, 0.0, 5.0, "NONE"
+        self.suspect, self.bad, self.good, self.hist = False, 0, 0, deque()
+        self.state, self.label = "WAIT", "IDLE"
+        self.ready_t, self.t_cmd = None, 0.0
+        self.goal, self.seq, self.idx, self.done, self.dwell_t0 = None, None, 0, False, None
+        self.obst_min = 99.0
+        self._t_last = self._t_mon = self._t_stat = time.monotonic()
+        self.create_timer(0.05, self._tick)
+
+    # ───────── подписки ─────────
+    def _on_lpos(self, m):
+        self.lp = m
+
+    def _on_vs(self, m):
+        self.vs = m
+
+    def _on_gps(self, m):
+        self.gps_fix = int(m.fix_type)
+
+    def _on_scan(self, m):
+        self.scan, self.scan_t = m, time.monotonic()
+
+    def _on_vio(self, m):
+        self.vio = (m.point.x, m.point.y, time.monotonic())
+
+    def _on_goal(self, msg):
+        try:
+            g = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if g.get("seq") == self.seq:
+            return
+        self.goal, self.seq, self.idx, self.done, self.dwell_t0 = g, g["seq"], 0, False, None
+
+    def _ts(self):
+        return int(self.get_clock().now().nanoseconds / 1000)
+
+    def _cmd(self, command, p1=0.0, p2=0.0):
+        m = VehicleCommand()
+        m.timestamp, m.command, m.param1, m.param2 = self._ts(), command, float(p1), float(p2)
+        m.target_system, m.target_component = common.DRONE_ID, 1
+        m.source_system, m.source_component, m.from_external = 1, 1, True
+        self.p_cmd.publish(m)
+
+    # ───────── оценка позиции ─────────
+    def _estimate(self, now, dt):
+        lp = self.lp
+        if lp is None:
+            return False
+        wx, wy = common.ned_to_world(lp.x, lp.y)
+        self.pz, self.hdg, self.ve, self.vn = -lp.z, lp.heading, lp.vy, lp.vx
+        vio_fresh = self.vio is not None and now - self.vio[2] < 1.0
+        if lp.xy_valid and not self.suspect:
+            self.px, self.py, self.src = wx, wy, "PX4"
+            self.sigma = float(lp.eph) if math.isfinite(lp.eph) else 5.0
+            if vio_fresh:
+                self.anc = (wx, wy, self.vio[0], self.vio[1])
+        elif vio_fresh and self.anc is not None:
+            self.px = self.anc[0] + self.vio[0] - self.anc[2]
+            self.py = self.anc[1] + self.vio[1] - self.anc[3]
+            self.sigma = min(100.0, self.sigma + (0.02 * math.hypot(self.ve, self.vn) + 0.02) * dt)
+            self.src = "VIO"
+        elif lp.v_xy_valid:
+            self.px, self.py = self.px + self.ve * dt, self.py + self.vn * dt
+            self.sigma = min(100.0, self.sigma + (0.05 * math.hypot(self.ve, self.vn) + 0.1) * dt)
+            self.src = "DR"
+        else:
+            self.src = "NONE"
+        return self.src != "NONE"
+
+    def _monitor(self, now):
+        lp = self.lp
+        if not (lp and lp.xy_valid and self.vio and now - self.vio[2] < 2.0):
+            self.bad = self.good = 0
+            return
+        wx, wy = common.ned_to_world(lp.x, lp.y)
+        self.hist.append((now, wx, wy, self.vio[0], self.vio[1]))
+        while self.hist and now - self.hist[0][0] > 20.0:
+            self.hist.popleft()
+        ref = next((h for h in self.hist if now - h[0] <= 10.0), None)
+        if ref is None or now - ref[0] < 6.0:
+            return
+        dvo = (self.vio[0] - ref[3], self.vio[1] - ref[4])
+        diff = math.hypot((wx - ref[1]) - dvo[0], (wy - ref[2]) - dvo[1])
+        if diff > 3.0 + 0.15 * math.hypot(*dvo):
+            self.bad, self.good = self.bad + 1, 0
+        else:
+            self.good, self.bad = self.good + 1, 0
+        if not self.suspect and self.bad >= 3:
+            self.suspect = True
+            old = [h for h in self.hist if now - h[0] >= 8.0]
+            h = old[-1] if old else self.hist[0]
+            self.anc = (h[1], h[2], h[3], h[4])
+            self.get_logger().warning(f"GPS SUSPECT: px4-vio mismatch {diff:.1f} m -> nav source VIO")
+        elif self.suspect and self.good >= 8:
+            self.suspect = False
+            self.get_logger().info("GPS consistent again -> nav source PX4")
+
+    # ───────── обход препятствий ─────────
+    def _avoid(self, vgx, vgy, now):
+        sc = self.scan
+        if sc is None or now - self.scan_t > 0.5:
+            self.obst_min = 99.0
+            return vgx, vgy
+        psi = math.pi / 2.0 - self.hdg          # курс NED -> yaw ENU
+        rx = ry = 0.0
+        dmin = 99.0
+        for i, r in enumerate(sc.ranges):
+            if not math.isfinite(r) or r >= R_AVOID:
+                continue
+            r = max(r, sc.range_min, 0.1)
+            a = psi + sc.angle_min + i * sc.angle_increment
+            w = 1.0 / r - 1.0 / R_AVOID
+            rx -= w * math.cos(a)
+            ry -= w * math.sin(a)
+            dmin = min(dmin, r)
+        self.obst_min = dmin
+        vx, vy = vgx, vgy
+        if dmin < R_AVOID:
+            g = math.hypot(vgx, vgy)
+            k = clamp((dmin - 0.5) / (R_STOP - 0.5), 0.0, 1.0) if dmin < R_STOP else 1.0
+            vx, vy = vgx * k + K_REP * rx, vgy * k + K_REP * ry
+            mag = math.hypot(rx, ry)
+            if g > 1e-3 and mag > 1e-3:
+                vx += 0.5 * K_REP * mag * (-vgy / g)     # тангенциальная составляющая (обход влево)
+                vy += 0.5 * K_REP * mag * (vgx / g)
+        n = math.hypot(vx, vy)
+        if n > VMAX:
+            vx, vy = vx * VMAX / n, vy * VMAX / n
+        return vx, vy
+
+    # ───────── главный цикл ─────────
+    def _tick(self):
+        now = time.monotonic()
+        dt = clamp(now - self._t_last, 0.0, 0.5)
+        self._t_last = now
+        mode = OffboardControlMode()
+        mode.timestamp = self._ts()
+        mode.position = mode.acceleration = mode.attitude = mode.body_rate = False
+        mode.velocity = True
+        self.p_mode.publish(mode)
+
+        have = self._estimate(now, dt)
+        if now - self._t_mon >= 1.0:
+            self._t_mon = now
+            self._monitor(now)
+
+        vx = vy = vz = 0.0
+        st = self.state
+        if st == "WAIT":
+            ok = (self.lp is not None and self.lp.z_valid and (self.lp.xy_valid or self.lp.v_xy_valid)
+                  and getattr(self.vs, "pre_flight_checks_pass", True))
+            if ok:
+                self.ready_t = self.ready_t or now
+                if now - self.ready_t > 3.0:
+                    self.state, self.t_cmd = "ARMING", 0.0
+            else:
+                self.ready_t = None
+        elif st == "ARMING":
+            if self.vs and self.vs.arming_state == 2 and self.vs.nav_state == 14:
+                self.state, self.label = "TAKEOFF", "TAKEOFF"
+            elif now - self.t_cmd > 1.0:
+                self.t_cmd = now
+                self._cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
+                self._cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
+        elif st == "TAKEOFF":
+            vz = clamp(KZ * (ALT - self.pz), -VZ_DN, VZ_UP)
+            if self.pz > ALT - 0.3:
+                self.state, self.label = "FLY", "HOLD"
+        elif st == "FLY":
+            vx, vy, vz = self._fly(now, have)
+        elif st == "LAND":
+            vz = -VZ_DN * 0.75
+            if self.pz < 0.2:
+                self._cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
+                self.state, self.label = "LANDED", "LANDED"
+
+        sp = TrajectorySetpoint()
+        sp.timestamp = self._ts()
+        nan = float("nan")
+        sp.position, sp.acceleration, sp.jerk = [nan] * 3, [nan] * 3, [nan] * 3
+        sp.velocity = [float(vy), float(vx), float(-vz)]       # ENU -> NED: vN = vy, vE = vx, vD = -vz
+        sp.yaw, sp.yawspeed = nan, 0.0
+        self.p_sp.publish(sp)
+
+        if now - self._t_stat >= 0.2:
+            self._t_stat = now
+            self._publish_status()
+
+    def _fly(self, now, have):
+        g = self.goal
+        alt = g["alt"] if g else ALT
+        vz = clamp(KZ * (alt - self.pz), -VZ_DN, VZ_UP)
+        if not have or g is None or g["kind"] == "HOLD" or (self.done and g["kind"] == "WAYPOINTS"):
+            self.label = "HOLD"
+            return 0.0, 0.0, vz
+        wps = g["wps"]
+        if self.idx >= len(wps):
+            self.done = True
+            if g["kind"] == "HOME":
+                self.state, self.label = "LAND", "RTB"
+            return 0.0, 0.0, vz
+        tx, ty = wps[self.idx]
+        dx, dy = tx - self.px, ty - self.py
+        dist = math.hypot(dx, dy)
+        self.label = "RTB" if g["kind"] == "HOME" else "NAV"
+        if dist < WP_R:
+            last = self.idx == len(wps) - 1
+            if last and g.get("dwell_s", 0.0) > 0.0:
+                self.label = "DWELL"
+                self.dwell_t0 = self.dwell_t0 or now
+                if now - self.dwell_t0 < g["dwell_s"]:
+                    return 0.0, 0.0, vz
+            self.idx, self.dwell_t0 = self.idx + 1, None
+            return 0.0, 0.0, vz
+        v = min(VMAX, max(0.5, KP * dist))
+        vx, vy = self._avoid(dx / dist * v, dy / dist * v, now)
+        return vx, vy, vz
+
+    def _publish_status(self):
+        n = self.lp
+        st = {"seq": self.seq, "idx": self.idx, "done": bool(self.done), "state": self.label, "phase": self.state,
+              "x": round(self.px, 2), "y": round(self.py, 2), "z": round(self.pz, 2),
+              "vx": round(self.ve, 2), "vy": round(self.vn, 2), "hdg": round(math.degrees(self.hdg), 1),
+              "src": self.src, "sigma": round(self.sigma, 1), "gps_fix": self.gps_fix, "gps_suspect": self.suspect,
+              "vio_ok": bool(self.vio and time.monotonic() - self.vio[2] < 1.0),
+              "xy_valid": bool(n and n.xy_valid), "armed": bool(self.vs and self.vs.arming_state == 2),
+              "obst_min": round(self.obst_min, 2)}
+        self.p_status.publish(String(data=json.dumps(st)))
+
+
+def main():
+    rclpy.init()
+    node = Flight()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 4.9. VIO: `swarm/vio_node.py`
+
+Режим «VIO-lite» (контракт п. 3.7):
+- Сдвиг между кадрами оценивается фазовой корреляцией (`cv2.phaseCorrelate` с окном Ханна).
+- Метрический масштаб `h/fx` берётся из нисходящего дальномера, где `fx = w / (2·tan(HFOV/2))`.
+- Скорость делится на `dt` по **штампам симуляции** (U7), поворачивается в NED курсом EKF2 и отправляется в PX4 как `VehicleOdometry` со скоростью (позиция и ориентация NaN).
+- Знак сдвига (`VIO_FLIP_X`, `VIO_FLIP_Y`) проверяется тестом D6: направление фазового сдвига в OpenCV и ориентацию изображения я проверить не мог.
+- Не компенсируются крен и тангаж. При скорости ≤ 3 м/с и углах в единицы градусов это допустимая погрешность.
+
+```python
+#!/usr/bin/env python3
+"""vio_node: оптический поток нижней камеры + высота -> VehicleOdometry (скорость, NED) для EKF2."""
+import math
+import os
+import time
+
+import cv2
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PointStamped
+from px4_msgs.msg import VehicleLocalPosition, VehicleOdometry
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, Image, Range
+
+from swarm import common
+
+RESP_MIN = float(os.environ.get("VIO_RESP_MIN", "0.08"))
+FLIP_X = float(os.environ.get("VIO_FLIP_X", "1"))
+FLIP_Y = float(os.environ.get("VIO_FLIP_Y", "1"))
+PX4_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                     history=HistoryPolicy.KEEP_LAST, depth=1)
+NAN = float("nan")
+
+
+class Vio(Node):
+    def __init__(self):
+        super().__init__("vio_node")
+        ns = f"/{common.PX4_NS}/fmu"
+        self.pub_odo = self.create_publisher(VehicleOdometry, f"{ns}/in/vehicle_visual_odometry", PX4_QOS)
+        self.pub_disp = self.create_publisher(PointStamped, "/swarm/local/vio_disp", 10)
+        self.create_subscription(Image, "/sensors/cam_down/image_raw", self._on_image, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, "/sensors/cam_down/camera_info", self._on_info, qos_profile_sensor_data)
+        self.create_subscription(Range, "/sensors/lidar_down/range", self._on_range, qos_profile_sensor_data)
+        self.create_subscription(VehicleLocalPosition, f"{ns}/out/vehicle_local_position", self._on_lpos, qos_profile_sensor_data)
+        self.fx, self.h, self.hdg, self.win = None, None, None, None
+        self.prev, self.prev_t, self.h_prev, self.vz = None, None, None, 0.0
+        self.E = self.N = 0.0
+
+    def _on_info(self, m):
+        self.fx = m.k[0]
+
+    def _on_range(self, m):
+        if m.min_range <= m.range <= m.max_range:
+            self.h = m.range if self.h is None else 0.7 * self.h + 0.3 * m.range
+
+    def _on_lpos(self, m):
+        self.hdg = m.heading
+
+    def _on_image(self, m):
+        if m.encoding != "mono8" or m.width * m.height != len(m.data):
+            return
+        img = np.frombuffer(m.data, np.uint8).reshape(m.height, m.width).astype(np.float32) / 255.0
+        t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+        if t <= 0.0:
+            t = time.monotonic()
+        if self.win is None:
+            self.win = cv2.createHanningWindow((m.width, m.height), cv2.CV_32F)
+        prev, prev_t = self.prev, self.prev_t
+        self.prev, self.prev_t = img, t
+        if prev is None or not (self.fx and self.h and self.hdg is not None):
+            return
+        dt = t - prev_t
+        if not 0.01 < dt < 0.5:
+            return
+        (dx, dy), resp = cv2.phaseCorrelate(prev, img, self.win)
+        if resp < RESP_MIN:
+            return
+        s = self.h / self.fx                       # м на пиксель
+        f, r = FLIP_Y * dy * s, -FLIP_X * dx * s   # смещение вперёд / вправо, м
+        c, sn = math.cos(self.hdg), math.sin(self.hdg)
+        dN, dE = f * c - r * sn, f * sn + r * c
+        if self.h_prev is not None:
+            self.vz = 0.5 * self.vz + 0.5 * (self.h - self.h_prev) / dt   # вверх
+        self.h_prev = self.h
+        self.E += dE
+        self.N += dN
+        now_us = int(self.get_clock().now().nanoseconds / 1000)            # U7: время ROS для PX4
+        o = VehicleOdometry()
+        o.timestamp = o.timestamp_sample = now_us
+        o.pose_frame, o.velocity_frame = VehicleOdometry.POSE_FRAME_NED, VehicleOdometry.VELOCITY_FRAME_NED
+        o.position, o.q, o.angular_velocity = [NAN] * 3, [NAN] * 4, [NAN] * 3
+        o.velocity = [dN / dt, dE / dt, -self.vz]
+        o.position_variance, o.orientation_variance = [NAN] * 3, [NAN] * 3
+        o.velocity_variance = [0.0225] * 3
+        o.reset_counter, o.quality = 0, int(min(100, resp * 100))
+        self.pub_odo.publish(o)
+        d = PointStamped()
+        d.header.stamp = self.get_clock().now().to_msg()
+        d.point.x, d.point.y, d.point.z = self.E, self.N, self.h
+        self.pub_disp.publish(d)
+
+
+def main():
+    rclpy.init()
+    node = Vio()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 4.10. Edge LLM: планировщик верхнего уровня
+
+### 4.10.1. Инструменты
+
+| Инструмент | Аргументы | Действие в `coordinator` | Проверка валидатором |
+|---|---|---|---|
+| `NAVIGATE_TO` | `x`, `y` (м) | перелёт в точку, переопределяет задачу (до 90 с или до достижения) | внутри зоны поиска ±5 м и вне препятствий + 2 м |
+| `SCAN_TARGET` | `target` 0..3 | усиливает свою ставку на цель ×1,5 на 60 с, новая эпоха | цель есть в списке допустимых |
+| `SPLIT_SECTOR` | `sector` 0..5, `parts` 2 или 3 | делит сектор, новая эпоха | сектор есть в списке допустимых |
+| `DECLARE_FAILOVER` | `failed` 1..8, `reason` | помечает борт отказавшим, рассылает FAILOVER 5 раз, новая эпоха | борт тих ≥ 6 с и не жив по непрямым свидетельствам |
+| `HOLD_POSITION` | — | зависание на 15 с | есть в списке допустимых |
+| `RETURN_HOME` | — | борт выходит из распределения, летит домой и садится | есть в списке допустимых |
+
+Список допустимых действий строит детерминированный код (`build_menu`) по состоянию борта, а модель выбирает из него. Для 0,5B-модели это радикально снижает долю бессмысленных решений. LLM вызывается только тогда, когда список содержит хотя бы одно действие, и не чаще раза в 6 с.
+
+### 4.10.2. Грамматика GBNF: `grammar/actions.gbnf`
+
+```
+root     ::= "{" ws "\"reasoning\":" ws text "," ws "\"tool\":" ws call ws "}"
+call     ::= navigate | scan | split | failover | hold | home
+navigate ::= "\"NAVIGATE_TO\"," ws "\"args\":" ws "{" ws "\"x\":" ws num "," ws "\"y\":" ws num ws "}"
+scan     ::= "\"SCAN_TARGET\"," ws "\"args\":" ws "{" ws "\"target\":" ws dig ws "}"
+split    ::= "\"SPLIT_SECTOR\"," ws "\"args\":" ws "{" ws "\"sector\":" ws dig "," ws "\"parts\":" ws ("2" | "3") ws "}"
+failover ::= "\"DECLARE_FAILOVER\"," ws "\"args\":" ws "{" ws "\"failed\":" ws dig "," ws "\"reason\":" ws reason ws "}"
+hold     ::= "\"HOLD_POSITION\"," ws "\"args\":" ws "{}"
+home     ::= "\"RETURN_HOME\"," ws "\"args\":" ws "{}"
+reason   ::= "\"NO_HEARTBEAT\"" | "\"GPS_LOST\"" | "\"LINK_DEGRADED\"" | "\"NAV_DRIFT\""
+text     ::= "\"" [^"\\\x7F\x00-\x1F]{1,140} "\""
+num      ::= "-"? [0-9]{1,3} ("." [0-9]{1,2})?
+dig      ::= [0-9]
+ws       ::= " "?
+```
+
+Результат гарантированно синтаксически корректный JSON. Допустимость значений (`target`, `sector`, `failed` и координат) проверяет валидатор.
+
+### 4.10.3. Промпт и параметры запроса
+
+Формат ChatML, запрос в `/completion` (сырой промпт, не `/v1/chat/completions`, чтобы грамматика и кэш префикса работали предсказуемо). Системный промпт одинаков между вызовами, поэтому кэшируется (`cache_prompt: true`).
+
+```
+<|im_start|>system
+You are the onboard tactical planner of drone {me} in a swarm of {n}. Choose exactly ONE tool from LEGAL ACTIONS. Reply with JSON only: {"reasoning": "<one short sentence>", "tool": "<NAME>", "args": {...}}. Never choose an action that is not listed. Prefer DECLARE_FAILOVER for silent peers, SCAN_TARGET for open targets when idle, SPLIT_SECTOR only when drones are idle, RETURN_HOME when navigation is unreliable.<|im_end|>
+<|im_start|>user
+t=212s drone=2 pos=(35,-4) alt=3.8 gps=LOST nav_sigma=6m link_q=0.41 epoch=7
+my_task=S3 done=2/9 open=S1,S2,S5,T0,T2
+peers: 1:ok task=S0; 3:silent 14s task=S4; 4:ok task=S1; 5:ok task=none
+events: peer 3 DEAD; gps fix lost
+LEGAL ACTIONS:
+- DECLARE_FAILOVER {"failed": 3, "reason": "NO_HEARTBEAT"} (peer 3 silent 14s)
+- SCAN_TARGET {"target": 0} (T0 open)
+Answer:<|im_end|>
+<|im_start|>assistant
+```
+
+Параметры: `n_predict=160`, `temperature=0.2`, `top_k=20`, `top_p=0.9`, `seed=42`, `stop=["<|im_end|>"]`, `grammar=<содержимое actions.gbnf>`.
+
+### 4.10.4. `swarm/planner_bridge.py`
+
+```python
+#!/usr/bin/env python3
+"""planner_bridge: событийные вызовы локальной LLM (llama.cpp + GBNF), валидатор, публикация команды в coordinator."""
+import json
+import math
+import os
+import threading
+import time
+import urllib.request
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from swarm import common
+
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8080")
+TIMEOUT = float(os.environ.get("LLM_TIMEOUT_S", "20"))
+MIN_GAP_S, PERIODIC_S, T_SUSPECT = 6.0, 20.0, 6.0
+GRAMMAR = open("/opt/grammar/actions.gbnf").read()
+SYSTEM = (
+    "You are the onboard tactical planner of drone {me} in a swarm of {n}. Choose exactly ONE tool from LEGAL ACTIONS. "
+    'Reply with JSON only: {{"reasoning": "<one short sentence>", "tool": "<NAME>", "args": {{...}}}}. '
+    "Never choose an action that is not listed. Prefer DECLARE_FAILOVER for silent peers, SCAN_TARGET for open targets "
+    "when idle, SPLIT_SECTOR only when drones are idle, RETURN_HOME when navigation is unreliable.")
+
+
+def build_menu(st):
+    menu, me = [], st["me"]
+    x, y = st["pos"][0], st["pos"][1]
+    for k, p in st["peers"].items():
+        if not p["alive"] and not p["declared_failed"] and p["silent_s"] >= T_SUSPECT:
+            menu.append({"tool": "DECLARE_FAILOVER", "args": {"failed": int(k), "reason": "NO_HEARTBEAT"},
+                         "text": f'DECLARE_FAILOVER {{"failed": {k}, "reason": "NO_HEARTBEAT"}} (peer {k} silent {p["silent_s"]:.0f}s)'})
+    nav = st["nav"]
+    if st["withdrawn"]:
+        return menu
+    idle = st["task"] is None
+    open_t = st["open"]
+    targets = sorted([t for t in open_t if t["kind"] == "TARGET"], key=lambda t: math.hypot(t["cx"] - x, t["cy"] - y))
+    if (idle or (st["task_name"] or "").startswith("S")) and targets:
+        for t in targets[:2]:
+            menu.append({"tool": "SCAN_TARGET", "args": {"target": t["id"] - 6},
+                         "text": f'SCAN_TARGET {{"target": {t["id"] - 6}}} ({t["name"]} open)'})
+    sectors = [t for t in open_t if t["splittable"] and t["area"] > 400]
+    if sectors and len(open_t) < len(st["alive"]):
+        s = max(sectors, key=lambda t: t["area"])
+        menu.append({"tool": "SPLIT_SECTOR", "args": {"sector": s["id"], "parts": 2},
+                     "text": f'SPLIT_SECTOR {{"sector": {s["id"]}, "parts": 2}} ({s["name"]} is large, drones idle)'})
+    if idle and open_t:
+        t = min(open_t, key=lambda t: math.hypot(t["cx"] - x, t["cy"] - y))
+        menu.append({"tool": "NAVIGATE_TO", "args": {"x": t["cx"], "y": t["cy"]},
+                     "text": f'NAVIGATE_TO {{"x": {t["cx"]}, "y": {t["cy"]}}} (reposition to {t["name"]})'})
+    if nav.get("sigma", 0) > 20 and nav.get("gps_fix", 3) < 3:
+        menu.append({"tool": "HOLD_POSITION", "args": {}, "text": "HOLD_POSITION {} (position uncertainty high)"})
+    if nav.get("sigma", 0) > 40:
+        menu.append({"tool": "RETURN_HOME", "args": {}, "text": "RETURN_HOME {} (navigation unreliable)"})
+    return menu
+
+
+def observation(st):
+    nav, x, y, z = st["nav"], st["pos"][0], st["pos"][1], st["pos"][2]
+    gps = "OK" if nav.get("gps_fix", 0) >= 3 and not nav.get("gps_suspect") else ("SUSPECT" if nav.get("gps_suspect") else "LOST")
+    peers = "; ".join(f'{k}:{"ok" if p["alive"] else f"silent {p["silent_s"]:.0f}s"} task={p["task"] if p["task"] != 255 else "none"}'
+                      for k, p in st["peers"].items())
+    ev = "; ".join(e[1] for e in st["events"][-3:]) or "none"
+    return (f't={st["t"]:.0f}s drone={st["me"]} pos=({x:.0f},{y:.0f}) alt={z:.1f} gps={gps} nav_sigma={nav.get("sigma", 0):.0f}m '
+            f'link_q={st["link_q"]} epoch={st["epoch"]}\n'
+            f'my_task={st["task_name"] or "none"} done={len(st["done"])}/{st["total_tasks"]} open={",".join(t["name"] for t in st["open"]) or "none"}\n'
+            f'peers: {peers}\nevents: {ev}')
+
+
+class Planner(Node):
+    def __init__(self):
+        super().__init__("planner_bridge")
+        self.pub_cmd = self.create_publisher(String, "/swarm/local/planner_cmd", 10)
+        self.pub_log = self.create_publisher(String, "/swarm/local/planner_log", 10)
+        self.create_subscription(String, "/swarm/local/state", self._on_state, 10)
+        self.st, self.busy, self.cmd_id = None, False, 0
+        self.last_call, self.last_sig, self.healthy = 0.0, None, False
+        self.stats = {"calls": 0, "accepted": 0, "rejected": 0, "failed": 0}
+        self.create_timer(1.0, self._tick)
+
+    def _on_state(self, msg):
+        try:
+            self.st = json.loads(msg.data)
+        except json.JSONDecodeError:
+            pass
+
+    def _health(self):
+        try:
+            with urllib.request.urlopen(LLM_URL + "/health", timeout=2) as r:
+                return r.status == 200
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _tick(self):
+        if self.busy or self.st is None:
+            return
+        if not self.healthy:
+            self.healthy = self._health()
+            return
+        now = time.monotonic()
+        if now - self.last_call < MIN_GAP_S:
+            return
+        menu = build_menu(self.st)
+        if not menu:
+            return
+        sig = json.dumps([(m["tool"], m["args"]) for m in menu], sort_keys=True)
+        if sig == self.last_sig and now - self.last_call < PERIODIC_S:
+            return
+        self.busy, self.last_call, self.last_sig = True, now, sig
+        threading.Thread(target=self._run, args=(self.st, menu), daemon=True).start()
+
+    def _run(self, st, menu):
+        t0 = time.monotonic()
+        rec = {"id": self.cmd_id + 1, "t": st["t"], "trigger": menu[0]["tool"], "verdict": "FALLBACK",
+               "reason": "", "reasoning": "", "tool": None, "args": None, "latency_ms": None, "tokens_in": None, "tokens_out": None}
+        try:
+            user = observation(st) + "\nLEGAL ACTIONS:\n" + "\n".join("- " + m["text"] for m in menu) + "\nAnswer:"
+            prompt = (f"<|im_start|>system\n{SYSTEM.format(me=st['me'], n=common.SWARM_SIZE)}<|im_end|>\n"
+                      f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+            body = {"prompt": prompt, "grammar": GRAMMAR, "n_predict": 160, "temperature": 0.2, "top_k": 20,
+                    "top_p": 0.9, "seed": 42, "cache_prompt": True, "stop": ["<|im_end|>"]}
+            req = urllib.request.Request(LLM_URL + "/completion", json.dumps(body).encode(),
+                                         {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                res = json.loads(r.read())
+            rec["latency_ms"] = int((time.monotonic() - t0) * 1000)
+            rec["tokens_in"], rec["tokens_out"] = res.get("tokens_evaluated"), res.get("tokens_predicted")
+            out = json.loads(res["content"])
+            rec.update(reasoning=str(out.get("reasoning", ""))[:140], tool=out.get("tool"), args=out.get("args"))
+            ok, why = self._validate(out, menu, st)
+            self.stats["calls"] += 1
+            if ok:
+                self.cmd_id += 1
+                rec.update(verdict="ACCEPTED", id=self.cmd_id)
+                self.stats["accepted"] += 1
+                self.pub_cmd.publish(String(data=json.dumps({"id": self.cmd_id, "tool": out["tool"], "args": out["args"]})))
+            else:
+                rec.update(verdict="REJECTED", reason=why)
+                self.stats["rejected"] += 1
+        except Exception as e:  # noqa: BLE001
+            rec["reason"] = f"{type(e).__name__}: {e}"[:120]
+            rec["latency_ms"] = int((time.monotonic() - t0) * 1000)
+            self.stats["failed"] += 1
+            self.healthy = self._health()
+        rec["stats"] = dict(self.stats)
+        self.pub_log.publish(String(data=json.dumps(rec)))
+        self.busy = False
+
+    @staticmethod
+    def _validate(out, menu, st):
+        tool, a = out.get("tool"), out.get("args", {})
+        cands = [m for m in menu if m["tool"] == tool]
+        if not cands:
+            return False, "tool not in legal list"
+        if tool == "NAVIGATE_TO":
+            x, y = float(a["x"]), float(a["y"])
+            A = common.AREA
+            if not (A["x_min"] - 5 <= x <= A["x_max"] + 5 and A["y_min"] - 5 <= y <= A["y_max"] + 5):
+                return False, "outside search area"
+            for o in common.OBSTACLES:
+                hx, hy = o["size_m"][0] / 2 + 2.0, o["size_m"][1] / 2 + 2.0
+                if abs(x - o["x_m"]) < hx and abs(y - o["y_m"]) < hy:
+                    return False, f"inside obstacle {o['name']}"
+            return True, ""
+        key = {"SCAN_TARGET": "target", "SPLIT_SECTOR": "sector", "DECLARE_FAILOVER": "failed"}.get(tool)
+        if key and not any(m["args"].get(key) == a.get(key) for m in cands):
+            return False, f"{key} not in legal list"
+        if tool == "SPLIT_SECTOR" and a.get("parts") not in (2, 3):
+            return False, "bad parts"
+        return True, ""
+
+
+def main():
+    rclpy.init()
+    node = Planner()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Из-за f-строки с вложенными кавычками в `observation` нужен Python ≥ 3.12. В образе Humble Python 3.10, поэтому эту строку надо писать без повторных двойных кавычек внутри f-выражения. Исправление:
+
+```python
+def _peer_txt(k, p):
+    s = "ok" if p["alive"] else "silent %.0fs" % p["silent_s"]
+    return "%s:%s task=%s" % (k, s, p["task"] if p["task"] != 255 else "none")
+
+# в observation():  peers = "; ".join(_peer_txt(k, p) for k, p in st["peers"].items())
+```
+
+Эта замена обязательна: в версии выше строка `peers = ...` не пройдёт на Python 3.10 (тест D1 поймает это на этапе запуска).
+
+## 4.11. Телеметрия: `swarm/telemetry.py`
+
+Узел раз в 0,5 с собирает пакет и отправляет `POST {HUD_URL}/{DRONE_ID}` по `mgmt-net` (канал РЭБ его не затрагивает) с заголовком `Authorization: Bearer $EW_TOKEN`. Принимающая сторона (`web-hud`) описывается в разделе 5.
+
+| Поле | Содержание |
+|---|---|
+| `v`, `drone`, `ts` | версия схемы (1), ID борта, UNIX-время |
+| `pos`, `nav` | позиция в мировых ENU и `nav_status` целиком |
+| `swarm` | `epoch`, `task_name`, `winners`, `done`, `open`, `alive`, `peers` (живость, `silent_s`, `q`, позиция, задача), `events` |
+| `mesh` | `link_q`, `periods`, `heard` (рёбра «этот борт слышит k»; граф связности строится объединением по всем бортам), `zenoh_peers`, `dropped`, `bad_tag`, `tx_bytes` |
+| `llm` | `stats` (`calls`, `accepted`, `rejected`, `failed`), `last_latency_ms`, `model` |
+| `thoughts` | последние 20 записей планировщика: `id`, `t`, `trigger`, `reasoning`, `tool`, `args`, `verdict`, `reason`, `latency_ms` (HUD удаляет дубли по `id`) |
+
+```python
+#!/usr/bin/env python3
+"""telemetry: состояние борта -> web-hud (HTTP POST, mgmt-net)."""
+import json
+import os
+import queue
+import threading
+import time
+import urllib.request
+from collections import deque
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from swarm import common
+
+URL = os.environ.get("HUD_URL", "http://172.33.0.5:8000/api/ingest") + f"/{common.DRONE_ID}"
+TOKEN = os.environ.get("EW_TOKEN", "")
+
+
+class Tele(Node):
+    def __init__(self):
+        super().__init__("telemetry")
+        self.state, self.thoughts, self.llm = None, deque(maxlen=20), {}
+        self.q = queue.Queue(maxsize=4)
+        self.create_subscription(String, "/swarm/local/state", self._on_state, 10)
+        self.create_subscription(String, "/swarm/local/planner_log", self._on_log, 10)
+        self.create_timer(0.5, self._tick)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _on_state(self, m):
+        try:
+            self.state = json.loads(m.data)
+        except json.JSONDecodeError:
+            pass
+
+    def _on_log(self, m):
+        try:
+            d = json.loads(m.data)
+        except json.JSONDecodeError:
+            return
+        self.thoughts.append({k: d.get(k) for k in ("id", "t", "trigger", "reasoning", "tool", "args", "verdict", "reason", "latency_ms")})
+        self.llm = {"stats": d.get("stats", {}), "last_latency_ms": d.get("latency_ms"),
+                    "model": "qwen2.5-" + os.environ.get("QWEN_VARIANT", "0.5b") + "-instruct-q4_k_m"}
+
+    def _tick(self):
+        s = self.state
+        if not s:
+            return
+        pkt = {"v": 1, "drone": common.DRONE_ID, "ts": time.time(), "pos": s["pos"], "nav": s["nav"],
+               "swarm": {k: s[k] for k in ("epoch", "task_name", "winners", "done", "open", "alive", "peers", "events",
+                                           "withdrawn", "last_cmd", "total_tasks")},
+               "mesh": {"link_q": s["link_q"], "periods": s["periods"], "heard": s["heard"], **s["mesh"]},
+               "llm": self.llm, "thoughts": list(self.thoughts)}
+        try:
+            self.q.put_nowait(json.dumps(pkt).encode())
+        except queue.Full:
+            pass
+
+    def _worker(self):
+        while True:
+            data = self.q.get()
+            try:
+                req = urllib.request.Request(URL, data, {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"})
+                urllib.request.urlopen(req, timeout=2).read()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def main():
+    rclpy.init()
+    node = Tele()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## 4.12. Критерии приёмки раздела
+
+| № | Критерий | Метод проверки |
+|---|---|---|
+| D1 | Образ `drone-agent` собирается, все 10 процессов в `RUNNING` (в том числе `planner` и `coordinator`, то есть без синтаксических ошибок под Python 3.10) | `docker compose build`; `supervisorctl status` |
+| D2 | `llama-server`: `/health` = ok; суммарный RSS всех процессов борта ≤ 2 GiB (в том числе с 1.5B) | `curl 127.0.0.1:8080/health`; `docker stats` |
+| D3 | Внутри борта ROS-граф виден (multicast на `lo`): `ros2 node list` показывает `vio_node`, `flight_ctrl`, `coordinator`, `planner_bridge`, `telemetry`, `gz_sensor_bridge`; узлов других бортов нет | `ros2 node list` в двух контейнерах |
+| D4 | Взлёт всех бортов: высота = `base_alt + 0,8·(N−1)` ± 0,4 м за ≤ 60 с после старта | `/swarm/local/nav_status` |
+| D5 | Без РЭБ: через 15 с у каждой задачи не более одного исполнителя, `epoch` одинакова на всех бортах | `/swarm/local/state` каждого борта |
+| D6 | **Калибровка VIO.** Полёт вперёд ≈ 10 м: смещение `vio_disp` совпадает с истинным (из Gazebo) с ошибкой ≤ 10 %. При противоположном знаке по оси меняется `VIO_FLIP_X` или `VIO_FLIP_Y` | `gz topic -e`, `ros2 topic echo /swarm/local/vio_disp` |
+| D7 | `ewctl gps denied 1`: борт 1 остаётся в полёте, `src` становится `VIO` или `DR`, `fix_type = 0`, дрейф горизонтальной оценки ≤ 10 % пройденного пути за 60 с | `nav_status`; сравнение с истинной позицией |
+| D8 | `ewctl gps drift 3` (скорость 1,5 м/с): `gps_suspect = true` за ≤ 15 с, ошибка позиции борта 3 относительно истины ≤ 5 м через 30 с после обнаружения | `nav_status`; `GET /v1/gps` моста |
+| D9 | Размер любого пакета ≤ 64 байт (ассерт в коде) и с неверным тегом отбрасывается (`bad_tag` растёт) | отправка пакета с чужим `SWARM_KEY` |
+| D10 | L2 на mesh: распределение без дублей достигается за ≤ 20 с, ни один борт не объявлен мёртвым ошибочно за 5 минут | `/swarm/local/state`, `events` |
+| D11 | L3 на mesh: роёвые решения (CBAA, завершение задач) работают, число ложных `DEAD` ≤ 1 за 5 минут | `events` |
+| D12 | Отказ борта (`docker stop drone-agent-3`): без LLM остальные помечают его мёртвым за ≤ 15 с и перераспределяют его задачу за ≤ 5 с; с LLM и `DECLARE_FAILOVER` за ≤ 9 с | `events`, `winners` |
+| D13 | Задержка решения LLM: 0.5B ≤ 6 с, 1.5B ≤ 12 с (U8). Все ответы синтаксически валидный JSON. Доля принятых валидатором действий фиксируется в отчёте | `planner_log`, `stats` |
+| D14 | L4 на mesh 60 с, затем `restore`: каждый борт продолжает работу (по последнему назначению); после восстановления единое распределение за ≤ 20 с, потерянных или задвоенных задач нет | `/swarm/local/state` |
+| D15 | Mesh-трафик: на `mesh-net` только UDP 7447; бюджет по режимам п. 4.6.4 соблюдается (`tx_bytes` / время) | `tcpdump` внутри `drone-agent-N`; `mesh.tx_bytes` |
+
+## 4.13. Точки риска
+
+Раздел написан без возможности собрать и запустить его в этой среде. Места, где реальное поведение может отличаться, и что делать:
+
+| Место | Ожидание | Признак | Действие |
+|---|---|---|---|
+| Ключи конфигурации Zenoh (`transport.link.tx.lease`, `connect.retry`) | принимаются версией 1.x | в логе `zenoh open (tuned=True) failed`, `mesh.tuned = false` | свериться с `DEFAULT_CONFIG.json5` установленной версии; без них lease 10 с и сессии рвутся на L3 |
+| Zenoh по UDP при потерях 80 % | сессия устанавливается и держится | `zenoh_peers` часто падает до 0 | оценить в D11; запасной вариант: TCP-endpoints (хуже по задержке) или повтор HB в протоколе |
+| Знак `cv2.phaseCorrelate` и ориентация изображения | вперёд = содержимое вниз, вправо = содержимое влево | D6 показывает обратный знак | поменять `VIO_FLIP_X/Y` |
+| Угол кольцевого лидара | угол 0 вперёд, против часовой стрелки | дрон «отталкивается» от пустоты или врезается | сверить `angle_min` и направление в `gz topic -e` |
+| `VehicleOdometry` (поля, `quality`) и `pre_flight_checks_pass` | как в `px4_msgs` `release/1.15` | ошибка атрибута при старте узла | `ros2 interface show px4_msgs/msg/VehicleOdometry`; убрать лишнее поле |
+| Offboard по скорости при потере позиции | PX4 принимает уставки при `v_xy_valid` | `nav_state` выходит из 14 после `gps denied` | оценить в D7; проверить `COM_OBL_ACT` и `COM_OF_LOSS_T` в airframe |
+| DDS внутри борта | multicast на `lo` включается в `entrypoint.sh` | D3 не проходит | профиль Fast DDS с `initialPeersList` и `maxInitialPeersRange=16` для всех процессов |
+| Скорость генерации Qwen на 3 потоках | см. U8 | D13 не проходит | сократить `n_predict`, перейти на 0.5B, проверить `GGML_FLAGS` под CPU хоста |
+| Качество решений 0,5B | высокая доля мусора | в `stats` растёт `rejected` | список допустимых действий уже сужает выбор; результат на работоспособность роя не влияет |
+| Реактивный обход | простые препятствия | зависание у вогнутых препятствий | в сцене они прямоугольные; для сложных нужен планировщик пути, в ТЗ не входит |
+
+---
+
+Раздел 5 (Mission Control и HUD: FastAPI + WebSocket, приём `/api/ingest/{id}`, карта MapLibre/Leaflet в локальных ENU-координатах, индикатор GREEN/JAMMED, граф связности в реальном времени, консоль «мыслей» Qwen) логично идёт следующим, затем раздел 6 (дерево репозитория и развёртывание). Могу написать раздел 5 в том же формате.

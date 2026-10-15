@@ -1,0 +1,9 @@
+name: full_ew
+description: Комбинированная РЭБ-обстановка с постепенной эскалацией
+steps:
+  - {at: 15,  action: mesh, params: {level: L1}}
+  - {at: 45,  action: gps,  params: {mode: drift, drones: [3], rate_mps: 1.5, heading_deg: 90, sigma_m: 0.5}}
+  - {at: 75,  action: mesh, params: {level: L3}}
+  - {at: 75,  action: c2,   params: {}}
+  - {at: 105, action: gps,  params: {mode: denied}}
+  - {at: 150, action: restore, params: {channel: all}}

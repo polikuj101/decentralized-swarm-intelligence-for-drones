@@ -1,0 +1,1659 @@
+# ТЗ: SITL-симулятор роя дронов с Edge AI и модулем РЭБ
+
+## Раздел 1. Системная архитектура и топология контейнеров
+
+### 1.1. Цель и границы системы
+
+Система воспроизводит на одной хост-машине рой из 3–5 квадрокоптеров. Для каждого борта эмулируются полётный контроллер (PX4 SITL) и бортовой компьютер (companion SBC с жёсткими лимитами ресурсов). Бортовой компьютер запускает локальную LLM, ROS 2-координатор и P2P-слой. Отдельный модуль деградирует три канала: GCS-линк, GNSS и межбортовую mesh-связь. Проверяется, как рой сохраняет работоспособность без оператора и без GPS.
+
+Проектные допущения:
+- Версии: PX4 Autopilot **v1.15.x** (удовлетворяет требованию v1.14+ и поддерживает `PX4_GZ_MODEL_NAME` для подключения к уже существующей модели), Gazebo **Harmonic**, ROS 2 **Humble**, `px4_msgs` из ветки `release/1.15`, Micro-XRCE-DDS-Agent **v2.4.x**. Gazebo Harmonic в ROS 2 напрямую не используется, он работает только через gz-transport и плагин PX4. Пакеты `ros_gz` не нужны, поэтому несовпадение «официальных» пар версий ничему не мешает.
+- Рендеринг (камера, rangefinder как `gpu_lidar`) в контейнере без GPU идёт через Mesa llvmpipe. Это медленнее, и целевой Real-Time Factor для 5 бортов задан как RTF ≥ 0,7. При RTF < 0,5 следует снижать число бортов до 3.
+- Числа по скорости LLM ниже (токены в секунду, задержка решения) являются **целевыми проектными показателями**, подлежащими замеру в приёмке (п. 1.10), а не гарантией.
+
+### 1.2. Архитектурная схема
+
+```
+┌───────────────────────────────  HOST (Ubuntu 22.04, Docker Engine + Compose v2) ───────────────────────────────┐
+│                                                                                                                │
+│  ui-net (bridge, не internal)        :8000 ──► браузер оператора                                               │
+│        │                                                                                                       │
+│  ┌─────┴──────┐  c2-net 172.32.0.0/24 (MAVLink UDP 14550)                                                     │
+│  │  web-hud   │◄──────────────────────────────────────────────┐                                               │
+│  │ FastAPI+WS │  mgmt-net 172.33.0.0/24 (HTTP/WS, REST)       │                                               │
+│  └─────┬──────┘◄───────────────┐                              │                                               │
+│        │                       │                              │                                               │
+│  ┌─────┴──────┐          ┌─────┴──────────────────────────────┴──────────────────────────────┐               │
+│  │ ew-injector│─────────►│ drone-agent-N (N=1..5)  cgroup: 4 vCPU / 2 GiB / no GPU            │               │
+│  │ ew-controller│ HTTP   │  ┌──────────────┐ ┌──────────────┐ ┌───────────────┐ ┌──────────┐ │               │
+│  └────────────┘  :9090   │  │ llama-server │ │ ROS 2 nodes  │ │ MicroXRCEAgent│ │ ew-agent │ │               │
+│                          │  │ Qwen2.5 Q4_K_M│◄►│ planner_bridge│◄►│ udp4 -p 8888+N│ │ (tc/nft) │ │               │
+│                          │  │ 127.0.0.1:8080│ │ coordinator  │ └───────┬───────┘ └────┬─────┘ │               │
+│                          │  └──────────────┘ │ mavlink-router│         │              │       │               │
+│                          │                   └──────┬───────┘          │              │       │               │
+│                          └──────────────────────────┼──────────────────┼──────────────┼───────┘               │
+│                                          mesh-net 172.31.0.0/24 │       │ sim-net 172.30.0.0/24                 │
+│                         (Zenoh peer, UDP 7447; ЗДЕСЬ netem)     │       │ (XRCE UDP, MAVLink 14540+i)           │
+│                                                                 │  ┌────┴─────┐                                 │
+│                                                                 │  │  fc-N    │ PX4 SITL instance i=N-1         │
+│                                                                 │  └────┬─────┘                                 │
+│                                                                 │       │ gz-transport (partition=swarm)        │
+│                                                          ┌──────┴───────┴──────┐                                │
+│                                                          │   simulator-core    │ Gazebo Harmonic server (-s)    │
+│                                                          │ world + 5 x500_swarm│ + GPS-jam bridge               │
+│                                                          └─────────────────────┘                                │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Цепочка из ТЗ в терминах этой схемы:
+**Host OS ↔ Gazebo Server (simulator-core) ↔ PX4 SITL (fc-N) ↔ Micro-XRCE-DDS-Agent (внутри drone-agent-N) ↔ ROS 2-ноды ↔ llama.cpp server ↔ P2P Mesh (Zenoh по mesh-net).**
+
+### 1.3. Принципы разделения
+
+1. **PX4 вынесен в отдельный сервис `fc-N`.** В реальности полётный контроллер не делит процессор и память с companion-компьютером. Если запустить PX4 внутри `drone-agent-N`, лимит 4 vCPU/2 GiB будет искажён.
+2. **Четыре обязательных сервиса из ТЗ** (`simulator-core`, `drone-agent-N`, `ew-injector`, `web-hud`) сохранены. `fc-N` добавлен как пятый тип, это сознательное архитектурное расширение.
+3. **Каждый канал живёт в своей сети и на своём сетевом интерфейсе контейнера.** Поэтому `tc netem` на интерфейсе mesh-сети не затрагивает связь PX4↔companion, а отсечение C2 не ломает mesh. Благодаря этому сценарии РЭБ независимы и воспроизводимы.
+4. **Управление РЭБ без `docker.sock`.** В каждом `drone-agent-N` работает лёгкий демон `ew-agent` с `CAP_NET_ADMIN`, слушающий HTTP на mgmt-net, порт 9090. Он применяет `tc`/`nft` в собственном сетевом пространстве имён. `ew-injector` только отправляет ему команды (подробности в разделе 2).
+5. **Companion физически отрезан от симулятора.** Он видит только данные, которые получил бы через XRCE-DDS и MAVLink.
+
+### 1.4. Сети
+
+| Сеть | Подсеть | Тип | Назначение | Участники |
+|---|---|---|---|---|
+| `sim-net` | 172.30.0.0/24 | bridge, `internal: true` | gz-transport, PX4↔XRCE, MAVLink onboard | simulator-core, fc-N, drone-agent-N |
+| `mesh-net` | 172.31.0.0/24 | bridge, `internal: true` | P2P-связь роя (Zenoh) | drone-agent-N |
+| `c2-net` | 172.32.0.0/24 | bridge, `internal: true` | линк «борт ↔ наземная станция» (MAVLink) | drone-agent-N, web-hud |
+| `mgmt-net` | 172.33.0.0/24 | bridge, `internal: true` | управление РЭБ, телеметрия HUD, REST | ew-injector, web-hud, drone-agent-N, simulator-core |
+| `ui-net` | 172.34.0.0/24 | bridge | публикация порта 8000 на хост | web-hud |
+
+Схема адресации (N = 1..5):
+
+| Узел | sim-net | mesh-net | c2-net | mgmt-net |
+|---|---|---|---|---|
+| simulator-core | 172.30.0.2 | – | – | 172.33.0.3 |
+| fc-N | 172.30.0.(10+N) | – | – | – |
+| drone-agent-N | 172.30.0.(20+N) | 172.31.0.(10+N) | 172.32.0.(10+N) | 172.33.0.(10+N) |
+| web-hud | – | – | 172.32.0.2 | 172.33.0.5 |
+| ew-injector | – | – | – | 172.33.0.2 |
+
+### 1.5. Каталог портов и протоколов
+
+| Поток | Протокол/порт | Источник → приёмник | Сеть |
+|---|---|---|---|
+| gz-transport | UDP, discovery + data (`GZ_PARTITION=swarm`) | fc-N ↔ simulator-core | sim-net |
+| MAVLink onboard | UDP 14540+(N−1) | fc-N → drone-agent-N | sim-net |
+| MAVLink GCS (C2) | UDP 14550 | drone-agent-N (mavlink-router) → web-hud | c2-net |
+| XRCE-DDS | UDP 8888+(N−1) | fc-N (uxrce_dds_client) → drone-agent-N (MicroXRCEAgent) | sim-net |
+| llama.cpp | TCP 8080, bind `127.0.0.1` | planner_bridge → llama-server (внутри контейнера) | loopback |
+| Zenoh P2P | UDP 7447, статические endpoints, multicast-scouting отключён | drone-agent-N ↔ drone-agent-M | mesh-net |
+| ew-agent API | TCP 9090 | ew-injector → drone-agent-N | mgmt-net |
+| EW state / телеметрия | HTTP/WS 8000 | drone-agent-N → web-hud, ew-injector → web-hud | mgmt-net |
+| UI | HTTP/WS 8000 | браузер → web-hud | ui-net → host |
+
+Для порта XRCE схема нумерации 8888, 8889, … соответствует требованию. Нумерация экземпляров PX4 нулевая (`px4 -i 0..4`), а `MAV_SYS_ID` равен N (1..5). Механика стартовых параметров (`UXRCE_DDS_PRT`, `UXRCE_DDS_AG_IP`, namespace топиков вида `/px4_N/fmu/...`) описана в разделе 3.
+
+### 1.6. Каталог сервисов
+
+**`simulator-core`**
+- Образ на базе `ubuntu:22.04` с Gazebo Harmonic (`gz-harmonic`) и PX4 `Tools/simulation/gz` (модели и миры).
+- Запуск: `gz sim -s -r --headless-rendering <world>.sdf` (сервер без GUI).
+- Содержит мир, 5 экземпляров модели `x500_swarm_N` (разнесены на 5 м по оси X), мост управления GPS-отказом (раздел 2).
+- Рендеринг: профиль `gpu` (опциональный `deploy.resources.reservations.devices` для nvidia) либо программный Mesa llvmpipe. Лимиты: 6 vCPU, 8 GiB.
+
+**`fc-N`**
+- Образ с собранным `px4_sitl` v1.15.x. Запуск в режиме `PX4_GZ_STANDALONE=1`, с привязкой к модели `PX4_GZ_MODEL_NAME=x500_swarm_N`, `PX4_SYS_AUTOSTART=4001`, `PX4_INSTANCE=N-1`.
+- Лимиты: 1 vCPU, 1 GiB.
+
+**`drone-agent-N`** (эмулятор SBC, например Raspberry Pi 5 / Orange Pi 5)
+Единый образ, процессы под `supervisord`:
+1. `MicroXRCEAgent udp4 -p 8888+(N-1)`
+2. `llama-server` (llama.cpp) с `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` (по умолчанию) или `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf`; параметры: `-c 2048 -t 3 -np 1 --host 127.0.0.1 --port 8080 --grammar-file /opt/grammar/actions.gbnf`
+3. ROS 2-ноды `planner_bridge`, `coordinator`, `telemetry_publisher` (раздел 4)
+4. `mavlink-routerd` (проксирует MAVLink fc-N → web-hud через c2-net)
+5. `ew-agent` (раздел 2)
+
+Лимиты: **4 vCPU, 2 GiB RAM, swap отключён, GPU не передаётся.** Оценка памяти: Qwen2.5-0.5B Q4_K_M имеет файл примерно 0,4 ГБ, 1,5B примерно 1,1 ГБ. При контексте 2048 токенов для 1,5B итоговый RSS всех процессов укладывается в 2 GiB, но с малым запасом (проверяется в приёмке).
+
+**`ew-injector`** (`ew-controller`)
+- Python (FastAPI) сервис. Принимает HTTP-команды и таймерные сценарии, рассылает их на `ew-agent` всех бортов и в мост GPS-отказа `simulator-core`.
+- Лимиты: 0,5 vCPU, 256 MiB.
+
+**`web-hud`**
+- FastAPI + WebSocket бэкенд, статический фронтенд (MapLibre), MAVLink-шлюз на порту 14550/UDP (c2-net).
+- Лимиты: 1 vCPU, 512 MiB.
+
+### 1.7. Лимиты ресурсов (cgroups)
+
+В Compose v2 (без Swarm) ограничения задаются полями `cpus`, `mem_limit`, `memswap_limit`, `pids_limit`, `cpuset`. Закрепление за ядрами нужно, чтобы нагрузка соседнего борта не искажала измерения задержек LLM.
+
+Рекомендуемая карта ядер хоста (16 физических ядер, 5 бортов):
+
+| Сервис | `cpuset` | `cpus` | `mem_limit` |
+|---|---|---|---|
+| drone-agent-1 | 0-3 | 4.0 | 2g |
+| drone-agent-2 | 4-7 | 4.0 | 2g |
+| drone-agent-3 | 8-11 | 4.0 | 2g |
+| drone-agent-4 | 12-15 | 4.0 | 2g |
+| drone-agent-5 | 16-19 | 4.0 | 2g |
+| simulator-core, fc-N, web-hud, ew-injector | 20-27 | см. выше | см. выше |
+
+Профили хоста:
+- **Минимум (3 борта):** 16 логических ядер, 32 GiB RAM, SSD 40 GiB.
+- **Рекомендуется (5 бортов):** 28+ логических ядер (пример выше), 48 GiB RAM, NVIDIA GPU для рендеринга по желанию.
+- Если ядер меньше, `cpuset` снимается и остаётся только `cpus: "2.0"`. Это нужно явно фиксировать в отчёте о тестах, потому что временные характеристики LLM изменятся.
+
+### 1.8. Фрагмент `docker-compose.yml` (топология и ресурсы)
+
+Сетевой блок с тонкой настройкой и `tc`-параметрами приведён в разделе 2. Ниже полный каркас для 5 бортов.
+
+```yaml
+name: swarm-sitl
+
+x-agent: &agent
+  build:
+    context: ./docker/drone-agent
+    args:
+      QWEN_VARIANT: "0.5b"            # "0.5b" | "1.5b"
+  image: swarm/drone-agent:latest
+  cap_add: [NET_ADMIN]
+  mem_swappiness: 0
+  memswap_limit: 2g
+  mem_limit: 2g
+  cpus: "4.0"
+  pids_limit: 512
+  restart: unless-stopped
+  depends_on:
+    simulator-core: { condition: service_healthy }
+
+x-fc: &fc
+  build:
+    context: ./docker/px4-sitl
+  image: swarm/px4-sitl:1.15
+  cpus: "1.0"
+  mem_limit: 1g
+  restart: unless-stopped
+  depends_on:
+    simulator-core: { condition: service_healthy }
+
+services:
+  simulator-core:
+    build: { context: ./docker/simulator-core }
+    image: swarm/simulator-core:latest
+    cpus: "6.0"
+    mem_limit: 8g
+    cpuset: "20-27"
+    environment:
+      GZ_PARTITION: swarm
+      GZ_IP: 172.30.0.2
+      SWARM_SIZE: "5"
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.2 }
+      mgmt-net: { ipv4_address: 172.33.0.3 }
+    healthcheck:
+      test: ["CMD", "gz", "topic", "-l"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  fc-1:
+    <<: *fc
+    environment: { PX4_INSTANCE: "0", PX4_SYS_ID: "1", PX4_GZ_MODEL_NAME: x500_swarm_1, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.11 }
+    networks: { sim-net: { ipv4_address: 172.30.0.11 } }
+  fc-2:
+    <<: *fc
+    environment: { PX4_INSTANCE: "1", PX4_SYS_ID: "2", PX4_GZ_MODEL_NAME: x500_swarm_2, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.12 }
+    networks: { sim-net: { ipv4_address: 172.30.0.12 } }
+  fc-3:
+    <<: *fc
+    environment: { PX4_INSTANCE: "2", PX4_SYS_ID: "3", PX4_GZ_MODEL_NAME: x500_swarm_3, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.13 }
+    networks: { sim-net: { ipv4_address: 172.30.0.13 } }
+  fc-4:
+    <<: *fc
+    environment: { PX4_INSTANCE: "3", PX4_SYS_ID: "4", PX4_GZ_MODEL_NAME: x500_swarm_4, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.14 }
+    networks: { sim-net: { ipv4_address: 172.30.0.14 } }
+  fc-5:
+    <<: *fc
+    environment: { PX4_INSTANCE: "4", PX4_SYS_ID: "5", PX4_GZ_MODEL_NAME: x500_swarm_5, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.15 }
+    networks: { sim-net: { ipv4_address: 172.30.0.15 } }
+
+  drone-agent-1:
+    <<: *agent
+    hostname: drone-agent-1
+    cpuset: "0-3"
+    environment: { DRONE_ID: "1", PX4_INSTANCE: "0", FC_ADDR: 172.30.0.11, XRCE_PORT: "8888", MAVLINK_ONBOARD_PORT: "14540", PEERS: "172.31.0.12,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.11 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.21 }
+      mesh-net: { ipv4_address: 172.31.0.11 }
+      c2-net:   { ipv4_address: 172.32.0.11 }
+      mgmt-net: { ipv4_address: 172.33.0.11 }
+  drone-agent-2:
+    <<: *agent
+    hostname: drone-agent-2
+    cpuset: "4-7"
+    environment: { DRONE_ID: "2", PX4_INSTANCE: "1", FC_ADDR: 172.30.0.12, XRCE_PORT: "8889", MAVLINK_ONBOARD_PORT: "14541", PEERS: "172.31.0.11,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.12 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.22 }
+      mesh-net: { ipv4_address: 172.31.0.12 }
+      c2-net:   { ipv4_address: 172.32.0.12 }
+      mgmt-net: { ipv4_address: 172.33.0.12 }
+  drone-agent-3:
+    <<: *agent
+    hostname: drone-agent-3
+    cpuset: "8-11"
+    environment: { DRONE_ID: "3", PX4_INSTANCE: "2", FC_ADDR: 172.30.0.13, XRCE_PORT: "8890", MAVLINK_ONBOARD_PORT: "14542", PEERS: "172.31.0.11,172.31.0.12,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.13 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.23 }
+      mesh-net: { ipv4_address: 172.31.0.13 }
+      c2-net:   { ipv4_address: 172.32.0.13 }
+      mgmt-net: { ipv4_address: 172.33.0.13 }
+  drone-agent-4:
+    <<: *agent
+    hostname: drone-agent-4
+    cpuset: "12-15"
+    environment: { DRONE_ID: "4", PX4_INSTANCE: "3", FC_ADDR: 172.30.0.14, XRCE_PORT: "8891", MAVLINK_ONBOARD_PORT: "14543", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.15", SELF_MESH_IP: 172.31.0.14 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.24 }
+      mesh-net: { ipv4_address: 172.31.0.14 }
+      c2-net:   { ipv4_address: 172.32.0.14 }
+      mgmt-net: { ipv4_address: 172.33.0.14 }
+  drone-agent-5:
+    <<: *agent
+    hostname: drone-agent-5
+    cpuset: "16-19"
+    environment: { DRONE_ID: "5", PX4_INSTANCE: "4", FC_ADDR: 172.30.0.15, XRCE_PORT: "8892", MAVLINK_ONBOARD_PORT: "14544", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.14", SELF_MESH_IP: 172.31.0.15 }
+    networks:
+      sim-net:  { ipv4_address: 172.30.0.25 }
+      mesh-net: { ipv4_address: 172.31.0.15 }
+      c2-net:   { ipv4_address: 172.32.0.15 }
+      mgmt-net: { ipv4_address: 172.33.0.15 }
+
+  ew-injector:
+    build: { context: ./docker/ew-injector }
+    image: swarm/ew-injector:latest
+    cpus: "0.5"
+    mem_limit: 256m
+    environment:
+      AGENT_URLS: "http://172.33.0.11:9090,http://172.33.0.12:9090,http://172.33.0.13:9090,http://172.33.0.14:9090,http://172.33.0.15:9090"
+      SIM_BRIDGE_URL: "http://172.33.0.3:9100"
+    networks:
+      mgmt-net: { ipv4_address: 172.33.0.2 }
+
+  web-hud:
+    build: { context: ./docker/web-hud }
+    image: swarm/web-hud:latest
+    cpus: "1.0"
+    mem_limit: 512m
+    ports: ["8000:8000"]
+    environment:
+      EW_URL: "http://172.33.0.2:8080"
+    networks:
+      ui-net:   {}
+      c2-net:   { ipv4_address: 172.32.0.2 }
+      mgmt-net: { ipv4_address: 172.33.0.5 }
+
+networks:
+  sim-net:  { driver: bridge, internal: true, ipam: { config: [{ subnet: 172.30.0.0/24 }] } }
+  mesh-net: { driver: bridge, internal: true, ipam: { config: [{ subnet: 172.31.0.0/24 }] } }
+  c2-net:   { driver: bridge, internal: true, ipam: { config: [{ subnet: 172.32.0.0/24 }] } }
+  mgmt-net: { driver: bridge, internal: true, ipam: { config: [{ subnet: 172.33.0.0/24 }] } }
+  ui-net:   { driver: bridge, ipam: { config: [{ subnet: 172.34.0.0/24 }] } }
+```
+
+Примечания:
+- Сборка образов требует интернета в момент `build`. Сети `internal: true` ограничивают только runtime-трафик контейнеров.
+- Для nvidia-рендеринга в `simulator-core` добавляется `deploy.resources.reservations.devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]`. К `drone-agent-N` GPU никогда не подключается, это инвариант системы.
+- Multicast-discovery gz-transport по Linux-bridge обычно работает. Если нет, в разделе 3 дан запасной вариант с unicast-relay.
+
+### 1.9. Порядок старта и healthcheck-цепочка
+
+1. `simulator-core` стартует, поднимает мир и заспавненные модели, healthcheck проходит по `gz topic -l`.
+2. Стартуют `fc-1..5` и подключаются к своим моделям, затем `drone-agent-1..5`.
+3. В каждом `drone-agent-N` порядок процессов: `MicroXRCEAgent` → `llama-server` (прогрев модели, ожидание `/health` = ok) → ROS 2-ноды → `mavlink-routerd` → `ew-agent`.
+4. Стартуют `web-hud` и `ew-injector`.
+5. Система считается готовой, когда у всех бортов в `/fmu/out/vehicle_status` присутствует сообщение, а `/health` у каждого `llama-server` возвращает `ok`.
+
+### 1.10. Критерии приёмки раздела
+
+| № | Критерий | Метод проверки |
+|---|---|---|
+| A1 | `docker compose up --build` поднимает 5 бортов без ручных действий | запуск на чистой Ubuntu 22.04 |
+| A2 | `docker stats` показывает лимиты 4 CPU / 2 GiB на каждый `drone-agent-N`, превышений нет | `docker stats --no-stream` |
+| A3 | RTF симуляции ≥ 0,7 при 5 бортах (≥ 0,9 при 3 бортах) | `gz topic -e -t /stats` |
+| A4 | Генерация одного решения LLM укладывается в целевые ≤ 4 с (0.5B) и ≤ 8 с (1.5B) при 4 vCPU | лог `planner_bridge` |
+| A5 | Применение `tc` на `mesh-net` интерфейсе не меняет задержку и потери на `sim-net` и `c2-net` | `ping`/`iperf3` до и после |
+| A6 | Остановка любого `drone-agent-N` не останавливает остальные борта | `docker stop` и мониторинг HUD |
+
+---
+
+# Раздел 2. Сетевая инфраструктура и эмуляция РЭБ (Traffic Control и Mesh)
+
+## 2.1. Принципы и уточнения к разделу 1
+
+1. **Три независимых канала, три независимых механизма.** Каждый канал деградируется своим инструментом в своём сетевом пространстве имён. Поэтому сценарии РЭБ не влияют друг на друга и воспроизводимы.
+
+| Канал | Сеть | Механизм | Где выполняется |
+|---|---|---|---|
+| C2 (борт ↔ GCS) | `c2-net`, UDP 14550 | `nftables` (drop по портам) | `ew-agent` внутри `drone-agent-N` |
+| GNSS | gz-transport + PX4 | (а) параметры PX4 (флаги `fix_type`, ковариация); (б) ретранслятор `gps-jam-bridge` (дрейф, спуфинг, шум) | `ew-agent` и `simulator-core` |
+| Mesh (борт ↔ борт) | `mesh-net`, UDP 7447 | `tc qdisc ... netem` (потери, задержка, джиттер, полоса) | `ew-agent` внутри `drone-agent-N` |
+
+2. **`netem` действует только на egress** интерфейса, поэтому деградация задаётся на передающей стороне. Если «заглушить» один борт, у него ухудшится только исходящий трафик, как при близком излучателе. Для симметричной деградации (зона подавления) команда рассылается на все борты, это режим по умолчанию.
+3. **Интерфейсы определяются по подсети, а не по имени.** Порядок `eth0..ethN` в контейнере с несколькими сетями не гарантирован, поэтому `ew-agent` ищет интерфейс по CIDR (`172.31.0.0/24` для mesh и т. д.). Интерфейс `mgmt-net` агент не трогает ни при каких условиях, иначе канал управления РЭБ сам оказался бы заглушён.
+4. **Порты MAVLink из ТЗ (14550/14540).** Порт 14550 это C2-линк, его обрыв и есть сценарий «потеря связи с GCS». Порт 14540+i это **бортовой** канал PX4 ↔ companion внутри `sim-net`. Его обрыв моделирует отказ шины между автопилотом и бортовым компьютером, а не РЭБ. Поэтому он отключён по умолчанию и включается флагом `include_onboard=true` (в сценарии он нужен как стресс-тест, не как реалистичное глушение).
+5. **GPS-флаги требуют патча PX4.** В `gz_bridge` PX4 поле `fix_type` фиксировано. Для сценария из ТЗ (`fix_type = 0`, дрейф ковариации) нужен небольшой патч, его интерфейс зафиксирован в п. 2.5. Сам патч (`0001-gz_bridge-gps-jam.patch`) привязывается к конкретному коммиту PX4 и поставляется в разделе 3. Что должен делать патч, определено здесь полностью, а его построчные изменения нужно будет проверить сборкой на выбранном теге.
+6. **Требования к хосту.** Нужна нативная Linux-система или полноценная VM с ядром, имеющим модули `sch_netem`, `sch_prio`, `cls_u32`, `nf_tables`. Docker Desktop и стандартное ядро WSL2 netem обычно не содержат, там сценарии mesh работать не будут.
+
+## 2.2. Сетевой блок и изменения Compose
+
+### 2.2.1. Блок `networks` (заменяет блок из п. 1.8)
+
+```yaml
+networks:
+  sim-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.30.0.0/24, gateway: 172.30.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-sim
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "simulation" }
+
+  mesh-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.31.0.0/24, gateway: 172.31.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-mesh
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "p2p-mesh", swarm.ew: "netem" }
+
+  c2-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.32.0.0/24, gateway: 172.32.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-c2
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "c2-link", swarm.ew: "nft" }
+
+  mgmt-net:
+    driver: bridge
+    internal: true
+    ipam: { config: [{ subnet: 172.33.0.0/24, gateway: 172.33.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-mgmt
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.driver.mtu: "1500"
+    labels: { swarm.role: "management" }
+
+  ui-net:
+    driver: bridge
+    ipam: { config: [{ subnet: 172.34.0.0/24, gateway: 172.34.0.254 }] }
+    driver_opts:
+      com.docker.network.bridge.name: br-swarm-ui
+```
+
+Шлюзы заданы на `.254`, чтобы адреса `.1`–`.15` оставались свободными под сервисы. `internal: true` отключает выход в интернет, на runtime-трафик между контейнерами это не влияет.
+
+### 2.2.2. Файл `docker-compose.override.yml`
+
+Compose подхватывает его автоматически, поэтому команда `docker compose up --build` не меняется. В итоговом репозитории (раздел 6) эти блоки сливаются в основной файл.
+
+```yaml
+x-ew-env: &ew-env
+  SWARM_SIZE: "5"
+  EW_TOKEN: ${EW_TOKEN:?задайте EW_TOKEN в файле .env}
+  MESH_CIDR: 172.31.0.0/24
+  C2_CIDR: 172.32.0.0/24
+  SIM_CIDR: 172.30.0.0/24
+
+services:
+  drone-agent-1: { environment: { <<: *ew-env, SELF_MGMT_IP: 172.33.0.11 } }
+  drone-agent-2: { environment: { <<: *ew-env, SELF_MGMT_IP: 172.33.0.12 } }
+  drone-agent-3: { environment: { <<: *ew-env, SELF_MGMT_IP: 172.33.0.13 } }
+  drone-agent-4: { environment: { <<: *ew-env, SELF_MGMT_IP: 172.33.0.14 } }
+  drone-agent-5: { environment: { <<: *ew-env, SELF_MGMT_IP: 172.33.0.15 } }
+
+  simulator-core:
+    environment:
+      GZ_WORLD: swarm_world
+      SWARM_SIZE: "5"
+    ports: []          # порт 9100 наружу не публикуется, только mgmt-net
+
+  ew-injector:
+    environment:
+      EW_TOKEN: ${EW_TOKEN:?задайте EW_TOKEN в файле .env}
+      SCENARIO_DIR: /app/scenarios
+    networks:
+      ui-net: {}
+    ports:
+      - "127.0.0.1:8080:8080"     # доступ с хоста только с loopback (для ewctl.sh)
+    volumes:
+      - ./scenarios:/app/scenarios:ro
+```
+
+Файл `.env` в корне репозитория: `EW_TOKEN=<случайная строка, например из openssl rand -hex 16>`.
+
+## 2.3. Профили деградации
+
+### 2.3.1. Уровни mesh
+
+Для `delay` и `jitter` используется `distribution normal`. Значение `jitter` задаёт σ нормального распределения, поэтому отдельные пакеты могут приходить с задержкой более 1 с. Это нормально для профиля L3, и **переупорядочивание пакетов при этом ожидаемо**. Протокол раздела 4 обязан к нему быть устойчивым.
+
+| Уровень | Название | Потери | Корреляция потерь | Задержка | Джиттер (σ) | Полоса | Очередь `limit` |
+|---|---|---|---|---|---|---|---|
+| L1 | Слабое подавление | 30 % | 25 % | 50 мс | 50 мс | 64 кбит/с | 100 пак. |
+| L2 | Среднее | 50 % | 30 % | 200 мс | 200 мс | 20 кбит/с | 60 пак. |
+| L3 | Сильное | 80 % | 40 % | 500 мс | 500 мс | 5 кбит/с | 40 пак. |
+| L4 | Блэкаут | 100 % | – | – | – | – | 10 пак. |
+
+Любой параметр можно задать явно через API, уровень служит только набором значений по умолчанию.
+
+### 2.3.2. Расчёт пропускной способности на L3
+
+Пакет на проводе: 64 байта полезной нагрузки + 8 (UDP) + 20 (IP) = 92 байта = 736 бит. При 5 кбит/с это около **6,8 пакета/с**. Если бортов пять и каждый шлёт Heartbeat по 2 Гц четырём соседям, нужно 8 пакетов/с. Канал при этом **перегружен ещё до учёта потерь**, поэтому раздел 4 должен предусматривать адаптивное снижение частоты Heartbeat и приоритет Target Claim над Heartbeat при уровне L3. Очередь с `limit 40` даёт tail-drop, как у реального перегруженного канала.
+
+## 2.4. `ew-agent` (исполнитель РЭБ в `drone-agent-N`)
+
+### 2.4.1. API агента (порт 9090, привязан к IP `mgmt-net`)
+
+Все запросы, кроме `/healthz`, требуют заголовок `Authorization: Bearer $EW_TOKEN`.
+
+| Метод и путь | Тело | Действие |
+|---|---|---|
+| `GET /healthz` | – | живость агента |
+| `GET /v1/status` | – | состояние трёх каналов, имена интерфейсов, вывод `tc qdisc show` и `nft list ruleset` |
+| `POST /v1/c2` | `{"ports":[14550],"include_onboard":false}` | обрыв C2 |
+| `DELETE /v1/c2` | – | восстановление C2 |
+| `POST /v1/mesh` | `{"loss_pct":80,"loss_corr_pct":40,"delay_ms":500,"jitter_ms":500,"rate_kbit":5,"limit_pkts":40,"peers":null}` | деградация mesh; `peers` — список ID бортов, для которых ухудшается канал (`null` — все) |
+| `DELETE /v1/mesh` | – | восстановление mesh |
+| `POST /v1/gps` | `{"mode":"denied"}` или `{"mode":"degraded","eph_start_m":5,"eph_end_m":60,"ramp_s":30}` | установка флагов GPS в PX4 |
+| `DELETE /v1/gps` | – | `SIM_GPS_JAM=0` |
+| `POST /v1/reset` | – | сброс всех трёх каналов |
+
+### 2.4.2. Код: `docker/drone-agent/ew/ew_agent.py`
+
+```python
+#!/usr/bin/env python3
+"""ew-agent: исполнитель РЭБ внутри drone-agent-N.
+C2   -> nftables (drop по портам)
+Mesh -> tc netem (root netem либо prio + u32 по dst-IP пира)
+GNSS -> MAVLink PARAM_SET параметров SIM_GPS_JAM / SIM_GPS_JAM_EPH (патч PX4, см. п. 2.5)
+"""
+import ipaddress
+import json
+import logging
+import os
+import struct
+import subprocess
+import threading
+import time
+from typing import Literal
+
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from pymavlink import mavutil
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s ew-agent %(message)s")
+log = logging.getLogger("ew-agent")
+
+DRONE_ID = int(os.environ["DRONE_ID"])
+SWARM_SIZE = int(os.environ.get("SWARM_SIZE", "5"))
+EW_TOKEN = os.environ.get("EW_TOKEN", "")
+MESH_NET = ipaddress.ip_network(os.environ.get("MESH_CIDR", "172.31.0.0/24"))
+C2_NET = ipaddress.ip_network(os.environ.get("C2_CIDR", "172.32.0.0/24"))
+SIM_NET = ipaddress.ip_network(os.environ.get("SIM_CIDR", "172.30.0.0/24"))
+MAV_ENDPOINT = os.environ.get("EW_MAVLINK", "udpout:127.0.0.1:14600")
+ONBOARD_PORT = 14540 + (DRONE_ID - 1)
+GCS_PORT = 14550
+
+
+class EwError(Exception):
+    pass
+
+
+def sh(cmd: list[str], check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
+    log.info("exec: %s", " ".join(cmd))
+    r = subprocess.run(cmd, input=stdin, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise EwError(f"{' '.join(cmd)} -> rc={r.returncode}: {r.stderr.strip()}")
+    return r
+
+
+def iface_for(net: ipaddress.IPv4Network) -> str:
+    out = sh(["ip", "-j", "-4", "addr", "show"]).stdout
+    for link in json.loads(out):
+        for a in link.get("addr_info", []):
+            if ipaddress.ip_address(a["local"]) in net:
+                return link["ifname"]
+    raise EwError(f"interface for {net} not found")
+
+
+IF = {"mesh": iface_for(MESH_NET), "c2": iface_for(C2_NET), "sim": iface_for(SIM_NET)}
+log.info("interfaces: %s", IF)
+
+
+def peer_ip(pid: int) -> str:
+    return str(MESH_NET.network_address + 10 + pid)   # drone K -> .(10+K)
+
+
+lock = threading.RLock()
+state = {
+    "c2": {"active": False, "ports": [], "include_onboard": False, "since": None},
+    "gps": {"active": False, "mode": "off", "eph_m": None, "since": None},
+    "mesh": {"active": False, "profile": None, "since": None},
+}
+
+# ───────────────────────────── C2 (nftables) ─────────────────────────────
+
+def _nft_rules(iface: str, ports: list[int]) -> str:
+    pset = "{ " + ", ".join(str(p) for p in ports) + " }"
+    return (
+        f'    iifname "{iface}" udp dport {pset} counter drop\n'
+        f'    iifname "{iface}" udp sport {pset} counter drop\n'
+    ), (
+        f'    oifname "{iface}" udp dport {pset} counter drop\n'
+        f'    oifname "{iface}" udp sport {pset} counter drop\n'
+    )
+
+
+def c2_cut(ports: list[int], include_onboard: bool) -> None:
+    in_r, out_r = _nft_rules(IF["c2"], ports)
+    if include_onboard:
+        i2, o2 = _nft_rules(IF["sim"], [ONBOARD_PORT])
+        in_r += i2
+        out_r += o2
+    script = (
+        "table inet ew\n"
+        "delete table inet ew\n"
+        "table inet ew {\n"
+        "  chain ew_in {\n    type filter hook input priority 0; policy accept;\n" + in_r + "  }\n"
+        "  chain ew_out {\n    type filter hook output priority 0; policy accept;\n" + out_r + "  }\n"
+        "}\n"
+    )
+    sh(["nft", "-f", "-"], stdin=script)
+    state["c2"] = {"active": True, "ports": ports, "include_onboard": include_onboard, "since": time.time()}
+
+
+def c2_restore() -> None:
+    sh(["nft", "delete", "table", "inet", "ew"], check=False)
+    state["c2"] = {"active": False, "ports": [], "include_onboard": False, "since": None}
+
+# ───────────────────────────── Mesh (tc netem) ─────────────────────────────
+
+class MeshProfile(BaseModel):
+    loss_pct: float = Field(0, ge=0, le=100)
+    loss_corr_pct: float = Field(25, ge=0, le=100)
+    delay_ms: int = Field(0, ge=0, le=10000)
+    jitter_ms: int = Field(0, ge=0, le=10000)
+    rate_kbit: int | None = Field(None, ge=1)
+    limit_pkts: int = Field(50, ge=1, le=10000)
+    peers: list[int] | None = None
+
+
+def netem_args(p: MeshProfile) -> list[str]:
+    a = ["netem", "limit", str(p.limit_pkts)]
+    if p.delay_ms or p.jitter_ms:
+        a += ["delay", f"{p.delay_ms}ms"]
+        if p.jitter_ms:
+            a += [f"{p.jitter_ms}ms", "distribution", "normal"]
+    if p.loss_pct > 0:
+        a += ["loss", f"{p.loss_pct:g}%"]
+        if p.loss_corr_pct > 0:
+            a += [f"{p.loss_corr_pct:g}%"]
+    if p.rate_kbit:
+        a += ["rate", f"{p.rate_kbit}kbit"]
+    return a
+
+
+def mesh_apply(p: MeshProfile) -> None:
+    dev = IF["mesh"]
+    sh(["tc", "qdisc", "del", "dev", dev, "root"], check=False)
+    if p.peers is None:
+        sh(["tc", "qdisc", "add", "dev", dev, "root"] + netem_args(p))
+    else:
+        for pid in p.peers:
+            if not (1 <= pid <= SWARM_SIZE) or pid == DRONE_ID:
+                raise EwError(f"invalid peer id {pid}")
+        # band 1 (1:1) — трафик без деградации; band k+1 — пир с ID=k
+        sh(["tc", "qdisc", "add", "dev", dev, "root", "handle", "1:", "prio",
+            "bands", str(SWARM_SIZE + 1), "priomap"] + ["0"] * 16)
+        for pid in p.peers:
+            band = pid + 1
+            sh(["tc", "qdisc", "add", "dev", dev, "parent", f"1:{band}", "handle", f"{10 + pid}:"]
+               + netem_args(p))
+            sh(["tc", "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
+                "u32", "match", "ip", "dst", f"{peer_ip(pid)}/32", "flowid", f"1:{band}"])
+    state["mesh"] = {"active": True, "profile": p.model_dump(), "since": time.time()}
+
+
+def mesh_restore() -> None:
+    sh(["tc", "qdisc", "del", "dev", IF["mesh"], "root"], check=False)
+    state["mesh"] = {"active": False, "profile": None, "since": None}
+
+# ───────────────────────────── GNSS (PX4 params via MAVLink) ─────────────────────────────
+
+_master = None
+_ramp_stop = threading.Event()
+
+
+def _mav():
+    global _master
+    if _master is None:
+        m = mavutil.mavlink_connection(MAV_ENDPOINT, source_system=250, source_component=191)
+        m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        if m.wait_heartbeat(timeout=5) is None:
+            raise EwError("no heartbeat from FC via mavlink-router")
+        _master = m
+    return _master
+
+
+def set_param(name: str, value: float, ptype: str) -> None:
+    """PX4 принимает INT32 побайтово (bytewise), REAL32 как float."""
+    m = _mav()
+    if ptype == "int32":
+        raw = struct.unpack("<f", struct.pack("<i", int(value)))[0]
+        t = mavutil.mavlink.MAV_PARAM_TYPE_INT32
+    else:
+        raw = float(value)
+        t = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    for _ in range(3):
+        m.mav.param_set_send(DRONE_ID, 1, name.encode(), raw, t)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            msg = m.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
+            if msg is None:
+                continue
+            pid = msg.param_id if isinstance(msg.param_id, str) else msg.param_id.decode()
+            if pid.rstrip("\x00") != name:
+                continue
+            got = (struct.unpack("<i", struct.pack("<f", msg.param_value))[0]
+                   if ptype == "int32" else msg.param_value)
+            if abs(got - value) < 1e-3:
+                return
+    raise EwError(f"PARAM_SET {name}={value} not confirmed (is the PX4 GPS-jam patch applied?)")
+
+
+def _stop_ramp() -> None:
+    _ramp_stop.set()
+
+
+def _ramp(stop: threading.Event, a: float, b: float, secs: float) -> None:
+    t0 = time.monotonic()
+    while not stop.wait(1.0):
+        f = min(1.0, (time.monotonic() - t0) / secs)
+        try:
+            set_param("SIM_GPS_JAM_EPH", a + (b - a) * f, "float")
+            state["gps"]["eph_m"] = round(a + (b - a) * f, 2)
+        except EwError as e:
+            log.warning("ramp: %s", e)
+        if f >= 1.0:
+            return
+
+
+class GpsReq(BaseModel):
+    mode: Literal["denied", "degraded"] = "denied"
+    eph_start_m: float = Field(5.0, ge=0.5, le=10000)
+    eph_end_m: float = Field(60.0, ge=0.5, le=10000)
+    ramp_s: float = Field(30.0, ge=0)
+
+
+def gps_apply(r: GpsReq) -> None:
+    global _ramp_stop
+    _stop_ramp()
+    if r.mode == "denied":
+        set_param("SIM_GPS_JAM", 1, "int32")
+        state["gps"] = {"active": True, "mode": "denied", "eph_m": None, "since": time.time()}
+        return
+    set_param("SIM_GPS_JAM_EPH", r.eph_start_m, "float")
+    set_param("SIM_GPS_JAM", 2, "int32")
+    state["gps"] = {"active": True, "mode": "degraded", "eph_m": r.eph_start_m, "since": time.time()}
+    if r.ramp_s > 0 and r.eph_end_m != r.eph_start_m:
+        _ramp_stop = threading.Event()
+        threading.Thread(target=_ramp, args=(_ramp_stop, r.eph_start_m, r.eph_end_m, r.ramp_s),
+                         daemon=True).start()
+
+
+def gps_restore() -> None:
+    _stop_ramp()
+    set_param("SIM_GPS_JAM", 0, "int32")
+    state["gps"] = {"active": False, "mode": "off", "eph_m": None, "since": None}
+
+
+def reset_all(tolerate_gps: bool = False) -> None:
+    c2_restore()
+    mesh_restore()
+    try:
+        gps_restore()
+    except EwError as e:
+        if not tolerate_gps:
+            raise
+        log.warning("gps reset skipped at startup: %s", e)
+
+# ───────────────────────────── HTTP API ─────────────────────────────
+
+def auth(authorization: str = Header(default="")):
+    if EW_TOKEN and authorization != f"Bearer {EW_TOKEN}":
+        raise HTTPException(401, "bad token")
+
+
+app = FastAPI(title=f"ew-agent-{DRONE_ID}")
+router = APIRouter(dependencies=[Depends(auth)])
+
+
+@app.exception_handler(EwError)
+async def ew_error(_: Request, exc: EwError):
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+class C2Req(BaseModel):
+    ports: list[int] = [GCS_PORT]
+    include_onboard: bool = False
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "drone": DRONE_ID}
+
+
+@router.get("/v1/status")
+def status():
+    with lock:
+        return {
+            "drone": DRONE_ID, "ifaces": IF, **state,
+            "tc": sh(["tc", "qdisc", "show", "dev", IF["mesh"]], check=False).stdout,
+            "nft": sh(["nft", "list", "ruleset"], check=False).stdout,
+        }
+
+
+@router.post("/v1/c2")
+def post_c2(r: C2Req):
+    with lock:
+        c2_cut(r.ports, r.include_onboard)
+        return state["c2"]
+
+
+@router.delete("/v1/c2")
+def del_c2():
+    with lock:
+        c2_restore()
+        return state["c2"]
+
+
+@router.post("/v1/mesh")
+def post_mesh(p: MeshProfile):
+    with lock:
+        mesh_apply(p)
+        return state["mesh"]
+
+
+@router.delete("/v1/mesh")
+def del_mesh():
+    with lock:
+        mesh_restore()
+        return state["mesh"]
+
+
+@router.post("/v1/gps")
+def post_gps(r: GpsReq):
+    with lock:
+        gps_apply(r)
+        return state["gps"]
+
+
+@router.delete("/v1/gps")
+def del_gps():
+    with lock:
+        gps_restore()
+        return state["gps"]
+
+
+@router.post("/v1/reset")
+def post_reset():
+    with lock:
+        reset_all()
+        return state
+
+
+app.include_router(router)
+
+
+@app.on_event("startup")
+def on_startup():
+    with lock:
+        reset_all(tolerate_gps=True)
+```
+
+Поведение при перезапуске: при старте агент очищает все правила. Если `ew-agent` упал во время сценария, supervisord перезапустит его, и деградация снимется. Это сознательное решение: «залипший» глушитель хуже, чем снятый.
+
+### 2.4.3. Ручная отладка: `docker/drone-agent/ew/ew-tc.sh`
+
+Скрипт для случаев, когда агент недоступен или нужно проверить `tc` руками. Запуск: `docker compose exec drone-agent-1 ew-tc.sh set 80 40 500 500 5`.
+
+```bash
+#!/usr/bin/env bash
+# ew-tc.sh set <loss%> <corr%> <delay_ms> <jitter_ms> <rate_kbit|0> [limit]
+# ew-tc.sh clear | show
+set -euo pipefail
+MESH_CIDR="${MESH_CIDR:-172.31.0.0/24}"
+
+dev=$(ip -j -4 addr show | python3 -c '
+import sys, json, ipaddress
+net = ipaddress.ip_network(sys.argv[1])
+for l in json.load(sys.stdin):
+    for a in l.get("addr_info", []):
+        if ipaddress.ip_address(a["local"]) in net:
+            print(l["ifname"]); sys.exit(0)
+sys.exit("mesh interface not found")' "$MESH_CIDR")
+
+case "${1:-}" in
+  set)
+    loss="${2:?loss%}"; corr="${3:?corr%}"; delay="${4:?delay_ms}"; jit="${5:?jitter_ms}"
+    rate="${6:?rate_kbit or 0}"; limit="${7:-50}"
+    tc qdisc del dev "$dev" root 2>/dev/null || true
+    args=(netem limit "$limit" delay "${delay}ms" "${jit}ms" distribution normal loss "${loss}%" "${corr}%")
+    [ "$rate" != "0" ] && args+=(rate "${rate}kbit")
+    tc qdisc add dev "$dev" root "${args[@]}"
+    tc qdisc show dev "$dev" ;;
+  clear) tc qdisc del dev "$dev" root 2>/dev/null || true; echo "cleared on $dev" ;;
+  show)  tc -s qdisc show dev "$dev" ;;
+  *) echo "usage: $0 set|clear|show" >&2; exit 2 ;;
+esac
+```
+
+### 2.4.4. Конфиг `mavlink-router` (`/etc/mavlink-router/main.conf`)
+
+Агенту нужен локальный endpoint `ew`. Остальные endpoint'ы уточняются в разделе 4, здесь приведён минимум для работы РЭБ.
+
+```ini
+[General]
+TcpServerPort = 0
+ReportStats = false
+
+[UdpEndpoint fc]
+Mode = Server
+Address = 0.0.0.0
+Port = ${MAVLINK_ONBOARD_PORT}
+
+[UdpEndpoint gcs]
+Mode = Normal
+Address = 172.32.0.2
+Port = 14550
+
+[UdpEndpoint ew]
+Mode = Server
+Address = 127.0.0.1
+Port = 14600
+```
+
+`${MAVLINK_ONBOARD_PORT}` подставляется `envsubst` в entrypoint (14540 + i). Важно: endpoint `gcs` отправляет на `172.32.0.2:14550` через интерфейс `c2-net`. Именно эти пакеты отсекают правила `nft` при обрыве C2.
+
+### 2.4.5. Фрагменты образа `drone-agent`
+
+Установка зависимостей (дополнение к Dockerfile раздела 4):
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      iproute2 nftables iputils-ping iperf3 curl tcpdump python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" \
+      "pydantic==2.*" "pymavlink==2.4.*"
+COPY ew/ew_agent.py /opt/ew/ew_agent.py
+COPY ew/ew-tc.sh /usr/local/bin/ew-tc.sh
+RUN chmod +x /usr/local/bin/ew-tc.sh
+```
+
+Секция `supervisord.conf` (запускается после `mavlink-routerd`):
+
+```ini
+[program:ew-agent]
+command=uvicorn ew_agent:app --host %(ENV_SELF_MGMT_IP)s --port 9090 --log-level info
+directory=/opt/ew
+priority=50
+autostart=true
+autorestart=true
+startsecs=3
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+```
+
+Привязка к `SELF_MGMT_IP` означает, что API агента недоступен из `mesh-net`, `c2-net` и `sim-net`. Это нужно и для безопасности, и чтобы глушение не могло отрезать управление.
+
+## 2.5. Глушение GPS
+
+### 2.5.1. Два слоя
+
+| Слой | Где | Что моделирует | Режимы |
+|---|---|---|---|
+| A. Флаги и ковариация PX4 | патч `gz_bridge` + `ew-agent` | потеря или ухудшение фикса, как её видит приёмник | `denied`, `degraded` |
+| B. Искажение координат | `gps-jam-bridge` в `simulator-core` | скрытый дрейф и спуфинг при формально «хорошем» фиксе | `noise`, `drift`, `spoof` |
+
+Слой B опаснее для навигации, потому что приёмник считает фикс нормальным. На нём проверяется, способен ли борт заметить расхождение GPS с VIO.
+
+### 2.5.2. Контракт патча PX4 (слой A)
+
+Патч `gz_bridge` (поставка в разделе 3) добавляет два параметра, не сохраняемых между перезапусками: `SIM_GPS_JAM` (INT32) и `SIM_GPS_JAM_EPH` (FLOAT, метры). В колбэке `NavSat` перед публикацией `sensor_gps` значения подменяются так:
+
+| `SIM_GPS_JAM` | `fix_type` | `satellites_used` | `eph` / `epv` | Дополнительно |
+|---|---|---|---|---|
+| 0 (норма) | 3 | как в симуляторе | как в симуляторе | – |
+| 1 (denied) | **0** | **0** | 9999 / 9999 | `s_variance_m_s` = 100; `jamming_state` = 3 (critical), если поле есть в `sensor_gps.msg` выбранного тега |
+| 2 (degraded) | 2 | 4 | `SIM_GPS_JAM_EPH` / 1,5 × `SIM_GPS_JAM_EPH` | `jamming_state` = 2 (warning), если поле есть |
+
+В режиме 2 `ew-agent` линейно меняет `SIM_GPS_JAM_EPH` от `eph_start_m` до `eph_end_m` за `ramp_s` секунд, это и есть «дрейф ковариации» из ТЗ. После сборки наличие полей `jamming_state` и применимость значений проверяются по `sensor_gps.msg` выбранного тега PX4 (п. 2.9, тест B2).
+
+Для работы слоя B модель `x500_swarm_N` (раздел 3) задаёт сенсору `navsat_sensor` явный топик `/swarm/N/navsat_raw`. Ретранслятор читает его и публикует в топик, который ожидает PX4:
+`/world/<world>/model/x500_swarm_N/link/base_link/sensor/navsat_sensor/navsat`.
+
+### 2.5.3. Код: `docker/simulator-core/gps_jam_bridge.py`
+
+```python
+#!/usr/bin/env python3
+"""gps-jam-bridge: ретранслятор gz.msgs.NavSat между сырым топиком сенсора и топиком PX4.
+Режимы на борт: pass | noise | drift | spoof. HTTP API на :9100 (mgmt-net)."""
+import logging
+import math
+import os
+import random
+import threading
+import time
+from typing import Literal
+
+import uvicorn
+from fastapi import FastAPI
+from gz.msgs10.navsat_pb2 import NavSat
+from gz.transport13 import Node
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s gps-bridge %(message)s")
+log = logging.getLogger("gps-bridge")
+
+WORLD = os.environ.get("GZ_WORLD", "swarm_world")
+N = int(os.environ.get("SWARM_SIZE", "5"))
+RAW_T = "/swarm/{n}/navsat_raw"
+OUT_T = "/world/{w}/model/x500_swarm_{n}/link/base_link/sensor/navsat_sensor/navsat"
+M_PER_DEG_LAT = 111_320.0
+
+
+class Chan:
+    def __init__(self, n: int, node: Node):
+        self.n = n
+        self.lock = threading.Lock()
+        self.mode = "pass"
+        self.rate = 1.0          # м/с (drift, spoof)
+        self.heading = 45.0      # град (drift): 0 = север, 90 = восток
+        self.sigma = 2.0         # м (noise; для drift — шаг случайного блуждания)
+        self.tgt_n = 0.0         # м (spoof)
+        self.tgt_e = 0.0
+        self.b_n = 0.0           # накопленное смещение, м
+        self.b_e = 0.0
+        self.last = None
+        self.pub = node.advertise(OUT_T.format(w=WORLD, n=n), NavSat)
+        if not node.subscribe(NavSat, RAW_T.format(n=n), self.on_msg):
+            raise RuntimeError(f"subscribe failed for drone {n}")
+
+    def on_msg(self, msg: NavSat) -> None:
+        now = time.monotonic()
+        with self.lock:
+            dt = 0.0 if self.last is None else min(now - self.last, 1.0)
+            self.last = now
+            if self.mode == "pass":
+                self.b_n = self.b_e = 0.0
+                off_n = off_e = 0.0
+            elif self.mode == "noise":
+                self.b_n = self.b_e = 0.0
+                off_n, off_e = random.gauss(0, self.sigma), random.gauss(0, self.sigma)
+            elif self.mode == "drift":
+                h = math.radians(self.heading)
+                self.b_n += self.rate * dt * math.cos(h) + random.gauss(0, self.sigma) * math.sqrt(dt)
+                self.b_e += self.rate * dt * math.sin(h) + random.gauss(0, self.sigma) * math.sqrt(dt)
+                off_n, off_e = self.b_n, self.b_e
+            else:  # spoof: линейный увод к цели
+                dn, de = self.tgt_n - self.b_n, self.tgt_e - self.b_e
+                dist = math.hypot(dn, de)
+                step = min(dist, self.rate * dt)
+                if dist > 1e-6:
+                    self.b_n += dn / dist * step
+                    self.b_e += de / dist * step
+                off_n, off_e = self.b_n, self.b_e
+        out = NavSat()
+        out.CopyFrom(msg)
+        out.latitude_deg = msg.latitude_deg + off_n / M_PER_DEG_LAT
+        out.longitude_deg = msg.longitude_deg + off_e / (
+            M_PER_DEG_LAT * max(0.01, math.cos(math.radians(msg.latitude_deg))))
+        self.pub.publish(out)
+
+    def info(self) -> dict:
+        with self.lock:
+            return {"mode": self.mode, "rate_mps": self.rate, "heading_deg": self.heading,
+                    "sigma_m": self.sigma, "bias_north_m": round(self.b_n, 2),
+                    "bias_east_m": round(self.b_e, 2)}
+
+
+node = Node()
+chans = {n: Chan(n, node) for n in range(1, N + 1)}
+app = FastAPI(title="gps-jam-bridge")
+
+
+class Req(BaseModel):
+    drones: list[int] | None = None
+    mode: Literal["pass", "noise", "drift", "spoof"] = "pass"
+    rate_mps: float = Field(1.0, ge=0, le=100)
+    heading_deg: float = 45.0
+    sigma_m: float = Field(2.0, ge=0, le=1000)
+    target_north_m: float = 0.0
+    target_east_m: float = 0.0
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
+@app.get("/v1/gps")
+def get_gps():
+    return {str(n): c.info() for n, c in chans.items()}
+
+
+@app.post("/v1/gps")
+def post_gps(r: Req):
+    ids = r.drones or list(chans)
+    for n in ids:
+        c = chans[n]
+        with c.lock:
+            c.mode, c.rate, c.heading, c.sigma = r.mode, r.rate_mps, r.heading_deg, r.sigma_m
+            c.tgt_n, c.tgt_e = r.target_north_m, r.target_east_m
+    log.info("drones=%s mode=%s", ids, r.mode)
+    return get_gps()
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=9100, log_level="info")
+```
+
+После `pass` смещение сбрасывается мгновенно, то есть позиция скачком возвращается к истинной. EKF2 увидит это как резкую невязку, что допустимо для теста. Если нужен плавный возврат, режим `spoof` с целью (0, 0) даёт линейный увод.
+
+Установка в образ `simulator-core`:
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3-gz-transport13 python3-gz-msgs10 python3-pip \
+    && pip3 install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "pydantic==2.*"
+COPY gps_jam_bridge.py /opt/gps_jam_bridge.py
+```
+Запуск: отдельная программа `[program:gps-jam-bridge]` в `supervisord` с `command=python3 /opt/gps_jam_bridge.py` и `startsecs=5`, после старта `gz sim`.
+
+## 2.6. `ew-controller` (сервис `ew-injector`)
+
+### 2.6.1. REST и WebSocket API (порт 8080)
+
+| Метод и путь | Тело | Назначение |
+|---|---|---|
+| `GET /healthz` | – | живость |
+| `GET /v1/state` | – | агрегированное состояние: по каждому борту статус (GREEN, DEGRADED, JAMMED), состояние трёх каналов, режим слоя B, общий статус, состояние сценария |
+| `WS /v1/ws` | – | то же состояние раз в секунду (для HUD) |
+| `POST /v1/ew/c2` | `{"drones":null,"include_onboard":false,"duration_s":60}` | обрыв C2 |
+| `POST /v1/ew/gps` | `{"mode":"denied","drones":[1,2],"duration_s":45}`. Режимы: `denied`, `degraded` (+ `eph_start_m`, `eph_end_m`, `ramp_s`), `noise`, `drift`, `spoof` (+ `rate_mps`, `heading_deg`, `sigma_m`, `target_north_m`, `target_east_m`) | глушение GPS |
+| `POST /v1/ew/mesh` | `{"level":"L3","drones":null,"peers":null,"duration_s":30}` или явные `loss_pct`, `loss_corr_pct`, `delay_ms`, `jitter_ms`, `rate_kbit`, `limit_pkts` | деградация mesh |
+| `POST /v1/ew/restore` | `{"channel":"c2\|gps\|mesh\|all","drones":null}` | восстановление |
+| `GET /v1/scenarios` | – | список YAML-сценариев |
+| `POST /v1/scenarios/run` | `{"name":"04_full_ew"}` или `{"inline":{"steps":[...]}}` | запуск сценария |
+| `POST /v1/scenarios/stop` | `{"restore":true}` | остановка (с восстановлением по умолчанию) |
+
+`duration_s` в любом запросе включает автоматическое восстановление по таймеру. Статус борта вычисляется так:
+
+- **JAMMED:** C2 оборван, или GPS в режиме `denied`, или mesh с потерями ≥ 50 %, или mesh с полосой ≤ 10 кбит/с.
+- **DEGRADED:** любая другая активная деградация, в том числе скрытая `noise`/`drift`/`spoof`. HUD показывает истинное состояние РЭБ (как для оператора симуляции), а не то, что «знает» борт.
+- **GREEN:** всё остальное.
+
+Общий статус равен худшему из бортовых.
+
+### 2.6.2. Код: `docker/ew-injector/controller.py`
+
+```python
+#!/usr/bin/env python3
+"""ew-controller: оркестратор РЭБ. HTTP/WS API + таймерные сценарии (YAML)."""
+import asyncio
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+import yaml
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s ew-controller %(message)s")
+log = logging.getLogger("ew-controller")
+
+AGENTS = [u.strip() for u in os.environ["AGENT_URLS"].split(",")]
+BRIDGE = os.environ["SIM_BRIDGE_URL"]
+TOKEN = os.environ.get("EW_TOKEN", "")
+SCEN_DIR = Path(os.environ.get("SCENARIO_DIR", "/app/scenarios"))
+N = len(AGENTS)
+client = httpx.AsyncClient(timeout=6.0, headers={"Authorization": f"Bearer {TOKEN}"} if TOKEN else {})
+
+LEVELS: dict[str, dict[str, Any]] = {
+    "L1": dict(loss_pct=30, loss_corr_pct=25, delay_ms=50, jitter_ms=50, rate_kbit=64, limit_pkts=100),
+    "L2": dict(loss_pct=50, loss_corr_pct=30, delay_ms=200, jitter_ms=200, rate_kbit=20, limit_pkts=60),
+    "L3": dict(loss_pct=80, loss_corr_pct=40, delay_ms=500, jitter_ms=500, rate_kbit=5, limit_pkts=40),
+    "L4": dict(loss_pct=100, loss_corr_pct=0, delay_ms=0, jitter_ms=0, rate_kbit=None, limit_pkts=10),
+}
+
+
+# ───────────── транспорт ─────────────
+
+def targets(drones: list[int] | None) -> list[int]:
+    ids = drones or list(range(1, N + 1))
+    bad = [d for d in ids if not 1 <= d <= N]
+    if bad:
+        raise HTTPException(422, f"unknown drones: {bad}")
+    return ids
+
+
+async def call(base: str, method: str, path: str, body: dict | None = None) -> dict:
+    try:
+        r = await client.request(method, base + path, json=body)
+        data = r.json() if r.content else None
+        return {"ok": r.status_code < 300, "status": r.status_code, "body": data}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "status": 0, "error": str(e)}
+
+
+async def to_agents(ids: list[int], method: str, path: str, body: dict | None = None) -> dict:
+    res = await asyncio.gather(*[call(AGENTS[i - 1], method, path, body) for i in ids])
+    return {str(i): r for i, r in zip(ids, res)}
+
+
+# ───────────── модели запросов ─────────────
+
+class Common(BaseModel):
+    drones: list[int] | None = None
+    duration_s: float | None = Field(None, gt=0)
+
+
+class C2Req(Common):
+    include_onboard: bool = False
+
+
+class MeshReq(Common):
+    level: Literal["L1", "L2", "L3", "L4"] | None = None
+    loss_pct: float | None = Field(None, ge=0, le=100)
+    loss_corr_pct: float | None = Field(None, ge=0, le=100)
+    delay_ms: int | None = Field(None, ge=0)
+    jitter_ms: int | None = Field(None, ge=0)
+    rate_kbit: int | None = Field(None, ge=1)
+    limit_pkts: int | None = Field(None, ge=1)
+    peers: list[int] | None = None
+
+
+class GpsReq(Common):
+    mode: Literal["denied", "degraded", "noise", "drift", "spoof"]
+    eph_start_m: float = 5.0
+    eph_end_m: float = 60.0
+    ramp_s: float = 30.0
+    rate_mps: float = 1.0
+    heading_deg: float = 45.0
+    sigma_m: float = 2.0
+    target_north_m: float = 0.0
+    target_east_m: float = 0.0
+
+
+class RestoreReq(BaseModel):
+    channel: Literal["c2", "gps", "mesh", "all"] = "all"
+    drones: list[int] | None = None
+
+
+# ───────────── таймеры авто-восстановления ─────────────
+
+TIMERS: dict[tuple[str, int], asyncio.Task] = {}
+
+
+def cancel_timers(channel: str, ids: list[int]) -> None:
+    for ch in ("c2", "gps", "mesh") if channel == "all" else (channel,):
+        for i in ids:
+            t = TIMERS.pop((ch, i), None)
+            if t and not t.done() and t is not asyncio.current_task():
+                t.cancel()
+
+
+def arm_timer(channel: str, ids: list[int], seconds: float | None) -> None:
+    cancel_timers(channel, ids)
+    if not seconds:
+        return
+
+    async def _later(i: int):
+        await asyncio.sleep(seconds)
+        TIMERS.pop((channel, i), None)
+        await do_restore(RestoreReq(channel=channel, drones=[i]), _from_timer=True)
+
+    for i in ids:
+        TIMERS[(channel, i)] = asyncio.create_task(_later(i))
+
+
+# ───────────── действия ─────────────
+
+async def do_c2(r: C2Req) -> dict:
+    ids = targets(r.drones)
+    out = await to_agents(ids, "POST", "/v1/c2", {"ports": [14550], "include_onboard": r.include_onboard})
+    arm_timer("c2", ids, r.duration_s)
+    log.info("c2 cut drones=%s onboard=%s", ids, r.include_onboard)
+    return out
+
+
+async def do_mesh(r: MeshReq) -> dict:
+    p: dict[str, Any] = dict(LEVELS[r.level]) if r.level else {}
+    for k in ("loss_pct", "loss_corr_pct", "delay_ms", "jitter_ms", "rate_kbit", "limit_pkts"):
+        v = getattr(r, k)
+        if v is not None:
+            p[k] = v
+    if not p:
+        raise HTTPException(422, "need level or explicit parameters")
+    p["peers"] = r.peers
+    ids = targets(r.drones)
+    out = await to_agents(ids, "POST", "/v1/mesh", p)
+    arm_timer("mesh", ids, r.duration_s)
+    log.info("mesh drones=%s profile=%s", ids, p)
+    return out
+
+
+async def do_gps(r: GpsReq) -> dict:
+    ids = targets(r.drones)
+    if r.mode in ("denied", "degraded"):
+        body = {"mode": r.mode, "eph_start_m": r.eph_start_m, "eph_end_m": r.eph_end_m, "ramp_s": r.ramp_s}
+        out = {"agents": await to_agents(ids, "POST", "/v1/gps", body)}
+    else:
+        out = {"bridge": await call(BRIDGE, "POST", "/v1/gps", {
+            "drones": ids, "mode": r.mode, "rate_mps": r.rate_mps, "heading_deg": r.heading_deg,
+            "sigma_m": r.sigma_m, "target_north_m": r.target_north_m, "target_east_m": r.target_east_m})}
+    arm_timer("gps", ids, r.duration_s)
+    log.info("gps drones=%s mode=%s", ids, r.mode)
+    return out
+
+
+async def do_restore(r: RestoreReq, _from_timer: bool = False) -> dict:
+    ids = targets(r.drones)
+    ch = r.channel
+    out: dict[str, Any] = {}
+    if ch in ("c2", "all"):
+        out["c2"] = await to_agents(ids, "DELETE", "/v1/c2")
+    if ch in ("mesh", "all"):
+        out["mesh"] = await to_agents(ids, "DELETE", "/v1/mesh")
+    if ch in ("gps", "all"):
+        out["gps_agents"] = await to_agents(ids, "DELETE", "/v1/gps")
+        out["gps_bridge"] = await call(BRIDGE, "POST", "/v1/gps", {"drones": ids, "mode": "pass"})
+    if not _from_timer:
+        cancel_timers(ch, ids)
+    log.info("restore channel=%s drones=%s", ch, ids)
+    return out
+
+
+ACTIONS = {
+    "c2": (C2Req, do_c2),
+    "gps": (GpsReq, do_gps),
+    "mesh": (MeshReq, do_mesh),
+    "restore": (RestoreReq, do_restore),
+}
+
+
+# ───────────── состояние и статусы ─────────────
+
+ORDER = {"GREEN": 0, "DEGRADED": 1, "JAMMED": 2}
+
+
+def classify(a: dict, bridge_mode: str) -> str:
+    c2, gps, mesh = a["c2"], a["gps"], a["mesh"]
+    if c2["active"] or (gps["active"] and gps["mode"] == "denied"):
+        return "JAMMED"
+    if mesh["active"]:
+        p = mesh["profile"]
+        if p["loss_pct"] >= 50 or (p.get("rate_kbit") and p["rate_kbit"] <= 10):
+            return "JAMMED"
+        return "DEGRADED"
+    if gps["active"] or bridge_mode != "pass":
+        return "DEGRADED"
+    return "GREEN"
+
+
+class Runner:
+    def __init__(self):
+        self.task: asyncio.Task | None = None
+        self.name: str | None = None
+        self.t0: float | None = None
+        self.events: list[dict] = []
+        self.finished = False
+
+    def info(self) -> dict:
+        return {"running": bool(self.task and not self.task.done()), "name": self.name,
+                "elapsed_s": round(time.monotonic() - self.t0, 1) if self.t0 else None,
+                "events": self.events[-20:]}
+
+    async def stop(self, restore: bool = True):
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        if restore:
+            await do_restore(RestoreReq(channel="all"))
+
+    async def start(self, name: str, sc: dict):
+        await self.stop(restore=False)
+        self.name, self.events, self.finished = name, [], False
+        self.task = asyncio.create_task(self._run(sc))
+
+    async def _run(self, sc: dict):
+        self.t0 = time.monotonic()
+        for step in sorted(sc["steps"], key=lambda s: s["at"]):
+            await asyncio.sleep(max(0.0, self.t0 + float(step["at"]) - time.monotonic()))
+            model, handler = ACTIONS[step["action"]]
+            t = round(time.monotonic() - self.t0, 2)
+            try:
+                await handler(model(**step.get("params", {})))
+                self.events.append({"t": t, "action": step["action"], "ok": True})
+            except Exception as e:  # noqa: BLE001
+                log.error("scenario step failed: %s", e)
+                self.events.append({"t": t, "action": step["action"], "ok": False, "error": str(e)})
+        self.finished = True
+
+
+runner = Runner()
+app = FastAPI(title="ew-controller")
+
+
+async def build_state() -> dict:
+    ids = list(range(1, N + 1))
+    agents, bridge = await asyncio.gather(to_agents(ids, "GET", "/v1/status"), call(BRIDGE, "GET", "/v1/gps"))
+    bmodes = (bridge.get("body") or {}) if bridge["ok"] else {}
+    drones, worst = {}, "GREEN"
+    for i in ids:
+        r = agents[str(i)]
+        if not r["ok"]:
+            drones[str(i)] = {"status": "UNKNOWN", "error": r.get("error") or r["status"]}
+            continue
+        b = r["body"]
+        bm = (bmodes.get(str(i)) or {}).get("mode", "pass")
+        st = classify(b, bm)
+        worst = max(worst, st, key=ORDER.get)
+        drones[str(i)] = {"status": st, "c2": b["c2"], "gps": b["gps"], "mesh": b["mesh"], "gps_bridge": bmodes.get(str(i))}
+    return {"ts": time.time(), "overall": worst, "drones": drones, "scenario": runner.info()}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/v1/state")
+async def state():
+    return await build_state()
+
+
+@app.websocket("/v1/ws")
+async def ws(sock: WebSocket):
+    await sock.accept()
+    try:
+        while True:
+            await sock.send_json(await build_state())
+            await asyncio.sleep(1.0)
+    except (WebSocketDisconnect, RuntimeError):
+        return
+
+
+@app.post("/v1/ew/c2")
+async def ep_c2(r: C2Req):
+    return await do_c2(r)
+
+
+@app.post("/v1/ew/gps")
+async def ep_gps(r: GpsReq):
+    return await do_gps(r)
+
+
+@app.post("/v1/ew/mesh")
+async def ep_mesh(r: MeshReq):
+    return await do_mesh(r)
+
+
+@app.post("/v1/ew/restore")
+async def ep_restore(r: RestoreReq):
+    return await do_restore(r)
+
+
+class RunReq(BaseModel):
+    name: str | None = None
+    inline: dict | None = None
+
+
+class StopReq(BaseModel):
+    restore: bool = True
+
+
+@app.get("/v1/scenarios")
+async def scenarios():
+    out = []
+    for f in sorted(SCEN_DIR.glob("*.yaml")):
+        d = yaml.safe_load(f.read_text())
+        out.append({"name": f.stem, "description": d.get("description", ""), "steps": len(d["steps"])})
+    return out
+
+
+@app.post("/v1/scenarios/run")
+async def run_scenario(r: RunReq):
+    if r.inline:
+        sc, name = r.inline, "inline"
+    elif r.name:
+        f = SCEN_DIR / f"{r.name}.yaml"
+        if not f.is_file():
+            raise HTTPException(404, f"scenario {r.name} not found")
+        sc, name = yaml.safe_load(f.read_text()), r.name
+    else:
+        raise HTTPException(422, "name or inline required")
+    for s in sc["steps"]:
+        if s["action"] not in ACTIONS:
+            raise HTTPException(422, f"unknown action {s['action']}")
+        ACTIONS[s["action"]][0](**s.get("params", {}))        # валидация параметров заранее
+    await runner.start(name, sc)
+    return runner.info()
+
+
+@app.post("/v1/scenarios/stop")
+async def stop_scenario(r: StopReq):
+    await runner.stop(restore=r.restore)
+    return runner.info()
+```
+
+### 2.6.3. Сценарии (каталог `scenarios/`)
+
+`scenarios/01_c2_cut.yaml`
+```yaml
+name: c2_cut
+description: Полный обрыв C2 на всех бортах на 60 с, начиная с 20-й секунды
+steps:
+  - {at: 20, action: c2, params: {duration_s: 60}}
+```
+
+`scenarios/02_gps_denial.yaml`
+```yaml
+name: gps_denial
+description: Потеря GPS на бортах 1 и 2 (45 с), затем деградация ковариации на всех
+steps:
+  - {at: 20, action: gps, params: {mode: denied, drones: [1, 2], duration_s: 45}}
+  - {at: 90, action: gps, params: {mode: degraded, eph_start_m: 5, eph_end_m: 80, ramp_s: 40, duration_s: 60}}
+```
+
+`scenarios/03_mesh_degradation.yaml`
+```yaml
+name: mesh_degradation
+description: Ступенчатое ухудшение межбортовой связи L1 -> L2 -> L3 -> блэкаут, затем восстановление
+steps:
+  - {at: 10,  action: mesh, params: {level: L1}}
+  - {at: 40,  action: mesh, params: {level: L2}}
+  - {at: 70,  action: mesh, params: {level: L3}}
+  - {at: 100, action: mesh, params: {level: L4, duration_s: 20}}
+  - {at: 130, action: restore, params: {channel: mesh}}
+```
+
+`scenarios/04_full_ew.yaml`
+```yaml
+name: full_ew
+description: Комбинированная РЭБ-обстановка с постепенной эскалацией
+steps:
+  - {at: 15,  action: mesh, params: {level: L1}}
+  - {at: 45,  action: gps,  params: {mode: drift, drones: [3], rate_mps: 1.5, heading_deg: 90, sigma_m: 0.5}}
+  - {at: 75,  action: mesh, params: {level: L3}}
+  - {at: 75,  action: c2,   params: {}}
+  - {at: 105, action: gps,  params: {mode: denied}}
+  - {at: 150, action: restore, params: {channel: all}}
+```
+
+### 2.6.4. Dockerfile `docker/ew-injector/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+RUN pip install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" \
+      "httpx==0.27.*" "pyyaml==6.*" "pydantic==2.*"
+WORKDIR /app
+COPY controller.py /app/controller.py
+# каталог scenarios монтируется томом (см. docker-compose.override.yml)
+HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"
+CMD ["uvicorn", "controller:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]
+```
+
+### 2.6.5. CLI-обёртка: `scripts/ewctl.sh`
+
+Работает с хоста через `127.0.0.1:8080`.
+
+```bash
+#!/usr/bin/env bash
+# ewctl.sh — управление РЭБ с хоста. Требует: curl; EW_URL по умолчанию http://127.0.0.1:8080
+set -euo pipefail
+URL="${EW_URL:-http://127.0.0.1:8080}"
+
+arr() { if [ -z "${1:-}" ] || [ "$1" = "all" ]; then echo null; else echo "[${1// /}]"; fi; }
+post() { curl -fsS -X POST "$URL$1" -H 'Content-Type: application/json' -d "$2"; echo; }
+
+usage() { cat <<'EOF'
+ewctl.sh state
+ewctl.sh c2 cut [drones_csv|all] [duration_s] [--onboard]
+ewctl.sh c2 restore [drones_csv|all]
+ewctl.sh gps denied|degraded|noise|drift|spoof [drones_csv|all] [duration_s]
+ewctl.sh gps restore [drones_csv|all]
+ewctl.sh mesh L1|L2|L3|L4 [drones_csv|all] [duration_s]
+ewctl.sh mesh restore [drones_csv|all]
+ewctl.sh scenario list|run <name>|stop
+ewctl.sh reset
+EOF
+exit 2; }
+
+dur() { if [ -n "${1:-}" ] && [[ "$1" != --* ]]; then echo ", \"duration_s\": $1"; fi; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  state) curl -fsS "$URL/v1/state"; echo ;;
+  c2)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      cut)
+        onboard=false; for a in "$@"; do [ "$a" = "--onboard" ] && onboard=true; done
+        post /v1/ew/c2 "{\"drones\": $(arr "${1:-}"), \"include_onboard\": $onboard$(dur "${2:-}")}" ;;
+      restore) post /v1/ew/restore "{\"channel\": \"c2\", \"drones\": $(arr "${1:-}")}" ;;
+      *) usage ;;
+    esac ;;
+  gps)
+    mode="${1:-}"; shift || true
+    if [ "$mode" = restore ]; then post /v1/ew/restore "{\"channel\": \"gps\", \"drones\": $(arr "${1:-}")}"
+    else post /v1/ew/gps "{\"mode\": \"$mode\", \"drones\": $(arr "${1:-}")$(dur "${2:-}")}"; fi ;;
+  mesh)
+    lvl="${1:-}"; shift || true
+    if [ "$lvl" = restore ]; then post /v1/ew/restore "{\"channel\": \"mesh\", \"drones\": $(arr "${1:-}")}"
+    else post /v1/ew/mesh "{\"level\": \"$lvl\", \"drones\": $(arr "${1:-}")$(dur "${2:-}")}"; fi ;;
+  scenario)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list) curl -fsS "$URL/v1/scenarios"; echo ;;
+      run)  post /v1/scenarios/run "{\"name\": \"${1:?scenario name}\"}" ;;
+      stop) post /v1/scenarios/stop '{"restore": true}' ;;
+      *) usage ;;
+    esac ;;
+  reset) post /v1/ew/restore '{"channel": "all", "drones": null}' ;;
+  *) usage ;;
+esac
+```
+
+Примеры:
+```bash
+./scripts/ewctl.sh mesh L3 all 30         # L3 на всех бортах на 30 с
+./scripts/ewctl.sh gps denied 2,4         # потеря GPS на бортах 2 и 4
+./scripts/ewctl.sh c2 cut all 60 --onboard
+./scripts/ewctl.sh scenario run 04_full_ew
+```
+
+## 2.7. Предполётная проверка хоста: `scripts/preflight.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+[ "$(uname -s)" = Linux ] || fail "нужна Linux-система (netem недоступен на macOS/Windows Docker Desktop)"
+docker compose version >/dev/null 2>&1 || fail "нужен Docker Compose v2"
+
+for m in sch_netem sch_prio cls_u32 nf_tables; do
+  if ! lsmod | grep -q "^$m"; then
+    sudo modprobe "$m" 2>/dev/null || fail "модуль ядра $m недоступен (uname -r: $(uname -r))"
+  fi
+  echo "ok: $m"
+done
+
+[ -f .env ] && grep -q '^EW_TOKEN=.\+' .env || {
+  echo "EW_TOKEN=$(openssl rand -hex 16)" >> .env
+  echo "создан EW_TOKEN в .env"
+}
+echo "preflight passed"
+```
+
+## 2.8. Ожидаемая реакция системы на сценарии
+
+Это ожидания для приёмки, а не гарантии. Фактическая реакция проверяется тестами п. 2.9.
+
+| Сценарий | Ожидаемая реакция |
+|---|---|
+| Обрыв C2 | `web-hud` перестаёт получать HEARTBEAT от `sysid=N` и через 3 с показывает «LINK LOST». PX4 не должен уходить в failsafe: в airframe-файле (раздел 3) задаются `NAV_DLL_ACT=0` и `COM_RC_IN_MODE=4`, имена и значения параметров сверяются со справочником выбранного тега PX4. Рой продолжает миссию под управлением бортовых агентов. |
+| GPS `denied` | В `vehicle_gps_position` приходит `fix_type = 0`. EKF2 прекращает использовать GPS, по умолчанию через 5 с (параметр `EKF2_NOAID_TOUT`). Положение удерживается по VIO, барометру и IMU. Оценка позиции дрейфует, что видно на HUD. |
+| GPS `degraded` | `fix_type = 2`, `eph` растёт. EKF2 снижает вес GPS и затем отвергает его по порогам. |
+| GPS `drift`/`spoof` | PX4 видит нормальный 3D-фикс с корректными `eph`, позиция постепенно уходит. Обнаружение отклонения лежит на бортовом агенте (сравнение с VIO). |
+| Mesh L1–L3 | Heartbeat'ы теряются, растёт время обнаружения отказа соседа, возникает разделение сети (partition). Согласование ролей должно деградировать, но не отказывать. На L3 канал перегружен (п. 2.3.2). |
+| Mesh L4 | Полная изоляция бортов. Каждый действует автономно по последнему распределению секторов. |
+
+Устойчивость Zenoh-сессий к потерям 80 % и джиттеру в сотни миллисекунд зависит от настроек `lease` и `keep_alive`. Эти настройки фиксируются в разделе 4. Здесь принято, что бортовой стек должен переживать разрыв сессии и автоматически переподключаться.
+
+## 2.9. Критерии приёмки раздела
+
+| № | Критерий | Метод проверки |
+|---|---|---|
+| B1 | `ewctl c2 cut all`: с интерфейса `c2-net` борта прекращаются пакеты на 14550 менее чем за 1 с, onboard-MAVLink на `sim-net` продолжает идти. После `restore` связь восстанавливается за ≤ 5 с. | `docker compose exec drone-agent-1 tcpdump -ni <c2-iface> udp port 14550` и аналогично для 14540; HUD |
+| B2 | `ewctl gps denied 1`: через ≤ 2 с `fix_type = 0` в `/px4_1/fmu/out/vehicle_gps_position`, у остальных бортов `fix_type = 3`. `PARAM_VALUE` подтверждает значение `SIM_GPS_JAM`. Наличие полей `jamming_state` проверено по `sensor_gps.msg` тега PX4. | `ros2 topic echo --once`, лог `ew-agent` |
+| B3 | L3 на mesh: измеренные потери 75–85 %, средний RTT согласуется с профилем, пропускная способность UDP ≤ 6 кбит/с. | `ping -c 200 -i 0.2`; `iperf3 -u -b 50k -t 20` между двумя `drone-agent` |
+| B4 | Изоляция каналов: во время L3 на mesh-интерфейсе потери и RTT на `sim-net` и `c2-net` остаются без изменений (0 % потерь, RTT < 1 мс). Интерфейс `mgmt-net` не затронут. | `ping` по всем сетям до и во время деградации |
+| B5 | `peers: [2]` на борту 1 ухудшает трафик только к `172.31.0.12`; к остальным пирам потерь нет. | `ping` до `.12` и `.13` с борта 1 |
+| B6 | Слой B: режим `drift` с `rate_mps=1.5` даёт смещение позиции борта около 90 м через 60 с (допуск ±15 %); соседние борта не затронуты. | `GET /v1/gps` на мосту; сравнение с истинной позицией в Gazebo |
+| B7 | Сценарий `04_full_ew`: шаги выполняются с отклонением ≤ 0,5 с от `at`, итоговый `restore all` приводит все борта в GREEN. | `/v1/state`, поле `scenario.events` |
+| B8 | После `reset`: `tc qdisc show` без `netem`, `nft list tables` без `ew`, `SIM_GPS_JAM = 0`, мост в режиме `pass`. | `/v1/status` каждого агента |
+| B9 | Запрос к `ew-agent` без токена получает 401; порт 9090 недоступен из `mesh-net`, `c2-net`, `sim-net`. | `curl` с соседнего контейнера |
+| B10 | Перезапуск `ew-agent` (`supervisorctl restart ew-agent`) снимает все деградации. Перезапуск `ew-injector` во время сценария не оставляет «залипших» деградаций после `reset`. | `/v1/status` |
+
+---
