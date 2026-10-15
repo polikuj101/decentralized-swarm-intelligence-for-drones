@@ -172,10 +172,10 @@ async def ingest(drone: int, request: Request):
     for th in pkt.get("thoughts") or []:
         if not isinstance(th, dict):
             continue
-        k = ("L", th.get("id"), th.get("t"), th.get("verdict"))       # U14
+        k = ("L", th.get("source"), th.get("id"), th.get("t"), th.get("verdict"))       # U14 + source: id у S1 и S2 независимы
         keys.add(k)
         if k not in d["keys"]:
-            feed_add("llm", drone, id=th.get("id"), t=th.get("t"), trigger=_s(th.get("trigger"), 40),
+            feed_add("llm", drone, source=_s(th.get("source"), 4), id=th.get("id"), t=th.get("t"), trigger=_s(th.get("trigger"), 40),
                      reasoning=_s(th.get("reasoning"), 200), tool=_s(th.get("tool"), 40), args=th.get("args"),
                      verdict=_s(th.get("verdict"), 20), reason=_s(th.get("reason"), 160),
                      latency_ms=th.get("latency_ms"))

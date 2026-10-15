@@ -188,6 +188,7 @@ function cardHtml(i, d, ew) {
   if (n.gps_suspect) gps += " · ⚠ SUSPECT";
   h += row("GPS", esc(gps));
   h += row("NAV", esc(`${n.state} · ${n.src} · σ ${fmt(n.sigma)} м · alt ${fmt(p.pos[2])} м`));
+  h += row("Фаза/S1", esc(`${p.phase || "—"} · ${(p.s1 || {}).mode || "—"} · p95 ${(p.s1 || {}).p95_ms ?? "—"} мс`));
   h += row("Препятствие", n.obst_min < 50 ? esc(fmt(n.obst_min) + " м") : "—");
   h += row("Задача", esc(`${sw.task_name || "—"} · эпоха ${sw.epoch} · готово ${sw.done.length}/${sw.total_tasks}`));
   h += row("Mesh", esc(`q ${fmt(m.link_q, 2)} · peers ${m.zenoh_peers} · ${meshLabel(ew.mesh)}`));
@@ -230,7 +231,8 @@ function feedEl(f) {
   e.append(mk("span", "t", `[${fmt(f.t, 0)}s]`), d);
   if (f.kind === "llm") {
     const lat = f.latency_ms != null ? ` ${(f.latency_ms / 1000).toFixed(1)}с` : "";
-    e.append(mk("span", "tool", f.tool || "—"), mk("span", "args", f.args ? JSON.stringify(f.args) : ""),
+    e.append(mk("span", "src " + (f.source || "S2"), f.source || "S2"),
+             mk("span", "tool", f.tool || "—"), mk("span", "args", f.args ? JSON.stringify(f.args) : ""),
              mk("span", "v " + f.verdict, (f.verdict || "?") + lat));
     if (f.reasoning) e.append(mk("div", "why", "« " + f.reasoning + " »"));
     if (f.reason) e.append(mk("div", "why err", "⤷ " + f.reason));
