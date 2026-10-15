@@ -8,8 +8,8 @@ x-agent: &agent
   image: swarm/drone-agent:latest
   cap_add: [NET_ADMIN]
   mem_swappiness: 0
-  memswap_limit: 2g
-  mem_limit: 2g
+  memswap_limit: ${AGENT_MEM_LIMIT:-2g}
+  mem_limit: ${AGENT_MEM_LIMIT:-2g}
   cpus: "4.0"
   pids_limit: 512
   restart: unless-stopped

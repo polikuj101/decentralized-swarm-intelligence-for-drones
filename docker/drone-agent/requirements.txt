@@ -1,0 +1,9 @@
+fastapi==0.115.*
+uvicorn[standard]==0.30.*
+pydantic==2.*
+pymavlink==2.4.*
+eclipse-zenoh>=1.0,<2
+onnxruntime>=1.18,<2
+tokenizers>=0.20,<1
+numpy<2
+pytest>=7

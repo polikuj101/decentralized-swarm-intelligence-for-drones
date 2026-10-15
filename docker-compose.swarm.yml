@@ -7,6 +7,15 @@ x-swarm-env: &swarm-env
   EW_TOKEN: ${EW_TOKEN:?}
   LLM_URL: http://127.0.0.1:8080
   LLM_TIMEOUT_S: "20"
+  S1_ENABLE: ${S1_ENABLE:-1}
+  S1_MODE: ${S1_MODE:-hybrid}
+  S1_EMBED_DIR: /opt/models/embed
+  S1_EMBED_FILE: ${S1_EMBED_FILE:-model_quantized.onnx}
+  S1_EMBED_DIM: "128"
+  S1_EMBED_THREADS: "1"
+  S1_TAU: "0.5"
+  S2_MIN_GAP_S: "15"
+  S2_PERIOD_S: "20"
 
 services:
   drone-agent-1: { environment: *swarm-env }
