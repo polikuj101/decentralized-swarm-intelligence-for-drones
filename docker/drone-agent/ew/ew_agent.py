@@ -134,26 +134,53 @@ def netem_args(p: MeshProfile) -> list[str]:
 def mesh_apply(p: MeshProfile) -> None:
     dev = IF["mesh"]
     sh(["tc", "qdisc", "del", "dev", dev, "root"], check=False)
+    sh(["nft", "delete", "table", "inet", "ew_mesh"], check=False)
     if p.peers is None:
-        sh(["tc", "qdisc", "add", "dev", dev, "root"] + netem_args(p))
+        try:
+            sh(["tc", "qdisc", "add", "dev", dev, "root"] + netem_args(p))
+        except EwError as e:
+            log.warning("tc netem failed (%s), fallback under WSL2", e)
+            if p.loss_pct >= 90:
+                script = (
+                    "table inet ew_mesh\n"
+                    "delete table inet ew_mesh\n"
+                    "table inet ew_mesh {\n"
+                    f'  chain ew_mesh_out {{\n    type filter hook output priority 0; policy accept;\n    oifname "{dev}" counter drop\n  }}\n'
+                    "}\n"
+                )
+                sh(["nft", "-f", "-"], stdin=script)
     else:
         for pid in p.peers:
             if not (1 <= pid <= SWARM_SIZE) or pid == DRONE_ID:
                 raise EwError(f"invalid peer id {pid}")
-        # band 1 (1:1) — трафик без деградации; band k+1 — пир с ID=k
-        sh(["tc", "qdisc", "add", "dev", dev, "root", "handle", "1:", "prio",
-            "bands", str(SWARM_SIZE + 1), "priomap"] + ["0"] * 16)
-        for pid in p.peers:
-            band = pid + 1
-            sh(["tc", "qdisc", "add", "dev", dev, "parent", f"1:{band}", "handle", f"{10 + pid}:"]
-               + netem_args(p))
-            sh(["tc", "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
-                "u32", "match", "ip", "dst", f"{peer_ip(pid)}/32", "flowid", f"1:{band}"])
+        try:
+            # band 1 (1:1) — трафик без деградации; band k+1 — пир с ID=k
+            sh(["tc", "qdisc", "add", "dev", dev, "root", "handle", "1:", "prio",
+                "bands", str(SWARM_SIZE + 1), "priomap"] + ["0"] * 16)
+            for pid in p.peers:
+                band = pid + 1
+                sh(["tc", "qdisc", "add", "dev", dev, "parent", f"1:{band}", "handle", f"{10 + pid}:"]
+                   + netem_args(p))
+                sh(["tc", "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
+                    "u32", "match", "ip", "dst", f"{peer_ip(pid)}/32", "flowid", f"1:{band}"])
+        except EwError as e:
+            log.warning("tc prio failed (%s), fallback to nftables under WSL2", e)
+            peer_ips = ", ".join(peer_ip(pid) for pid in p.peers)
+            script = (
+                "table inet ew_mesh\n"
+                "delete table inet ew_mesh\n"
+                "table inet ew_mesh {\n"
+                f'  chain ew_mesh_out {{\n    type filter hook output priority 0; policy accept;\n    oifname "{dev}" ip daddr {{ {peer_ips} }} counter drop\n  }}\n'
+                f'  chain ew_mesh_in {{\n    type filter hook input priority 0; policy accept;\n    iifname "{dev}" ip saddr {{ {peer_ips} }} counter drop\n  }}\n'
+                "}\n"
+            )
+            sh(["nft", "-f", "-"], stdin=script)
     state["mesh"] = {"active": True, "profile": p.model_dump(), "since": time.time()}
 
 
 def mesh_restore() -> None:
     sh(["tc", "qdisc", "del", "dev", IF["mesh"], "root"], check=False)
+    sh(["nft", "delete", "table", "inet", "ew_mesh"], check=False)
     state["mesh"] = {"active": False, "profile": None, "since": None}
 
 # ───────────────────────────── GNSS (PX4 params via MAVLink) ─────────────────────────────

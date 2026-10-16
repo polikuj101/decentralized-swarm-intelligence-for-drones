@@ -33,6 +33,12 @@ soak:
 failover:
 	./scripts/failover_test.sh 3
 
+stress:
+	./scripts/run_stress.sh all
+
+scorecard:
+	python3 ./scripts/scorecard.py $$(ls -td logs/stress/*/report.json | head -1)
+
 help:
 	@echo "Targets:"
 	@echo "  fetch-embedder - Download ONNX embedding model"

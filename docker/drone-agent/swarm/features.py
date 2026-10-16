@@ -1,7 +1,7 @@
 """swarm/features.py — состояние -> типизированный Obs -> бакеты -> каноническая строка (закрытый словарь)."""
 from dataclasses import dataclass
 
-T_SUSPECT = 6.0
+T_SUSPECT = 3.0
 
 
 @dataclass(frozen=True)

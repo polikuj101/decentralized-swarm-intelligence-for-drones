@@ -16,7 +16,7 @@ from swarm.cbaa import CBAA
 from swarm.mesh import Mesh
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
-T_DEAD, T_SUSPECT, SETTLE_S = 12.0, 6.0, 2.5
+T_DEAD, T_SUSPECT, SETTLE_S = 3.5, 3.0, 2.0
 STATE_CODE = {"IDLE": 0, "TAKEOFF": 1, "NAV": 2, "HOLD": 3, "DWELL": 4, "RTB": 5, "LANDED": 6}
 CODE_STATE = {v: k for k, v in STATE_CODE.items()}
 
@@ -131,7 +131,7 @@ class Coordinator(Node):
     def heard_mask(self, now):
         m = 0
         for j, p in self.peers.items():
-            if p.last_rx is not None and now - p.last_rx < max(5.0, 3.0 * p.hb_s):
+            if p.last_rx is not None and now - p.last_rx < max(2.5, 2.0 * p.hb_s):
                 m |= 1 << (j - 1)
         return m
 
@@ -258,6 +258,8 @@ class Coordinator(Node):
         f = d["failed"]
         if f in self.peers and f != s:
             self.force_dead.add(f)
+            self.cbaa.drop_peer(f)
+            self.reset_cbaa(now)
             self.log(f"peer {f} declared FAILED by {s}")
 
     # ───────── ROS-вход ─────────
@@ -363,6 +365,7 @@ class Coordinator(Node):
             if f in self.alive_set(now):
                 return False, "peer still alive"
             self.force_dead.add(f)
+            self.cbaa.drop_peer(f)
             reason = wire.REASONS.get(a.get("reason", "NO_HEARTBEAT"), 0)
             self.bump("failover", now)
             self.fail_tx = [(now + i * 1.0, f, reason) for i in range(5)]
@@ -554,7 +557,13 @@ class Coordinator(Node):
               "phase": self.phase.value,
               "mesh": {"ready": self.mesh.ready, "tuned": self.mesh.tuned, "zenoh_peers": self.mesh.peers_connected(),
                        "dropped": self.dropped, "bad_tag": self.bad_tag, "tx_bytes": self.mesh.tx_bytes}}
-        self.pub_state.publish(String(data=json.dumps(st)))
+        payload = json.dumps(st)
+        self.pub_state.publish(String(data=payload))
+        try:
+            with open("/dev/shm/swarm_state.json", "w") as f:
+                f.write(payload)
+        except Exception:
+            pass
 
 
 def main():
