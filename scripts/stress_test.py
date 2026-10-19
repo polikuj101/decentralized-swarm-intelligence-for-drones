@@ -181,7 +181,8 @@ def v1_netem(n=N_DEFAULT) -> Result:
                 if task in seen and seen[task] != who:
                     dup.add(task)
                 seen[task] = who
-        if len(epochs) == 1 and not dup:
+        all_alive = all(len(st.get("alive", [])) == n for st in states.values() if isinstance(st, dict))
+        if len(epochs) == 1 and not dup and all_alive:
             converged_at = time.time() - t_merge0
             break
         seen_epochs |= epochs
