@@ -33,7 +33,8 @@ def read_ros(service, timeout=8):
             "n.create_subscription(String,'/swarm/local/state',cb,10)\n"
             "t0=time.time()\n"
             "while 'v' not in h and time.time()-t0<%f: rclpy.spin_once(n,timeout_sec=0.2)\n"
-            "print(json.dumps({'v': h.get('v','{}'), 't': h.get('t', time.time())}))") % timeout
+            "print(json.dumps({'v': h.get('v','{}'), 't': h.get('t', time.time())}))\n"
+            "try:\n    n.destroy_node()\n    rclpy.shutdown()\nexcept Exception:\n    pass") % timeout
     r = rr(service, "python3", "-c", code, timeout=timeout + 3)
     try:
         out = json.loads(r.stdout.strip().splitlines()[-1])

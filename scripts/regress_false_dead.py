@@ -77,6 +77,11 @@ def run_level(level, duration):
     threads = [threading.Thread(target=_collect, args=(i,)) for i in range(1, N_DEFAULT + 1)]
     for t in threads:
         t.start()
+    t_start = time.time()
+    while any(t.is_alive() for t in threads):
+        elapsed = int(time.time() - t_start)
+        print(f"[{level}] сбор событий: {elapsed}/{duration}s...", flush=True)
+        time.sleep(15)
     for t in threads:
         t.join()
     sh(["./scripts/ewctl.sh", "reset"])

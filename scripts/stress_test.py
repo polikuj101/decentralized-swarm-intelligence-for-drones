@@ -62,12 +62,13 @@ def pub_cmd(service, cmd_dict):
 
 def get_state(service="drone-agent-1", timeout=25):
     """одно состояние /swarm/local/state (быстро через /dev/shm или подписчик)"""
-    r_shm = dcx(service, "cat", "/dev/shm/swarm_state.json", timeout=4)
-    if r_shm.returncode == 0 and r_shm.stdout.strip().startswith("{"):
-        try:
-            return json.loads(r_shm.stdout.strip())
-        except Exception:
-            pass
+    if not os.environ.get("FORCE_ROS"):
+        r_shm = dcx(service, "cat", "/dev/shm/swarm_state.json", timeout=4)
+        if r_shm.returncode == 0 and r_shm.stdout.strip().startswith("{"):
+            try:
+                return json.loads(r_shm.stdout.strip())
+            except Exception:
+                pass
     code = (
         "import rclpy,sys,json;from rclpy.node import Node;from std_msgs.msg import String;"
         "rclpy.init();n=Node('probe');h={}\n"
@@ -76,7 +77,7 @@ def get_state(service="drone-agent-1", timeout=25):
         "import time;t0=time.time()\n"
         "while 'v' not in h and time.time()-t0<6: rclpy.spin_once(n,timeout_sec=0.15)\n"
         "print(h.get('v','{}'))\n"
-        "n.destroy_node();rclpy.shutdown()"
+        "try:\n    n.destroy_node()\n    rclpy.shutdown()\nexcept Exception:\n    pass"
     )
     r = rr(service, "python3", "-c", code, timeout=timeout)
     try:
