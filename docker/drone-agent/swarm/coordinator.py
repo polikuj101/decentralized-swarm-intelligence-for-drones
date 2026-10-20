@@ -55,6 +55,7 @@ class Coordinator(Node):
         self.nav = {}
         self.goal, self.goal_seq = None, int(time.time()) % 1000000
         self.exec_task, self.override, self.mission_done_sent = None, None, False
+        self.exec_dist_min, self.exec_dist_t = 999.0, now
         self.alive_prev = {ME}
         self.last_bump, self.pending_bump = -99.0, False
         self.vec_changed, self.claim_dirty = 0.0, False
@@ -144,7 +145,18 @@ class Coordinator(Node):
             return 0
         t = self.tasks[j]
         x, y, _ = self.pos()
-        s = (1.0 if t.kind == "TARGET" else 0.8) / (1.0 + ((t.cx - x) ** 2 + (t.cy - y) ** 2) ** 0.5 / 25.0)
+        dx, dy = t.cx - x, t.cy - y
+        dist = math.hypot(dx, dy)
+        s = (1.0 if t.kind == "TARGET" else 0.8) / (1.0 + dist / 25.0)
+
+        # Векторное выравнивание по скорости (устраняет слепые зоны на границах секторов)
+        vx = float(self.nav.get("vx", 0.0))
+        vy = float(self.nav.get("vy", 0.0))
+        vmag = math.hypot(vx, vy)
+        if vmag > 0.5 and dist > 2.0:
+            cos_theta = (vx * dx + vy * dy) / (vmag * dist)
+            s *= (1.0 + 0.25 * cos_theta)
+
         if self.nav_degraded():
             s *= 0.6
         if j == self.exec_task:
@@ -400,7 +412,21 @@ class Coordinator(Node):
         dwell = common.MISSION["target_dwell_s"] if t.kind == "TARGET" else 0.0
         self._send_goal("WAYPOINTS", common.task_waypoints(t), dwell, j)
         self.exec_task = j
+        x, y, _ = self.pos()
+        self.exec_dist_min = math.hypot(t.cx - x, t.cy - y)
+        self.exec_dist_t = now
         self.log(f"start task {t.name} ({len(self.goal['wps'])} wps)")
+
+    def preempt_task(self, j, reason, now):
+        """Аварийный сброс захвата цели (Preemption Lease) для мгновенного подхвата ведомым."""
+        t = self.tasks[j]
+        self.log(f"task {t.name} PREEMPTED: {reason} (released to peers)")
+        self.exec_task = None
+        self.prefer[j] = 0.0
+        self.cbaa.drop_task(j)
+        self._send_goal("HOLD")
+        self.claim_dirty = True
+        self.bump(f"preempt-{reason}", now)
 
     # ───────── главный цикл ─────────
     def tick(self):
@@ -461,6 +487,16 @@ class Coordinator(Node):
             return
         if self.withdrawn:
             return
+        if self.exec_task is not None and not self.override:
+            t = self.tasks[self.exec_task]
+            x, y, _ = self.pos()
+            cur_dist = math.hypot(t.cx - x, t.cy - y)
+            if cur_dist < self.exec_dist_min - 1.0:
+                self.exec_dist_min = cur_dist
+                self.exec_dist_t = now
+            elif now - self.exec_dist_t > 8.0 and t.kind == "TARGET" and self.nav_degraded():
+                self.preempt_task(self.exec_task, "stalled_degraded", now)
+                return
         if not self.open_tasks():
             if not self.mission_done_sent:
                 self.mission_done_sent, self.exec_task = True, None

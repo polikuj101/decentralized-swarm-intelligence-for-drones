@@ -107,6 +107,15 @@ class CBAA:
             return True
         return False
 
+    def drop_task(self, task_id):
+        """Принудительный отказ от конкретной задачи (Preemption / Release)."""
+        if task_id in self.bundle:
+            self.bundle.remove(task_id)
+        self.c[task_id] = 0
+        self.y[task_id] = 0
+        self.z[task_id] = 0
+        return self.select()
+
     def drop_peer(self, peer_id):
         """Борт погиб — сбросить все его победы в векторе z."""
         changed = False
