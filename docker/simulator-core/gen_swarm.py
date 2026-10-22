@@ -47,9 +47,12 @@ def imu_xml():
 
 
 def navsat_xml(n):
+    # В Gazebo NavSat шум horizontal задаётся в ГРАДУСАХ, а не в метрах:
+    # 0.3 м -> 0.3 / 111320.0 град (~2.7e-6 град)
+    h_noise_deg = 0.3 / 111320.0
     return (f'<sensor name="navsat_sensor" type="navsat"><always_on>1</always_on><update_rate>10</update_rate>'
             f'<topic>/swarm/{n}/navsat_raw</topic><navsat>'
-            f'<position_sensing><horizontal>{noise(0.3)}</horizontal><vertical>{noise(0.5)}</vertical></position_sensing>'
+            f'<position_sensing><horizontal>{noise(h_noise_deg)}</horizontal><vertical>{noise(0.5)}</vertical></position_sensing>'
             f'<velocity_sensing><horizontal>{noise(0.05)}</horizontal><vertical>{noise(0.05)}</vertical></velocity_sensing>'
             f'</navsat></sensor>')
 
@@ -83,6 +86,27 @@ def down_xml(n):
             f'{noise(0.02)}</lidar></sensor>')
 
 
+def motor_xml(num: str, direction: str) -> str:
+    return (
+        f'<plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">'
+        f'<jointName>rotor_{num}_joint</jointName>'
+        f'<linkName>rotor_{num}</linkName>'
+        f'<turningDirection>{direction}</turningDirection>'
+        f'<timeConstantUp>0.0125</timeConstantUp>'
+        f'<timeConstantDown>0.025</timeConstantDown>'
+        f'<maxRotVelocity>1000.0</maxRotVelocity>'
+        f'<motorConstant>8.54858e-06</motorConstant>'
+        f'<momentConstant>0.016</momentConstant>'
+        f'<commandSubTopic>command/motor_speed</commandSubTopic>'
+        f'<motorNumber>{num}</motorNumber>'
+        f'<rotorDragCoefficient>8.06428e-05</rotorDragCoefficient>'
+        f'<rollingMomentCoefficient>1e-06</rollingMomentCoefficient>'
+        f'<rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>'
+        f'<motorType>velocity</motorType>'
+        f'</plugin>'
+    )
+
+
 def build_model(n: int):
     if not BASE.exists():
         die(f"{BASE} не найден")
@@ -102,6 +126,8 @@ def build_model(n: int):
             die(f"x500_base: нет сенсора {need} (изменилась структура модели PX4?)")
     for xml in (imu_xml(), navsat_xml(n), camera_xml(n), ring_xml(n), down_xml(n)):
         base.append(ET.fromstring(xml))
+    for num, direction in [("0", "ccw"), ("1", "ccw"), ("2", "cw"), ("3", "cw")]:
+        model.append(ET.fromstring(motor_xml(num, direction)))
     d = OUT / "models" / f"x500_swarm_{n}"
     d.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(str(d / "model.sdf"), xml_declaration=True, encoding="UTF-8", pretty_print=True)

@@ -13,6 +13,8 @@ x-agent: &agent
   cpus: "4.0"
   pids_limit: 512
   restart: unless-stopped
+  volumes:
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
   depends_on:
     simulator-core: { condition: service_healthy }
 
@@ -23,6 +25,8 @@ x-fc: &fc
   cpus: "1.0"
   mem_limit: 1g
   restart: unless-stopped
+  volumes:
+    - ./docker/px4-sitl/airframes/4901_gz_x500_swarm:/opt/px4/ROMFS/px4fmu_common/init.d-posix/airframes/4901_gz_x500_swarm:ro
   depends_on:
     simulator-core: { condition: service_healthy }
 
@@ -38,6 +42,10 @@ services:
       GZ_PARTITION: swarm
       GZ_IP: 172.30.0.2
       SWARM_SIZE: "5"
+    volumes:
+      - ./docker/simulator-core/gen_swarm.py:/opt/swarm/gen_swarm.py:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /mnt/wslg:/mnt/wslg:rw
     networks:
       sim-net:  { ipv4_address: 172.30.0.2 }
       mgmt-net: { ipv4_address: 172.33.0.3 }
@@ -50,23 +58,23 @@ services:
 
   fc-1:
     <<: *fc
-    environment: { PX4_INSTANCE: "0", PX4_SYS_ID: "1", PX4_GZ_MODEL_NAME: x500_swarm_1, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.11 }
+    environment: { PX4_INSTANCE: "0", PX4_SYS_ID: "1", PX4_GZ_MODEL_NAME: x500_swarm_1, PX4_SYS_AUTOSTART: "4901", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.11 }
     networks: { sim-net: { ipv4_address: 172.30.0.11 } }
   fc-2:
     <<: *fc
-    environment: { PX4_INSTANCE: "1", PX4_SYS_ID: "2", PX4_GZ_MODEL_NAME: x500_swarm_2, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.12 }
+    environment: { PX4_INSTANCE: "1", PX4_SYS_ID: "2", PX4_GZ_MODEL_NAME: x500_swarm_2, PX4_SYS_AUTOSTART: "4901", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.12 }
     networks: { sim-net: { ipv4_address: 172.30.0.12 } }
   fc-3:
     <<: *fc
-    environment: { PX4_INSTANCE: "2", PX4_SYS_ID: "3", PX4_GZ_MODEL_NAME: x500_swarm_3, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.13 }
+    environment: { PX4_INSTANCE: "2", PX4_SYS_ID: "3", PX4_GZ_MODEL_NAME: x500_swarm_3, PX4_SYS_AUTOSTART: "4901", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.13 }
     networks: { sim-net: { ipv4_address: 172.30.0.13 } }
   fc-4:
     <<: *fc
-    environment: { PX4_INSTANCE: "3", PX4_SYS_ID: "4", PX4_GZ_MODEL_NAME: x500_swarm_4, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.14 }
+    environment: { PX4_INSTANCE: "3", PX4_SYS_ID: "4", PX4_GZ_MODEL_NAME: x500_swarm_4, PX4_SYS_AUTOSTART: "4901", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.14 }
     networks: { sim-net: { ipv4_address: 172.30.0.14 } }
   fc-5:
     <<: *fc
-    environment: { PX4_INSTANCE: "4", PX4_SYS_ID: "5", PX4_GZ_MODEL_NAME: x500_swarm_5, PX4_SYS_AUTOSTART: "4001", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.15 }
+    environment: { PX4_INSTANCE: "4", PX4_SYS_ID: "5", PX4_GZ_MODEL_NAME: x500_swarm_5, PX4_SYS_AUTOSTART: "4901", PX4_GZ_STANDALONE: "1", GZ_PARTITION: swarm, GZ_IP: 172.30.0.15 }
     networks: { sim-net: { ipv4_address: 172.30.0.15 } }
 
   drone-agent-1:

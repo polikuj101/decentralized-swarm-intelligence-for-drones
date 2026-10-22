@@ -35,5 +35,15 @@ param set-default EKF2_NOAID_TOUT 5000000
 param set-default SIM_GPS_JAM 0
 param set-default SIM_GPS_JAM_EPH 5.0
 
+# Micro XRCE-DDS: привязка к localhost (127.0.0.1) в контейнере companion-а
+param set-default UXRCE_DDS_PTCFG 1
+
+# Смягчение предполетных чеков для SITL
+param set-default EKF2_REQ_HDRIFT 5.0
+param set-default EKF2_REQ_VDRIFT 5.0
+param set-default COM_ARM_EKF_POS 50.0
+param set-default COM_ARM_EKF_VEL 50.0
+param set-default COM_ARM_EKF_YAW 50.0
+
 # Лог только при взведённых моторах (экономит диск при долгих прогонах)
 param set-default SDLOG_MODE 1

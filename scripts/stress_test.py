@@ -32,14 +32,13 @@ def sh(cmd, check=False, timeout=60, **kw):
 
 
 def cid(service):
-    """Возвращает container ID по имени сервиса Compose"""
-    r = sh(["docker", "compose", "ps", "-q", service])
-    lines = r.stdout.strip().splitlines()
-    return lines[0] if lines else service
+    """Возвращает container ID / имя по имени сервиса Compose"""
+    return f"swarm-sitl-{service}-1" if not service.startswith("swarm-sitl-") else service
 
 
 def dcx(service, *args, timeout=30):
-    return sh(["docker", "compose", "exec", "-T", service, *args], timeout=timeout)
+    cname = cid(service)
+    return sh(["docker", "exec", cname, *args], timeout=timeout)
 
 
 def rr(service, *args, timeout=30):
@@ -97,36 +96,36 @@ def get_all_states(n=N_DEFAULT, timeout=25):
 def wait_healthy(services, secs=180):
     t0 = time.time()
     while time.time() - t0 < secs:
-        ps_out = sh(["docker", "compose", "ps", "--format", "{{.Service}} {{.State}} {{.Health}}"]).stdout
+        ps_out = sh(["docker", "ps", "--format", "{{.Names}} {{.State}} {{.Status}}"]).stdout
         all_ok = True
         for s in services:
-            line = next((l for l in ps_out.splitlines() if l.startswith(s)), "")
-            if not line or ("running" not in line and "healthy" not in line and "Up" not in line):
+            target = f"swarm-sitl-{s}-1"
+            line = next((l for l in ps_out.splitlines() if target in l or s in l), "")
+            if not line or ("running" not in line and "Up" not in line):
                 all_ok = False
                 break
         if all_ok:
             return True
-        time.sleep(3)
+        time.sleep(1)
     return False
 
 
 def reset_stand(n=N_DEFAULT):
     print("resetting stand...", flush=True)
     sh(["./scripts/ewctl.sh", "reset"])
+    agents = [f"drone-agent-{i}" for i in range(1, n + 1)]
     for i in range(1, n + 1):
         sh(["docker", "unpause", cid(f"drone-agent-{i}")], check=False)
-    stopped = [s for s in sh(["docker", "compose", "ps", "-a", "--filter", "status=exited",
-              "--format", "{{.Service}}"]).stdout.split()]
-    agents = [f"drone-agent-{i}" for i in range(1, n + 1)]
-    victims = [s for s in stopped if s in agents]
-    if victims:
-        sh(["docker", "compose", "start", *victims])
+        sh(["docker", "update", "--cpus", "4.0", cid(f"drone-agent-{i}")], check=False)
+    # Запускаем упавшие контейнеры, если такие есть
+    exited = [s for s in sh(["docker", "ps", "-a", "--filter", "status=exited",
+              "--format", "{{.Names}}"]).stdout.split()]
     for i in range(1, n + 1):
-        c = cid(f"drone-agent-{i}")
-        if c:
-            sh(["docker", "update", "--cpus", "4.0", c], check=False)
-    wait_healthy(agents, 120)
-    time.sleep(5)
+        name = cid(f"drone-agent-{i}")
+        if name in exited:
+            sh(["docker", "start", name])
+    wait_healthy(agents, 60)
+    time.sleep(2)
 
 
 @dataclass
@@ -166,8 +165,8 @@ def v1_netem(n=N_DEFAULT) -> Result:
     winners_B = {j: v for st in [mid_states[i] for i in groupB] for j, v in st.get("winners", {}).items()}
     dup_during_split = sorted(set(winners_A) & set(winners_B))
 
-    sh(["./scripts/ewctl.sh", "reset"])
     t_merge0 = time.time()
+    sh(["./scripts/ewctl.sh", "reset"])
     converged_at = None
     seen_epochs = set()
     while time.time() - t_merge0 < 60:

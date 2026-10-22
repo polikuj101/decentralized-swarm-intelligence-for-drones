@@ -196,8 +196,7 @@ class Flight(Node):
         vx = vy = vz = 0.0
         st = self.state
         if st == "WAIT":
-            ok = (self.lp is not None and self.lp.z_valid and (self.lp.xy_valid or self.lp.v_xy_valid)
-                  and getattr(self.vs, "pre_flight_checks_pass", True))
+            ok = (self.lp is not None and self.lp.z_valid and (self.lp.xy_valid or self.lp.v_xy_valid))
             if ok:
                 self.ready_t = self.ready_t or now
                 if now - self.ready_t > 3.0:
@@ -205,7 +204,7 @@ class Flight(Node):
             else:
                 self.ready_t = None
         elif st == "ARMING":
-            if self.vs and self.vs.arming_state == 2 and self.vs.nav_state == 14:
+            if self.vs and self.vs.arming_state == 2:
                 self.state, self.label = "TAKEOFF", "TAKEOFF"
             elif now - self.t_cmd > 1.0:
                 self.t_cmd = now
