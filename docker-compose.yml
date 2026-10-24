@@ -148,6 +148,7 @@ services:
       EW_URL: "http://172.33.0.2:8080"
     volumes:
       - ./docker/web-hud/main.py:/app/main.py:ro
+      - ./docker/web-hud/convergence.py:/app/convergence.py:ro
       - ./docker/web-hud/static:/app/static:ro
     networks:
       ui-net:   {}
