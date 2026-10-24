@@ -139,31 +139,53 @@ class Result:
 
 # ───────────────────────── Вектор 1: сетевой хаос ─────────────────────────
 
+def ew_agent_errors(r) -> list:
+    """ew-controller отвечает HTTP 200, даже когда агент не применил правило ({"1": {"ok": false, "body": {"error": ...}}}),
+    а `curl -f` и ewctl.sh этого не видят: раньше Вектор 1 проходил на рое, который на самом деле никто не резал
+    (ядро WSL без netem/prio, старый образ агента). Возвращает тексты ошибок."""
+    try:
+        data = json.loads((r.stdout or "").strip() or "{}")
+    except ValueError:
+        return [f"не JSON: {(r.stdout or '')[:80]!r}"]
+    errs = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict) and v.get("ok") is False:
+                body = v.get("body")
+                errs.append(f"D{k}: {(body.get('error') if isinstance(body, dict) else body) or v.get('status')}"[:160])
+    return errs
+
+
 def v1_netem(n=N_DEFAULT) -> Result:
     res = Result(1, "Zenoh network degradation (netem, split-brain, merge)")
     before = get_state("drone-agent-1")
-    sh(["./scripts/ewctl.sh", "mesh", "L3", "all", "20"])
-    time.sleep(22)
-    after_l3 = get_state("drone-agent-1")
-    link_q_during = after_l3.get("link_q", 0.0)
+    link_q_before = before.get("link_q", 0.0)
+    ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "mesh", "L3", "all", "20"]))
+    time.sleep(10)                                   # середина окна L3 (длительность 20 с): L3 ещё активен
+    link_q_during = get_state("drone-agent-1").get("link_q", 0.0)
+    time.sleep(12)                                   # дождаться автоснятия L3 до разделения
+    l3_effective = not ew_errors and link_q_during <= link_q_before - 0.2
 
     # split-brain: {1,2,3} | {4,5}, аукцион активен
     groupA, groupB = [1, 2, 3], [4, 5]
     t0 = time.time()
     for a in groupA:
-        sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps({"level": "L4", "drones": [a], "peers": [b for b in groupB]})])
+        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+                                         "-H", "Content-Type: application/json",
+                                         "-d", json.dumps({"level": "L4", "drones": [a], "peers": [b for b in groupB]})]))
     for b in groupB:
-        sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps({"level": "L4", "drones": [b], "peers": [a for a in groupA]})])
+        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+                                         "-H", "Content-Type: application/json",
+                                         "-d", json.dumps({"level": "L4", "drones": [b], "peers": [a for a in groupA]})]))
     split_hold_s = 20
     time.sleep(split_hold_s)
     mid_states = get_all_states(n)
     winners_A = {j: v for st in [mid_states[i] for i in groupA] for j, v in st.get("winners", {}).items()}
     winners_B = {j: v for st in [mid_states[i] for i in groupB] for j, v in st.get("winners", {}).items()}
     dup_during_split = sorted(set(winners_A) & set(winners_B))
+    # разрыв должен быть виден самому рою: каждый борт считает живыми ровно свою группу
+    own_group = {**{i: set(groupA) for i in groupA}, **{i: set(groupB) for i in groupB}}
+    split_effective = all(set(mid_states[i].get("alive", [])) == own_group[i] for i in own_group if i in mid_states)         and len(mid_states) == len(own_group)
 
     t_merge0 = time.time()
     sh(["./scripts/ewctl.sh", "reset"])
@@ -188,16 +210,27 @@ def v1_netem(n=N_DEFAULT) -> Result:
         time.sleep(1)
 
     res.metrics = {
+        "link_q_before": round(link_q_before, 3),
         "link_q_during_L3": round(link_q_during, 3),
+        "l3_effective": l3_effective,
+        "split_effective": split_effective,
+        "ew_agent_errors": sorted(set(ew_errors))[:5],
         "duplicate_tasks_during_split": dup_during_split,
         "merge_convergence_s": None if converged_at is None else round(converged_at, 1),
         "epochs_seen_during_merge": sorted(list(seen_epochs)),
     }
-    res.verdict = "PASS" if (converged_at is not None and converged_at <= 30.0) else "FAIL"
-    res.notes = (
-        "допустимо дублирование задач ВО ВРЕМЯ раздельного существования групп (ожидаемое поведение п. 4.7.2); "
-        "сходимость после слияния подтверждена за t <= 30c"
-    )
+    chaos_applied = l3_effective and split_effective and not ew_errors
+    res.verdict = "PASS" if (chaos_applied and converged_at is not None and converged_at <= 30.0) else "FAIL"
+    if not chaos_applied:
+        res.notes = ("ХАОС НЕ ПРИМЕНЁН — результат слияния ничего не доказывает: "
+                     f"L3 {'применён' if l3_effective else 'не снизил link_q'}, "
+                     f"разделение {'разошлось' if split_effective else 'не разошлось (alive не по группам)'}, "
+                     f"ошибки агентов: {sorted(set(ew_errors))[:2] or 'нет'}")
+    else:
+        res.notes = (
+            "допустимо дублирование задач ВО ВРЕМЯ раздельного существования групп (ожидаемое поведение п. 4.7.2); "
+            "сходимость после слияния подтверждена за t <= 30c"
+        )
     return res
 
 
