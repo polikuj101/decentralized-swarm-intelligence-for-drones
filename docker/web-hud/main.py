@@ -291,15 +291,10 @@ def agent_failures(data) -> list[str]:
     return out
 
 
-def split_groups() -> tuple[list[int], list[int]]:
-    half = (N + 1) // 2                  # N=5 -> {1,2,3}|{4,5}, как в stress_test v1
-    return list(range(1, half + 1)), list(range(half + 1, N + 1))
-
-
 @app.post("/api/split", dependencies=[Depends(guard)])
 async def split():
     """Жёсткое разделение mesh (L4, 100% потерь между группами) — тот сценарий, на котором измерено время слияния."""
-    ga, gb = split_groups()
+    ga, gb = convergence.split_groups(N)
     calls = [{"level": "L4", "drones": [d], "peers": other, "duration_s": SPLIT_MAX_S}
              for grp, other in ((ga, gb), (gb, ga)) for d in grp]
     results = await asyncio.gather(*(ew_call("POST", "/v1/ew/mesh", c) for c in calls))

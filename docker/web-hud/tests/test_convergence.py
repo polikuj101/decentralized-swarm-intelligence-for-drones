@@ -94,13 +94,50 @@ def test_idle_ignores_updates_and_heal_without_split():
     assert t.phase == "idle" and t.converged_s is None
 
 
+def split_swarm(rx, a_winners=None, b_winners=None):
+    """Рой после реального разрыва: борты 1-3 видят живыми {1,2,3}, борты 4-5 — {4,5}."""
+    s = {}
+    for i in (1, 2, 3):
+        s[i] = {"epoch": 7, "winners": {"3": 1} if a_winners is None else a_winners, "alive": [1, 2, 3], "rx": rx}
+    for i in (4, 5):
+        s[i] = {"epoch": 8, "winners": {"3": 4} if b_winners is None else b_winners, "alive": [4, 5], "rx": rx}
+    return s
+
+
+def test_split_groups_match_stress_test_layout():
+    assert cv.split_groups(5) == ([1, 2, 3], [4, 5])
+    assert cv.split_groups(4) == ([1, 2], [3, 4])
+
+
+def test_split_overlap_counts_tasks_claimed_by_both_groups():
+    settled, dup = cv.split_overlap(split_swarm(20.0), N, now=20.5)
+    assert settled and dup == ["3"]
+
+
+def test_split_overlap_same_task_claimed_only_by_one_group_is_not_duplicate():
+    settled, dup = cv.split_overlap(split_swarm(20.0, a_winners={"3": 1}, b_winners={"5": 4}), N, now=20.5)
+    assert settled and dup == []
+
+
+def test_split_overlap_ignored_until_groups_actually_diverged():
+    """alive=5 у всех: сеть не разошлась (так было, пока ядро WSL не умело режет mesh) -> пересечение не считаем."""
+    settled, dup = cv.split_overlap(swarm(rx=20.0, winners={"3": 1}), N, now=20.5)
+    assert not settled and dup == []
+
+
+def test_split_overlap_needs_fresh_packets_from_all_drones():
+    s = split_swarm(20.0)
+    s[5]["rx"] = 10.0
+    assert cv.split_overlap(s, N, now=20.5) == (False, [])
+    del s[5]
+    assert cv.split_overlap(s, N, now=20.5) == (False, [])
+
+
 def test_full_cycle_split_heal_converge():
     t = cv.Tracker()
     t.mark_split(10.0)
-    s = swarm(rx=20.0)
-    s[1]["winners"], s[4]["winners"] = {"3": 1}, {"3": 4}
-    t.update(s, N, now=20.5)                            # дубликат во время разделения
-    assert t.phase == "split" and t.dup_split == {"3"}
+    t.update(split_swarm(20.0), N, now=20.5)             # задача 3 заявлена обеими группами
+    assert t.phase == "split" and t.split_effective and t.dup_split == {"3"}
     t.mark_heal(30.0)
     assert t.phase == "merging"
     t.update(swarm(rx=29.0), N, now=30.5)               # пакеты ДО Heal: не считаются
@@ -108,7 +145,15 @@ def test_full_cycle_split_heal_converge():
     t.update(swarm(rx=33.0), N, now=33.2)
     assert t.phase == "converged" and t.converged_s == pytest.approx(3.2)
     snap = t.snapshot(40.0)
-    assert snap["merge_s"] == 3.2 and snap["dup_split"] == ["3"] and snap["dup_merge"] == []
+    assert snap["merge_s"] == 3.2 and snap["dup_split"] == ["3"] and snap["dup_merge"] == [] and snap["split_effective"]
+
+
+def test_split_that_never_diverged_is_flagged_not_effective():
+    t = cv.Tracker()
+    t.mark_split(10.0)
+    t.update(swarm(rx=20.0, winners={"3": 1}), N, now=20.5)
+    snap = t.snapshot(21.0)
+    assert snap["phase"] == "split" and not snap["split_effective"] and snap["dup_split"] == []
 
 
 def test_epochs_seen_during_merge_are_reported():

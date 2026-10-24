@@ -60,9 +60,10 @@ def hud():
     return TestClient(main.app)
 
 
-def pkt(drone, epoch=7, alive=5, winners=None):
+def pkt(drone, epoch=7, alive=5, winners=None, alive_ids=None):
     return {"v": 1, "drone": drone, "pos": [0, 0, 0], "nav": {}, "mesh": {},
-            "swarm": {"epoch": epoch, "winners": winners or {}, "alive": list(range(1, alive + 1))}}
+            "swarm": {"epoch": epoch, "winners": winners or {},
+                      "alive": alive_ids if alive_ids is not None else list(range(1, alive + 1))}}
 
 
 def ingest_all(c, **kw):
@@ -175,14 +176,23 @@ def test_convergence_measured_from_heal_on_fresh_packets_only(hud):
     assert snap["phase"] == "converged" and snap["merge_s"] >= 0 and snap["dup_merge"] == []
 
 
-def test_duplicates_during_split_reported_separately(hud):
+def test_duplicates_during_split_are_tasks_claimed_by_both_groups(hud):
     hud.post("/api/split", headers=HUD)
-    for i in range(1, 6):
-        winners = {"3": 1} if i <= 3 else {"3": 4}
-        hud.post(f"/api/ingest/{i}", json=pkt(i, alive=3, winners=winners))
+    for i in range(1, 6):                                      # реальный разрыв: каждая группа видит живыми только своих
+        group = [1, 2, 3] if i <= 3 else [4, 5]
+        hud.post(f"/api/ingest/{i}", json=pkt(i, alive_ids=group, winners={"3": 1 if i <= 3 else 4}))
+    snap = hud.get("/api/state").json()["converge"]
+    assert snap["split_effective"] and snap["dup_split"] == ["3"]
     time.sleep(TICK)
     hud.post("/api/heal", headers=HUD)
     time.sleep(TICK)
     ingest_all(hud)
     snap = hud.get("/api/state").json()["converge"]
     assert snap["dup_split"] == ["3"] and snap["dup_merge"] == [] and snap["phase"] == "converged"
+
+
+def test_split_without_real_partition_is_not_marked_effective(hud):
+    hud.post("/api/split", headers=HUD)
+    ingest_all(hud, winners={"3": 1})                          # alive=5 у всех: сеть не разошлась
+    snap = hud.get("/api/state").json()["converge"]
+    assert not snap["split_effective"] and snap["dup_split"] == []

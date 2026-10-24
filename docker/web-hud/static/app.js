@@ -220,8 +220,8 @@ function updateTop(s, ref) {
 // Время слияния считает HUD (convergence.py); дубликаты во время разделения и после слияния показываются отдельно.
 function convText(c) {
   if (!c || c.phase === "idle") return "";
-  const dup = `дубли: разделение ${c.dup_split.length} · после слияния ${c.dup_merge.length}`;
-  if (c.phase === "split") return `РАЗДЕЛЕНИЕ · ${dup}`;
+  const dup = `дубли: во время разделения ${c.dup_split.length} · после слияния ${c.dup_merge.length}`;
+  if (c.phase === "split") return (c.split_effective ? "РАЗДЕЛЕНИЕ применено" : "РАЗДЕЛЕНИЕ: сеть ещё не разошлась") + ` · ${dup}`;
   if (c.phase === "merging")
     return `слияние… ${fmt(c.elapsed_s, 1)} с · эпох ${c.epochs_merge.length}` + (c.waiting_for.length ? ` · ждём D${c.waiting_for.join(",D")}` : "") + ` · ${dup}`;
   return `СЛИЯНИЕ ${fmt(c.merge_s, 2)} с · эпох ${c.epochs_merge.length} · ${dup}`;
