@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ew-agent: исполнитель РЭБ внутри drone-agent-N.
 C2   -> nftables (drop по портам)
-Mesh -> tc netem (root netem либо prio + u32 по dst-IP пира)
+Mesh -> tc netem (root netem либо prio + u32 по dst-IP пира); на ядрах без netem/prio — nftables (см. nft_mesh_script)
 GNSS -> MAVLink PARAM_SET параметров SIM_GPS_JAM / SIM_GPS_JAM_EPH (патч PX4, см. п. 2.5)
 """
 import ipaddress
@@ -131,29 +131,57 @@ def netem_args(p: MeshProfile) -> list[str]:
     return a
 
 
+def nft_mesh_script(dev: str, p: MeshProfile, peer_ips: list[str] | None) -> tuple[str | None, list[str]]:
+    """Эмуляция деградации mesh через nftables — для ядер без sch_netem/sch_prio (стандартное ядро WSL2).
+    Умеет: равномерную потерю (numgen random), жёсткий обрыв, ограничение скорости (limit rate).
+    Не умеет: задержку/джиттер, коррелированные (пакетные) потери — они возвращаются списком `unsupported`
+    и попадают в state, чтобы профиль не выглядел точнее, чем он применён.
+    peer_ips=None — вся mesh-интерфейс, иначе только трафик к/от перечисленных пиров.
+    Возвращает (скрипт nft или None если нечего применять, unsupported)."""
+    unsupported = []
+    if p.delay_ms or p.jitter_ms:
+        unsupported.append("delay/jitter")
+    if 0 < p.loss_pct < 100 and p.loss_corr_pct > 0:
+        unsupported.append("loss_corr (пакетные потери заменены равномерными)")
+    to = "" if peer_ips is None else f"ip daddr {{ {', '.join(peer_ips)} }} "
+    out_rules, in_rules = [], []
+    if p.loss_pct >= 100:
+        out_rules.append(f'oifname "{dev}" {to}counter drop')
+        if peer_ips is not None:          # симметрично на приёме, как раньше: жёсткий разрыв с обеих сторон
+            in_rules.append(f'iifname "{dev}" ip saddr {{ {", ".join(peer_ips)} }} counter drop')
+    else:
+        if p.loss_pct > 0:
+            out_rules.append(f'oifname "{dev}" {to}numgen random mod 1000 < {round(p.loss_pct * 10)} counter drop')
+        if p.rate_kbit:
+            out_rules.append(f'oifname "{dev}" {to}limit rate over {p.rate_kbit * 125} bytes/second counter drop')
+    if not out_rules and not in_rules:
+        return None, unsupported
+
+    def chain(name: str, hook: str, rules: list[str]) -> str:
+        body = "".join(f"    {r}\n" for r in rules)
+        return f"  chain {name} {{\n    type filter hook {hook} priority 0; policy accept;\n{body}  }}\n"
+
+    chains = chain("ew_mesh_out", "output", out_rules)
+    if in_rules:
+        chains += chain("ew_mesh_in", "input", in_rules)
+    return "table inet ew_mesh\ndelete table inet ew_mesh\ntable inet ew_mesh {\n" + chains + "}\n", unsupported
+
+
 def mesh_apply(p: MeshProfile) -> None:
     dev = IF["mesh"]
     sh(["tc", "qdisc", "del", "dev", dev, "root"], check=False)
     sh(["nft", "delete", "table", "inet", "ew_mesh"], check=False)
-    if p.peers is None:
-        try:
-            sh(["tc", "qdisc", "add", "dev", dev, "root"] + netem_args(p))
-        except EwError as e:
-            log.warning("tc netem failed (%s), fallback under WSL2", e)
-            if p.loss_pct >= 90:
-                script = (
-                    "table inet ew_mesh\n"
-                    "delete table inet ew_mesh\n"
-                    "table inet ew_mesh {\n"
-                    f'  chain ew_mesh_out {{\n    type filter hook output priority 0; policy accept;\n    oifname "{dev}" counter drop\n  }}\n'
-                    "}\n"
-                )
-                sh(["nft", "-f", "-"], stdin=script)
-    else:
+    peer_ips = None
+    if p.peers is not None:
         for pid in p.peers:
             if not (1 <= pid <= SWARM_SIZE) or pid == DRONE_ID:
                 raise EwError(f"invalid peer id {pid}")
-        try:
+        peer_ips = [peer_ip(pid) for pid in p.peers]
+    emulation, unsupported = "tc", []
+    try:
+        if p.peers is None:
+            sh(["tc", "qdisc", "add", "dev", dev, "root"] + netem_args(p))
+        else:
             # band 1 (1:1) — трафик без деградации; band k+1 — пир с ID=k
             sh(["tc", "qdisc", "add", "dev", dev, "root", "handle", "1:", "prio",
                 "bands", str(SWARM_SIZE + 1), "priomap"] + ["0"] * 16)
@@ -163,19 +191,20 @@ def mesh_apply(p: MeshProfile) -> None:
                    + netem_args(p))
                 sh(["tc", "filter", "add", "dev", dev, "parent", "1:", "protocol", "ip", "prio", "1",
                     "u32", "match", "ip", "dst", f"{peer_ip(pid)}/32", "flowid", f"1:{band}"])
-        except EwError as e:
-            log.warning("tc prio failed (%s), fallback to nftables under WSL2", e)
-            peer_ips = ", ".join(peer_ip(pid) for pid in p.peers)
-            script = (
-                "table inet ew_mesh\n"
-                "delete table inet ew_mesh\n"
-                "table inet ew_mesh {\n"
-                f'  chain ew_mesh_out {{\n    type filter hook output priority 0; policy accept;\n    oifname "{dev}" ip daddr {{ {peer_ips} }} counter drop\n  }}\n'
-                f'  chain ew_mesh_in {{\n    type filter hook input priority 0; policy accept;\n    iifname "{dev}" ip saddr {{ {peer_ips} }} counter drop\n  }}\n'
-                "}\n"
-            )
-            sh(["nft", "-f", "-"], stdin=script)
-    state["mesh"] = {"active": True, "profile": p.model_dump(), "since": time.time()}
+    except EwError as e:
+        log.warning("tc netem/prio failed (%s), fallback to nftables (ядро без netem, например WSL2)", e)
+        sh(["tc", "qdisc", "del", "dev", dev, "root"], check=False)      # убрать частично созданное
+        script, unsupported = nft_mesh_script(dev, p, peer_ips)
+        if script is None:
+            # раньше здесь молча ничего не применялось, а state говорил active=True — это ложный успех
+            raise EwError(f"ядро без netem, профиль нельзя эмулировать через nftables "
+                          f"(нужны: {', '.join(unsupported) or 'loss/rate'}): {e}")
+        sh(["nft", "-f", "-"], stdin=script)
+        emulation = "nftables"
+        if unsupported:
+            log.warning("nftables-эмуляция не воспроизводит: %s", ", ".join(unsupported))
+    state["mesh"] = {"active": True, "profile": {**p.model_dump(), "emulation": emulation, "unsupported": unsupported},
+                     "since": time.time()}
 
 
 def mesh_restore() -> None:
