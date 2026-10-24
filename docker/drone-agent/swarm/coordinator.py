@@ -12,6 +12,7 @@ from std_msgs.msg import String
 import math
 from collections import deque
 from swarm import actions as A, common, wire
+from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.mesh import Mesh
 
@@ -57,7 +58,7 @@ class Coordinator(Node):
         self.exec_task, self.override, self.mission_done_sent = None, None, False
         self.exec_dist_min, self.exec_dist_t = 999.0, now
         self.alive_prev = {ME}
-        self.last_bump, self.pending_bump = -99.0, False
+        self.last_bump, self.bump_gate = -99.0, BumpGate()
         self.vec_changed, self.claim_dirty = 0.0, False
         self._x_last, self.x_since = None, now
         self.seqs = {wire.T_HB: 0, wire.T_CLAIM: 0, wire.T_ALLOC: 0, wire.T_FAIL: 0}
@@ -200,6 +201,7 @@ class Coordinator(Node):
     def adopt(self, epoch, now, why):
         self.epoch = epoch & 0xFF
         self.reset_cbaa(now)
+        self.bump_gate.absorb()             # чужой bump уже перезапустил аукцион; свой отложенный bump по прибытию лишний
         self.log(f"epoch -> {self.epoch} ({why})")
 
     def bump(self, why, now):
@@ -478,14 +480,15 @@ class Coordinator(Node):
     def _liveness(self, now):
         alive = self.alive_set(now)
         if alive != self.alive_prev:
-            for g in sorted(self.alive_prev - alive):
+            left, joined = self.alive_prev - alive, alive - self.alive_prev
+            for g in sorted(left):
                 self.log(f"peer {g} DEAD")
-            for g in sorted(alive - self.alive_prev):
+            for g in sorted(joined):
                 self.log(f"peer {g} ALIVE")
             self.alive_prev = alive
-            self.pending_bump = True
-        if self.pending_bump and now - self.last_bump > 3.0:
-            self.pending_bump = False
+            self.bump_gate.observe(bool(joined), bool(left), now)
+        if self.bump_gate.due(now, self.last_bump):
+            self.bump_gate.fire()
             self.bump("alive-set", now)
 
     def _exec(self, now):
