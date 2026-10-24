@@ -3,6 +3,7 @@
 лента «мыслей» LLM, WebSocket для браузера, прокси команд РЭБ (белый список)."""
 import asyncio
 import hmac
+import itertools
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocke
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pymavlink import mavutil
+
+import convergence
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s web-hud %(message)s")
 log = logging.getLogger("web-hud")
@@ -39,6 +42,9 @@ MAV = {i: {"hb": None, "armed": None, "fix": None, "sats": None} for i in range(
 EW = {"state": None, "ok": False, "err": "not polled yet", "rx": None}
 FEED: deque = deque(maxlen=1000)
 EVIDENCE: deque = deque(maxlen=200)
+EVIDENCE_SEQ = itertools.count(1)       # id не зависит от размера deque (len()+1 давал id=201 для всех после 200-й)
+TRACK = convergence.Tracker()
+SPLIT_MAX_S = 120.0                     # страховка: если HUD упал, разделение само снимется
 AGENT_MGMT_IPS = {i: f"172.33.0.{10+i}" for i in range(1, N + 1)}
 _feed_n = 0
 CLIENT: httpx.AsyncClient | None = None
@@ -98,6 +104,8 @@ async def ew_poll() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global CLIENT
+    if not TOKEN:
+        log.warning("EW_TOKEN не задан: ingest/evidence/tasking-агенты не проверяют Bearer (см. TODOS.md #2)")
     CLIENT = httpx.AsyncClient(timeout=8.0)
     threading.Thread(target=mav_loop, daemon=True).start()
     task = asyncio.create_task(ew_poll())
@@ -191,7 +199,19 @@ async def ingest(drone: int, request: Request):
     stored = {k: v for k, v in pkt.items() if k != "thoughts"}
     stored["swarm"] = {k: v for k, v in pkt["swarm"].items() if k != "events"}
     d["pkt"], d["rx"] = stored, time.monotonic()
+    if TRACK.phase in ("split", "merging"):
+        TRACK.update(conv_states(), N, d["rx"])
     return {"ok": True}
+
+
+def conv_states() -> dict:
+    out = {}
+    for i, d in DR.items():
+        sw = (d["pkt"] or {}).get("swarm") or {}
+        w = sw.get("winners")
+        out[i] = {"epoch": sw.get("epoch"), "winners": w if isinstance(w, dict) else {},
+                  "alive": sw.get("alive"), "rx": d["rx"]}
+    return out
 
 
 # ───────────── снимок и WebSocket ─────────────
@@ -207,7 +227,7 @@ def snapshot() -> dict:
             "pkt": d["pkt"],
             "c2": {"state": "NO_LINK" if hb_age is None else ("OK" if hb_age < C2_LOST_S else "LOST"),
                    "hb_age": hb_age, "armed": m["armed"], "fix": m["fix"], "sats": m["sats"]}}
-    return {"ts": time.time(), "swarm_size": N, "drones": drones, "ew": EW["state"],
+    return {"ts": time.time(), "swarm_size": N, "drones": drones, "converge": TRACK.snapshot(now), "ew": EW["state"],
             "ew_ok": bool(EW["ok"] and now - (EW["rx"] or 0.0) < 4.0), "ew_err": EW["err"]}
 
 
@@ -241,7 +261,7 @@ EW_POST = {"c2": "/v1/ew/c2", "gps": "/v1/ew/gps", "mesh": "/v1/ew/mesh", "resto
            "scenario_run": "/v1/scenarios/run", "scenario_stop": "/v1/scenarios/stop"}
 
 
-async def ew_forward(method: str, path: str, body: dict | None = None):
+async def ew_call(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     try:
         r = await CLIENT.request(method, EW_URL + path, json=body)
     except httpx.HTTPError as e:
@@ -250,7 +270,40 @@ async def ew_forward(method: str, path: str, body: dict | None = None):
         data = r.json()
     except ValueError:
         data = {"raw": r.text[:200]}
-    return JSONResponse(data, status_code=r.status_code)
+    return r.status_code, data
+
+
+async def ew_forward(method: str, path: str, body: dict | None = None):
+    status, data = await ew_call(method, path, body)
+    return JSONResponse(data, status_code=status)
+
+
+def split_groups() -> tuple[list[int], list[int]]:
+    half = (N + 1) // 2                  # N=5 -> {1,2,3}|{4,5}, как в stress_test v1
+    return list(range(1, half + 1)), list(range(half + 1, N + 1))
+
+
+@app.post("/api/split", dependencies=[Depends(guard)])
+async def split():
+    """Жёсткое разделение mesh (L4, 100% потерь между группами) — тот сценарий, на котором измерено время слияния."""
+    ga, gb = split_groups()
+    calls = [{"level": "L4", "drones": [d], "peers": other, "duration_s": SPLIT_MAX_S}
+             for grp, other in ((ga, gb), (gb, ga)) for d in grp]
+    results = await asyncio.gather(*(ew_call("POST", "/v1/ew/mesh", c) for c in calls))
+    if any(s != 200 for s, _ in results):
+        raise HTTPException(502, "split failed on ew-controller; нажмите Heal")
+    TRACK.mark_split(time.monotonic())
+    return {"ok": True, "groups": [ga, gb], "max_s": SPLIT_MAX_S}
+
+
+@app.post("/api/heal", dependencies=[Depends(guard)])
+async def heal():
+    """Снятие разделения. Старт таймера слияния — момент, когда restore принят ew-controller."""
+    status, data = await ew_call("POST", "/v1/ew/restore", {"channel": "mesh", "drones": None})
+    if status != 200:
+        raise HTTPException(502, "heal failed on ew-controller")
+    TRACK.mark_heal(time.monotonic())
+    return {"ok": True}
 
 
 @app.get("/api/ew/scenarios")
@@ -288,7 +341,7 @@ async def post_evidence(drone: int, request: Request):
         card = json.loads(raw)
     except ValueError:
         raise HTTPException(400, "bad json")
-    card["id"], card["drone"] = len(EVIDENCE) + 1, drone
+    card["id"], card["drone"] = next(EVIDENCE_SEQ), drone
     EVIDENCE.append(card)
     return {"ok": True, "id": card["id"]}
 
@@ -306,7 +359,7 @@ def get_evidence_image(card_id: int):
     return Response(bytes.fromhex(c["image_jpeg_b64"]), media_type="image/jpeg")
 
 
-@app.post("/api/tasking")
+@app.post("/api/tasking", dependencies=[Depends(guard)])
 async def post_tasking(request: Request):
     body = await request.json()
     prompt = str(body.get("prompt", "")).strip()

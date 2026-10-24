@@ -13,6 +13,7 @@
     <span id="ewb" class="b UNKNOWN">EW: —</span>
     <span id="scn-st" class="dim"></span>
     <span id="kpi" class="dim"></span>
+    <span id="conv" class="dim"></span>
     <span class="sp"></span>
     <span id="conn" class="b UNKNOWN">HUD offline</span>
   </header>
@@ -72,6 +73,8 @@
         <button data-lvl="L3">L3</button><button data-lvl="L4">L4</button>
         <button id="meshres">Вернуть mesh</button>
       </div>
+      <div class="btns"><button id="split">Split {1,2,3}|{4,5}</button><button id="heal">Heal</button></div>
+      <div class="r2 small">Split: жёсткое разделение mesh (L4, 100% потерь между группами), авто-снятие через 120 с. Heal запускает таймер слияния.</div>
       <div class="btns"><button id="reset" class="danger">Сброс всей РЭБ</button></div>
       <div class="btns"><select id="scn"></select><button id="scnrun">Сценарий ▶</button><button id="scnstop">■ Стоп</button></div>
       <div id="ewmsg" class="dim"></div>

@@ -75,6 +75,47 @@ except urllib.error.HTTPError as e:
     assert e.code == 404, f"Expected 404, got {e.code}"
     print("Test 5c (unknown action): 404 OK")
 
+# 5d. POST /api/tasking without X-HUD -> 403 (регрессия: эндпоинт был без guard)
+try:
+    req = urllib.request.Request("http://127.0.0.1:8000/api/tasking", data=b'{"prompt": "x"}', headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req)
+    print("FAIL: should have been 403")
+    sys.exit(1)
+except urllib.error.HTTPError as e:
+    assert e.code == 403, f"Expected 403, got {e.code}"
+    print("Test 5d (tasking, missing X-HUD): 403 OK")
+
+# 5e. POST /api/tasking with evil origin -> 403
+try:
+    req = urllib.request.Request("http://127.0.0.1:8000/api/tasking", data=b'{"prompt": "x"}', headers={"Content-Type": "application/json", "X-HUD": "1", "Origin": "http://evil.com"})
+    urllib.request.urlopen(req)
+    print("FAIL: should have been 403")
+    sys.exit(1)
+except urllib.error.HTTPError as e:
+    assert e.code == 403, f"Expected 403, got {e.code}"
+    print("Test 5e (tasking, evil origin): 403 OK")
+
+# 5f. POST /api/tasking with valid guard but empty prompt -> 422 (доходит до хендлера, LLM не вызывается)
+try:
+    req = urllib.request.Request("http://127.0.0.1:8000/api/tasking", data=b'{"prompt": ""}', headers={"Content-Type": "application/json", "X-HUD": "1", "Origin": "http://127.0.0.1:8000"})
+    urllib.request.urlopen(req)
+    print("FAIL: should have been 422")
+    sys.exit(1)
+except urllib.error.HTTPError as e:
+    assert e.code == 422, f"Expected 422, got {e.code}"
+    print("Test 5f (tasking, empty prompt): 422 OK")
+
+# 5g. Split/Heal без X-HUD -> 403 (сами split/heal не вызываем: они меняют состояние живого роя)
+for path in ("/api/split", "/api/heal"):
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8000" + path, data=b"{}", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req)
+        print("FAIL: should have been 403")
+        sys.exit(1)
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, f"Expected 403 for {path}, got {e.code}"
+print("Test 5g (split/heal, missing X-HUD): 403 OK")
+
 # 6. WebSocket tests
 async def test_ws():
     import websockets

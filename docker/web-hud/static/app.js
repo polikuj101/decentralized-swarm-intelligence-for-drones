@@ -214,6 +214,17 @@ function updateTop(s, ref) {
     const sw = ref.pkt.swarm;
     $("kpi").textContent = `эпоха ${sw.epoch} · задач готово ${sw.done.length}/${sw.total_tasks} · живых бортов ${sw.alive.length}`;
   } else $("kpi").textContent = "нет телеметрии";
+  $("conv").textContent = convText(s.converge);
+}
+
+// Время слияния считает HUD (convergence.py); дубликаты во время разделения и после слияния показываются отдельно.
+function convText(c) {
+  if (!c || c.phase === "idle") return "";
+  const dup = `дубли: разделение ${c.dup_split.length} · после слияния ${c.dup_merge.length}`;
+  if (c.phase === "split") return `РАЗДЕЛЕНИЕ · ${dup}`;
+  if (c.phase === "merging")
+    return `слияние… ${fmt(c.elapsed_s, 1)} с · эпох ${c.epochs_merge.length}` + (c.waiting_for.length ? ` · ждём D${c.waiting_for.join(",D")}` : "") + ` · ${dup}`;
+  return `СЛИЯНИЕ ${fmt(c.merge_s, 2)} с · эпох ${c.epochs_merge.length} · ${dup}`;
 }
 
 function render(s) {
@@ -271,10 +282,12 @@ function selDrones() {
 }
 const countBad = (o) => (o && typeof o === "object") ? (o.ok === false ? 1 : 0) + Object.values(o).reduce((a, v) => a + countBad(v), 0) : 0;
 
-async function ew(name, body) {
+const ew = (name, body) => hudPost("/api/ew/" + name, body);
+
+async function hudPost(path, body) {
   const m = $("ewmsg"); m.textContent = "…";
   try {
-    const r = await fetch("/api/ew/" + name, {method: "POST", headers: {"Content-Type": "application/json", "X-HUD": "1"}, body: JSON.stringify(body || {})});
+    const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-HUD": "1"}, body: JSON.stringify(body || {})});
     const data = await r.json().catch(() => ({}));
     if (!r.ok) m.textContent = `ошибка ${r.status}: ${String(data.detail || data.error || "").slice(0, 120)}`;
     else { const bad = countBad(data); m.textContent = bad ? `выполнено, ошибок у агентов: ${bad}` : "OK"; }
@@ -302,6 +315,8 @@ function buildCtrl() {
   $("gpsres").onclick = () => ew("restore", {channel: "gps", drones: selDrones()});
   document.querySelectorAll("button[data-lvl]").forEach((b) => b.onclick = () => ew("mesh", {level: b.dataset.lvl, drones: selDrones(), duration_s: dur()}));
   $("meshres").onclick = () => ew("restore", {channel: "mesh", drones: selDrones()});
+  $("split").onclick = () => hudPost("/api/split", {});
+  $("heal").onclick = () => hudPost("/api/heal", {});
   $("reset").onclick = () => ew("restore", {channel: "all", drones: null});
   $("scnrun").onclick = () => $("scn").value && ew("scenario_run", {name: $("scn").value});
   $("scnstop").onclick = () => ew("scenario_stop", {restore: true});
