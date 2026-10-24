@@ -105,7 +105,7 @@ async def ew_poll() -> None:
 async def lifespan(_: FastAPI):
     global CLIENT
     if not TOKEN:
-        log.warning("EW_TOKEN не задан: ingest/evidence/tasking-агенты не проверяют Bearer (см. TODOS.md #2)")
+        log.error("EW_TOKEN не задан: ingest и evidence отвечают 503, tasking-агенты отклонят приказы")
     CLIENT = httpx.AsyncClient(timeout=8.0)
     threading.Thread(target=mav_loop, daemon=True).start()
     task = asyncio.create_task(ew_poll())
@@ -125,6 +125,14 @@ async def sec_headers(request: Request, call_next):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+def require_bearer(request: Request) -> None:
+    """Bearer для эндпоинтов, которые зовут борты (ingest, evidence). Пустой EW_TOKEN = отказ, а не «без проверки»."""
+    if not TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
+        raise HTTPException(401, "bad token")
 
 
 def guard(request: Request) -> None:
@@ -164,8 +172,7 @@ def config():
 
 @app.post("/api/ingest/{drone}")
 async def ingest(drone: int, request: Request):
-    if TOKEN and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
-        raise HTTPException(401, "bad token")
+    require_bearer(request)
     if drone not in DR:
         raise HTTPException(404, "unknown drone")
     raw = await request.body()
@@ -278,16 +285,19 @@ async def ew_forward(method: str, path: str, body: dict | None = None):
     return JSONResponse(data, status_code=status)
 
 
-def agent_failures(data) -> list[str]:
-    """ew-controller отвечает HTTP 200 даже если агенты не применили правило: ошибки лежат в теле
-    ({"1": {"ok": false, "body": {"error": ...}}}). Возвращает тексты ошибок агентов."""
+def agent_failures(data, path: str = "") -> list[str]:
+    """ew-controller отвечает HTTP 200 даже если агенты не применили правило: ошибки лежат в теле, на любой глубине
+    ({"1": {"ok": false, ...}} у mesh/c2, {"mesh": {"1": {"ok": false, ...}}} у restore). Возвращает тексты ошибок агентов."""
+    out: list[str] = []
     if not isinstance(data, dict):
-        return []
-    out = []
+        return out
+    if data.get("ok") is False:
+        body = data.get("body")
+        err = body.get("error") if isinstance(body, dict) else body
+        out.append(f"{path or 'agent'}: {str(err or data.get('status'))[:160]}")
+        return out
     for k, v in data.items():
-        if isinstance(v, dict) and v.get("ok") is False:
-            err = (v.get("body") or {}).get("error") if isinstance(v.get("body"), dict) else v.get("body")
-            out.append(f"D{k}: {str(err or v.get('status'))[:160]}")
+        out += agent_failures(v, f"{path}/{'D' if str(k).isdigit() else ''}{k}".lstrip("/"))
     return out
 
 
@@ -344,8 +354,7 @@ async def ew_post(name: str, request: Request):
 
 @app.post("/api/evidence/{drone}")
 async def post_evidence(drone: int, request: Request):
-    if TOKEN and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
-        raise HTTPException(401, "bad token")
+    require_bearer(request)
     raw = await request.body()
     if len(raw) > 65536:
         raise HTTPException(413, "too large")

@@ -314,7 +314,9 @@ def reset_all(tolerate_gps: bool = False) -> None:
 # ───────────────────────────── HTTP API ─────────────────────────────
 
 def auth(authorization: str = Header(default="")):
-    if EW_TOKEN and authorization != f"Bearer {EW_TOKEN}":
+    if not EW_TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if authorization != f"Bearer {EW_TOKEN}":
         raise HTTPException(401, "bad token")
 
 

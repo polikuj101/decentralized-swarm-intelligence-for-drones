@@ -111,7 +111,9 @@ def healthz():
 
 @app.post("/v1/tasking")
 def post_tasking(r: TaskingReq, authorization: str = Header(default="")):
-    if EW_TOKEN and authorization != f"Bearer {EW_TOKEN}":
+    if not EW_TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if authorization != f"Bearer {EW_TOKEN}":
         raise HTTPException(401, "bad token")
     try:
         manifest = compile_order(r.prompt)

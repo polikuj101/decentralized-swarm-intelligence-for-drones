@@ -1,4 +1,4 @@
-"""tests/test_ew_agent_nft.py — nftables-эмуляция деградации mesh (ядра без netem/prio, например WSL2) и логика отказа.
+"""tests/test_ew_agent.py — nftables-эмуляция деградации mesh (ядра без netem/prio, например WSL2) и логика отказа.
 Запускается и на хосте (pip install pytest fastapi pydantic), и в drone-agent (make test-s1)."""
 import importlib.util
 import ipaddress
@@ -160,3 +160,24 @@ def test_apply_uses_tc_when_available(ew, monkeypatch):
 
 def test_peer_ip_layout_matches_mesh_net(ew):
     assert ew.peer_ip(4) == str(ipaddress.ip_network("172.31.0.0/24").network_address + 14)
+
+
+# ───────────── Bearer: пустой EW_TOKEN = отказ (fail-closed) ─────────────
+
+def test_agent_auth_fails_closed_without_token(ew, monkeypatch):
+    """Регрессия: `if EW_TOKEN and ...` при пустом токене пропускал любые команды РЭБ."""
+    from fastapi import HTTPException
+    monkeypatch.setattr(ew, "EW_TOKEN", "")
+    for header in ("", "Bearer "):
+        with pytest.raises(HTTPException) as e:
+            ew.auth(header)
+        assert e.value.status_code == 503
+
+
+def test_agent_auth_rejects_wrong_and_accepts_right_token(ew, monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(ew, "EW_TOKEN", "s3cret")
+    with pytest.raises(HTTPException) as e:
+        ew.auth("Bearer nope")
+    assert e.value.status_code == 401
+    assert ew.auth("Bearer s3cret") is None

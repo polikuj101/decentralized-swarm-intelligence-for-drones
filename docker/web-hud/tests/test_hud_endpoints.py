@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-os.environ["EW_TOKEN"] = ""                      # без токена: проверяем guard (Origin + X-HUD), а не Bearer
+TEST_TOKEN = "test-token-123"
+os.environ["EW_TOKEN"] = TEST_TOKEN
 os.environ.setdefault("SWARM_SIZE", "5")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
@@ -25,14 +26,15 @@ import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 HUD = {"X-HUD": "1"}
+BEARER = {"Authorization": f"Bearer {TEST_TOKEN}"}
 TICK = 0.05          # на Windows шаг time.monotonic() ~15 мс: разводим события, иначе rx == t_heal
 
 
 class FakeEW:
     """Подмена httpx.AsyncClient: запоминает вызовы к ew-controller."""
 
-    def __init__(self, status=200, agent_error=None):
-        self.status, self.agent_error, self.calls = status, agent_error, []
+    def __init__(self, status=200, agent_error=None, nested=False):
+        self.status, self.agent_error, self.nested, self.calls = status, agent_error, nested, []
 
     async def request(self, method, url, json=None):
         self.calls.append((method, url.split("8080")[-1] if "8080" in url else url, json))
@@ -44,8 +46,9 @@ class FakeEW:
 
             def json(self):
                 if outer.agent_error:                      # форма ответа ew-controller: HTTP 200, ошибки по агентам в теле
-                    return {"1": {"ok": False, "status": 500, "body": {"error": outer.agent_error}},
-                            "2": {"ok": True, "status": 200, "body": {}}}
+                    agents = {"1": {"ok": False, "status": 500, "body": {"error": outer.agent_error}},
+                              "2": {"ok": True, "status": 200, "body": {}}}
+                    return {"mesh": agents} if outer.nested else agents          # restore вкладывает ответы под именем канала
                 return {"1": {"ok": outer.status == 200, "status": outer.status}}
         return R()
 
@@ -68,7 +71,7 @@ def pkt(drone, epoch=7, alive=5, winners=None, alive_ids=None):
 
 def ingest_all(c, **kw):
     for i in range(1, 6):
-        assert c.post(f"/api/ingest/{i}", json=pkt(i, **kw)).status_code == 200
+        assert c.post(f"/api/ingest/{i}", json=pkt(i, **kw), headers=BEARER).status_code == 200
 
 
 # ───────────── /api/tasking guard (регрессия: раньше был без Depends(guard)) ─────────────
@@ -91,7 +94,7 @@ def test_tasking_with_x_hud_reaches_handler(hud):
 def test_evidence_ids_stay_unique_after_deque_is_full(hud):
     for i in range(203):                                        # дубликаты id у старого кода начинаются с 202-й карточки
         card = {"image_jpeg_b64": f"{i:04x}", "enu": [0, 0]}
-        assert hud.post(f"/api/evidence/{(i % 5) + 1}", json=card).status_code == 200
+        assert hud.post(f"/api/evidence/{(i % 5) + 1}", json=card, headers=BEARER).status_code == 200
     cards = hud.get("/api/evidence").json()
     ids = [c["id"] for c in cards]
     assert len(cards) == 200 and len(set(ids)) == 200 and ids == sorted(ids)
@@ -138,8 +141,9 @@ def test_split_with_agent_errors_is_not_reported_as_success(hud):
 
 
 def test_heal_with_agent_errors_does_not_start_timer(hud):
+    """restore отвечает вложенно ({"mesh": {"1": {"ok": false}}}) — прежний плоский обход ошибку не видел."""
     hud.post("/api/split", headers=HUD)
-    main.CLIENT = FakeEW(agent_error="boom")
+    main.CLIENT = FakeEW(agent_error="boom", nested=True)
     assert hud.post("/api/heal", headers=HUD).status_code == 502
     assert main.TRACK.phase == "split"
 
@@ -180,7 +184,7 @@ def test_duplicates_during_split_are_tasks_claimed_by_both_groups(hud):
     hud.post("/api/split", headers=HUD)
     for i in range(1, 6):                                      # реальный разрыв: каждая группа видит живыми только своих
         group = [1, 2, 3] if i <= 3 else [4, 5]
-        hud.post(f"/api/ingest/{i}", json=pkt(i, alive_ids=group, winners={"3": 1 if i <= 3 else 4}))
+        hud.post(f"/api/ingest/{i}", json=pkt(i, alive_ids=group, winners={"3": 1 if i <= 3 else 4}), headers=BEARER)
     snap = hud.get("/api/state").json()["converge"]
     assert snap["split_effective"] and snap["dup_split"] == ["3"]
     time.sleep(TICK)
@@ -196,3 +200,30 @@ def test_split_without_real_partition_is_not_marked_effective(hud):
     ingest_all(hud, winners={"3": 1})                          # alive=5 у всех: сеть не разошлась
     snap = hud.get("/api/state").json()["converge"]
     assert not snap["split_effective"] and snap["dup_split"] == []
+
+
+# ───────────── Bearer: пустой токен = отказ (fail-closed), неверный = 401 ─────────────
+
+def test_ingest_and_evidence_require_the_token(hud):
+    assert hud.post("/api/ingest/1", json=pkt(1)).status_code == 401
+    assert hud.post("/api/ingest/1", json=pkt(1), headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert hud.post("/api/evidence/1", json={"image_jpeg_b64": "00"}).status_code == 401
+    assert hud.post("/api/ingest/1", json=pkt(1), headers=BEARER).status_code == 200
+
+
+def test_unconfigured_token_fails_closed(hud, monkeypatch):
+    """Регрессия: пустой EW_TOKEN раньше отключал проверку целиком (`if TOKEN and ...`)."""
+    monkeypatch.setattr(main, "TOKEN", "")
+    r = hud.post("/api/ingest/1", json=pkt(1))
+    assert r.status_code == 503 and "EW_TOKEN" in r.json()["detail"]
+    assert hud.post("/api/ingest/1", json=pkt(1), headers={"Authorization": "Bearer "}).status_code == 503
+    assert hud.post("/api/evidence/1", json={"image_jpeg_b64": "00"}).status_code == 503
+
+
+def test_agent_failures_walks_flat_and_nested_replies():
+    assert main.agent_failures({"1": {"ok": True}, "2": {"ok": True}}) == []
+    flat = main.agent_failures({"1": {"ok": False, "status": 500, "body": {"error": "x"}}})
+    assert flat == ["D1: x"]
+    nested = main.agent_failures({"c2": {"1": {"ok": True}}, "mesh": {"3": {"ok": False, "status": 500, "body": {"error": "y"}}}})
+    assert nested == ["mesh/D3: y"]
+    assert main.agent_failures(None) == [] and main.agent_failures([1, 2]) == []
