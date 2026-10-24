@@ -16,6 +16,7 @@ x-agent: &agent
   volumes:
     - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
     - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro   # образ от 15.10 без nftables-fallback для WSL2 (нет netem/prio)
     - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
   depends_on:
     simulator-core: { condition: service_healthy }
