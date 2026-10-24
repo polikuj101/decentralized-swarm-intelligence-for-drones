@@ -35,6 +35,8 @@ SPAWN = next((d["x_m"], d["y_m"]) for d in SCENE["drones"] if d["id"] == DRONE_I
 HOME = SPAWN
 ALT = MISSION["base_alt_m"] + MISSION["alt_step_m"] * (DRONE_ID - 1)
 OBSTACLES = SCENE.get("obstacles", [])
+# T0/T1/T2 -> родительский базовый сектор. Зависит от текущей scene.json: T0(40,15)->S4, T1(45,-12)->S2, T2(20,30)->S3.
+TARGET_PARENT_SECTOR = {6: 4, 7: 2, 8: 3}
 
 
 def world_to_ned(x, y):

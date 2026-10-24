@@ -25,7 +25,7 @@ async function loadConfig() {
 async function init() {
   await loadConfig();
   N = cfg.swarm_size;
-  buildMap(); buildGraph(); buildCtrl(); buildFilter();
+  buildMap(); buildGraph(); buildCtrl(); buildFilter(); buildTasking(); buildEvidence();
   setTimeout(() => map.invalidateSize(), 100);
   connect();
 }
@@ -306,6 +306,119 @@ function buildCtrl() {
   $("scnrun").onclick = () => $("scn").value && ew("scenario_run", {name: $("scn").value});
   $("scnstop").onclick = () => ew("scenario_stop", {restore: true});
   loadScenarios(); setInterval(loadScenarios, 15000);
+}
+
+// ───────────── Commander Tasking & BDA Evidence ─────────────
+function buildTasking() {
+  const btn = $("cmd-send");
+  const inp = $("cmd-input");
+  const st = $("cmd-status");
+  const card = $("manifest-info");
+  if (!btn || !inp) return;
+
+  btn.onclick = async () => {
+    const prompt = inp.value.trim();
+    if (!prompt) return;
+    st.textContent = "Компиляция Qwen-0.5B (5 бортов)...";
+    st.className = "cmd-badge compiling";
+    btn.disabled = true;
+
+    try {
+      const res = await fetch("/api/tasking", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-HUD": "1"},
+        body: JSON.stringify({prompt})
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      if (!res.ok) {
+        st.textContent = "Ошибка: " + (data.detail || "502");
+        st.className = "cmd-badge";
+        return;
+      }
+      const okCount = (data.results || []).filter(r => r.ok).length;
+      st.textContent = `Манифест согласован (${okCount}/${N} бортов)`;
+      st.className = "cmd-badge ready";
+
+      const firstOk = (data.results || []).find(r => r.ok && r.body);
+      if (firstOk && firstOk.body) {
+        const b = firstOk.body;
+        card.style.display = "block";
+        card.innerHTML = `<b>Скомпилированный Task Manifest:</b> Зоны: <code>[${(b.zones_named || []).join(", ")}]</code> (сектора ${(b.active_sectors || []).join(",")}) | ` +
+                         `При контакте: <code>${b.on_target}</code> (${b.dwell_s}с) | RTB: <code>${b.rtb_on_complete}</code> | ` +
+                         `Инференс: <code>${b.latency_ms} мс</code>`;
+      }
+    } catch (e) {
+      btn.disabled = false;
+      st.textContent = "Ошибка сети: " + e.message;
+      st.className = "cmd-badge";
+    }
+  };
+}
+
+let lastEvidenceIds = new Set();
+async function pollEvidence() {
+  try {
+    const res = await fetch("/api/evidence");
+    if (!res.ok) return;
+    const cards = await res.json();
+    const badge = $("ev-badge");
+    if (badge) badge.textContent = String(cards.length);
+    if (!cards.length) return;
+
+    const gal = $("evidence-gallery");
+    if (!gal) return;
+    const currentIds = new Set(cards.map(c => c.id));
+    if (currentIds.size !== lastEvidenceIds.size) {
+      lastEvidenceIds = currentIds;
+      gal.replaceChildren();
+      for (const c of cards.slice().reverse()) {
+        const d = mk("div", "ev-card");
+        const img = mk("img", "ev-thumb");
+        img.src = `/api/evidence/${c.id}/image`;
+        img.alt = `Target T${c.target_id}`;
+
+        const body = mk("div", "ev-body");
+        const head = mk("div", "ev-head", `Цель T${c.target_id} (Борт D${c.drone})`);
+        const pos = mk("div", null, `ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.local_enu_m.z}м) | Дистанция: ${c.dist_to_target_m}м`);
+        const geo = mk("div", "dim", `Координаты: ${c.approx_latlon.lat}°, ${c.approx_latlon.lon}°`);
+        const src = mk("div", "dim", `Источник: ${c.nav_source || "VIO/DR"} (GPS fix: ${c.gps_fix || "denied"}) | Фото: ${c.image_bytes}B`);
+        const note = mk("div", "ev-note", `* ${c.approx_latlon.note}`);
+
+        body.append(head, pos, geo, src, note);
+        d.append(img, body);
+        gal.append(d);
+      }
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function buildEvidence() {
+  const tCon = $("tab-console");
+  const tEv = $("tab-evidence");
+  const cView = $("console");
+  const cTools = $("console-tools");
+  const eView = $("evidence-view");
+  if (!tCon || !tEv) return;
+
+  tCon.onclick = () => {
+    tCon.classList.add("active");
+    tEv.classList.remove("active");
+    if (cView) cView.style.display = "block";
+    if (cTools) cTools.style.display = "flex";
+    if (eView) eView.style.display = "none";
+  };
+
+  tEv.onclick = () => {
+    tEv.classList.add("active");
+    tCon.classList.remove("active");
+    if (cView) cView.style.display = "none";
+    if (cTools) cTools.style.display = "none";
+    if (eView) eView.style.display = "block";
+    pollEvidence();
+  };
+
+  setInterval(pollEvidence, 2000);
 }
 
 // ───────────── WebSocket ─────────────

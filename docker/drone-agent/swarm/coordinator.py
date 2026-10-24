@@ -79,8 +79,10 @@ class Coordinator(Node):
         self.create_subscription(String, "/swarm/local/phase", self._on_phase, 10)
         self.create_subscription(String, "/swarm/local/planner_cmd", self._on_cmd, 10)
         self.create_subscription(String, "/swarm/local/planner_log", self._on_plog, 10)
-        with self.lock:
-            self.reset_cbaa(now)
+        self.manifest_file = os.environ.get("MANIFEST_FILE", "/opt/swarm/config/manifest.json")
+        self.manifest_wait_timeout_s = 90.0
+        self.active_zones, self.manifest, self.manifest_wait_t0 = None, None, now
+        self.log("ожидание Task Manifest (NL-приказ оператора)...")
         self.create_timer(0.1, self.tick)
         self.log("coordinator started")
 
@@ -136,8 +138,27 @@ class Coordinator(Node):
                 m |= 1 << (j - 1)
         return m
 
+    def _try_load_manifest(self, now):
+        try:
+            with open(self.manifest_file, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            self.active_zones, self.manifest = set(m["active_sectors"]), m
+            self.log(f"manifest загружен: zones={m.get('zones_named')} sectors={sorted(self.active_zones)} on_target={m.get('on_target')}")
+            return True
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            return False
+
+    def _zone_of(self, j):
+        if j < common.COLS * common.ROWS:
+            return j
+        if j in getattr(common, "TARGET_PARENT_SECTOR", {}):
+            return common.TARGET_PARENT_SECTOR[j]
+        return (j - 10) // 2
+
     def open_tasks(self):
-        return [j for j in sorted(self.tasks) if not (self.done >> j) & 1]
+        if self.active_zones is None:
+            return []
+        return [j for j in sorted(self.tasks) if not (self.done >> j) & 1 and self._zone_of(j) in self.active_zones]
 
     # ───────── ставки и CBAA ─────────
     def bid_for(self, j, now):
@@ -432,6 +453,14 @@ class Coordinator(Node):
     def tick(self):
         with self.lock:
             now = time.monotonic()
+            if self.active_zones is None:
+                got = self._try_load_manifest(now)
+                if not got and now - self.manifest_wait_t0 <= self.manifest_wait_timeout_s:
+                    return   # борт на земле/HOLD, манифест ещё не пришёл
+                if self.active_zones is None:   # таймаут без приказа — safety net, не демо-путь
+                    self.active_zones = set(range(common.COLS * common.ROWS))
+                    self.log("manifest timeout -> fallback: все сектора активны")
+                self.reset_cbaa(now)
             self._liveness(now)
             self._exec(now)
             self._tx(now)

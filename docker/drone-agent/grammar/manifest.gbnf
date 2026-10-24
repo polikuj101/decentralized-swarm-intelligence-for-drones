@@ -1,0 +1,7 @@
+root     ::= "{" ws "\"zones\":" ws zonelist "," ws "\"on_target\":" ws ontarget "," ws "\"dwell_s\":" ws dwell "," ws "\"rtb_on_complete\":" ws bool ws "}"
+zonelist ::= "[" ws zone (ws "," ws zone){0,2} ws "]"
+zone     ::= "\"alpha\"" | "\"bravo\"" | "\"charlie\"" | "\"delta\"" | "\"echo\"" | "\"foxtrot\"" | "\"all\""
+ontarget ::= "\"DWELL_RECON\"" | "\"DWELL_ONLY\"" | "\"SKIP\""
+dwell    ::= [3-9] | "1" [0-5]
+bool     ::= "true" | "false"
+ws       ::= " "?

@@ -14,7 +14,7 @@ from pathlib import Path
 
 os.environ.setdefault("MAVLINK20", "1")
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pymavlink import mavutil
@@ -38,6 +38,8 @@ DR = {i: {"pkt": None, "rx": None, "keys": set()} for i in range(1, N + 1)}
 MAV = {i: {"hb": None, "armed": None, "fix": None, "sats": None} for i in range(1, N + 1)}
 EW = {"state": None, "ok": False, "err": "not polled yet", "rx": None}
 FEED: deque = deque(maxlen=1000)
+EVIDENCE: deque = deque(maxlen=200)
+AGENT_MGMT_IPS = {i: f"172.33.0.{10+i}" for i in range(1, N + 1)}
 _feed_n = 0
 CLIENT: httpx.AsyncClient | None = None
 _cache: dict = {}
@@ -271,6 +273,60 @@ async def ew_post(name: str, request: Request):
     if not isinstance(body, dict):
         raise HTTPException(400, "object expected")
     return await ew_forward("POST", path, body)
+
+
+# ───────────── evidence & tasking ─────────────
+
+@app.post("/api/evidence/{drone}")
+async def post_evidence(drone: int, request: Request):
+    if TOKEN and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
+        raise HTTPException(401, "bad token")
+    raw = await request.body()
+    if len(raw) > 65536:
+        raise HTTPException(413, "too large")
+    try:
+        card = json.loads(raw)
+    except ValueError:
+        raise HTTPException(400, "bad json")
+    card["id"], card["drone"] = len(EVIDENCE) + 1, drone
+    EVIDENCE.append(card)
+    return {"ok": True, "id": card["id"]}
+
+
+@app.get("/api/evidence")
+def get_evidence():
+    return [{k: v for k, v in c.items() if k != "image_jpeg_b64"} for c in EVIDENCE]
+
+
+@app.get("/api/evidence/{card_id}/image")
+def get_evidence_image(card_id: int):
+    c = next((c for c in EVIDENCE if c["id"] == card_id), None)
+    if c is None:
+        raise HTTPException(404, "not found")
+    return Response(bytes.fromhex(c["image_jpeg_b64"]), media_type="image/jpeg")
+
+
+@app.post("/api/tasking")
+async def post_tasking(request: Request):
+    body = await request.json()
+    prompt = str(body.get("prompt", "")).strip()
+    if not (1 <= len(prompt) <= 500):
+        raise HTTPException(422, "prompt length 1..500")
+
+    async def one(i):
+        try:
+            r = await CLIENT.post(
+                f"http://{AGENT_MGMT_IPS[i]}:9091/v1/tasking",
+                json={"prompt": prompt},
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                timeout=25.0
+            )
+            return {"drone": i, "ok": r.status_code == 200, "body": r.json() if r.status_code == 200 else r.text}
+        except Exception as e:
+            return {"drone": i, "ok": False, "error": str(e)}
+
+    results = await asyncio.gather(*(one(i) for i in range(1, N + 1)))
+    return {"results": results}
 
 
 # ───────────── статика ─────────────

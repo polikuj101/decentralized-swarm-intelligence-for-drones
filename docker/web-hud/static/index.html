@@ -16,6 +16,15 @@
     <span class="sp"></span>
     <span id="conn" class="b UNKNOWN">HUD offline</span>
   </header>
+  <div id="commander-bar">
+    <div class="cmd-row">
+      <span class="cmd-tag">COMMANDER PROMPT</span>
+      <input id="cmd-input" type="text" placeholder="Введите приказ: например, Разведать квадрат Браво, вскрыть позиции, при обнаружении целей — доразведка и зависание" value="Разведать квадрат Браво, вскрыть позиции, при обнаружении целей — доразведка и зависание">
+      <button id="cmd-send" class="btn-cmd">Отправить приказ (Pre-Flight)</button>
+      <span id="cmd-status" class="cmd-badge">Готов к приказу</span>
+    </div>
+    <div id="manifest-info" class="manifest-card" style="display:none;"></div>
+  </div>
   <main>
     <section id="map"></section>
     <aside id="side">
@@ -24,12 +33,23 @@
     </aside>
     <section id="consolebox">
       <div class="bar">
-        <b>Бортовой планировщик (Qwen) и события роя</b>
-        <select id="fdrone"></select>
-        <label><input type="checkbox" id="showEv" checked> события роя</label>
-        <label><input type="checkbox" id="autoscroll" checked> автопрокрутка</label>
+        <div class="tabs">
+          <button id="tab-console" class="tab active">Бортовой планировщик и события</button>
+          <button id="tab-evidence" class="tab">BDA Evidence Gallery <span id="ev-badge" class="badge">0</span></button>
+        </div>
+        <span class="sp"></span>
+        <div id="console-tools">
+          <select id="fdrone"></select>
+          <label><input type="checkbox" id="showEv" checked> события роя</label>
+          <label><input type="checkbox" id="autoscroll" checked> автопрокрутка</label>
+        </div>
       </div>
       <div id="console"></div>
+      <div id="evidence-view" style="display:none;">
+        <div id="evidence-gallery" class="ev-grid">
+          <div class="empty-ev dim">Целей пока не зафиксировано (ожидание входа борта в режим DWELL над объектом)</div>
+        </div>
+      </div>
     </section>
     <section id="ctrl">
       <h3>Управление РЭБ</h3>
