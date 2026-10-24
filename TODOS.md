@@ -1,22 +1,45 @@
 # TODOS
 
-## 1. Live verification of Section 9 (investor demo)
-- **What:** One honest live run: 5 different orders compile to an identical `manifest.json` on all 5 drones, p95 compile latency <= 4 s, Acts 2-3 of `scripts/run_demo.sh` complete, BDA cards appear in the gallery with the correct image.
-- **Why:** Section 9 (commit d78bcd9) was written without a full live run (risk 9.8 in the spec); only one manifest compilation is evidenced. Code was produced by Gemini from a Claude-written spec, so treat the implementation report as unverified.
-- **Pros:** know what actually works before any showing. **Cons:** stand time.
-- **Context:** `docker/drone-agent/swarm/tasking.py`, `evidence.py`, `scripts/run_demo.sh`, `scenarios/05_investor_demo.yaml` (trigger times are marked "starting approximation").
-- **Depends on:** running stand (`make up`).
+Обновлено 2026-10-24 после живых проверок на стенде (WSL2, 5 бортов). Закрытое из прежнего списка: fail-closed `EW_TOKEN`,
+защита `/api/tasking`, id карточек BDA, nftables-fallback для ядра без netem, Вектор 1 больше не проходит при неприменённом хаосе.
 
-## 2. Fail-closed EW_TOKEN
-- **What:** With an empty `EW_TOKEN`, HUD, tasking, evidence and ew_agent must refuse mutating requests instead of skipping the check.
-- **Why:** an unset token silently disables all authorization, including EW control.
-- **Pros:** closes the root cause. **Cons:** breaks token-less local runs; set the token in `docker-compose*.yml` and `scripts/run_demo.sh`.
-- **Context:** `docker/web-hud/main.py:159`, `:282`; `docker/drone-agent/swarm/tasking.py:114`; `docker/drone-agent/ew/ew_agent.py:288`.
-- **Depends on:** the `/api/tasking` guard fix from the 2026-10-24 eng review (warning only on empty token).
+## 1. Точность компиляции приказа бортовой Qwen2.5-0.5B (Раздел 9) — ВЫСОКИЙ ПРИОРИТЕТ
+- **Факт** (`scripts/verify_tasking.py`, 5 приказов): верно 2 из 5, детерминизм при этом полный (5 бортов и повторы идентичны).
+  Ошибки: «Браво» → зоны alpha+bravo+charlie (сектора 0,1,4 вместо 4); «цели игнорировать» → `DWELL_ONLY` вместо `SKIP`;
+  «Проверить Фокстрот» → тот же ответ, что на «Браво» (похоже на ответ по умолчанию). Латентность на борту: p50 2,6 с, p95 7,3 с (порог 4 с).
+- **Почему важно:** идентичность на 5 бортах не ловит детерминированную ошибку. Флагманский приказ демо не соответствует собственному результату.
+- **Варианты:** (a) разбор имён зон и ключевых слов детерминированными правилами, LLM — только для намерения (on_target/dwell/rtb);
+  (b) пост-проверка: зоны из вывода модели должны встречаться в тексте приказа, иначе отказ с понятным сообщением оператору;
+  (c) больше примеров в промпте или модель крупнее. Выбор — за вами: (a)/(b) меняют заявление «приказ разобран бортовой LLM».
+- **Контекст:** `docker/drone-agent/swarm/tasking.py` (`SYSTEM`, `compile_order`), `ZONE_TO_SECTOR`, `scripts/verify_tasking.py` (расширять набором приказов).
 
-## 3. Debounce epoch bumps on alive-set change
-- **What:** 300-500 ms window on `alive_set` changes so peers rejoining a partition cause one epoch bump instead of 15-17 per split/merge cycle.
-- **Why:** each bump resets the CBAA auction; a skeptical engineer will ask "why 15 epochs in a 6 s merge?"; this is the demoed phase.
-- **Pros:** cleaner epoch trace, less churn. **Cons:** touches consensus code; chaos tests must be re-run.
-- **Context:** `docker/drone-agent/swarm/coordinator.py` around the `alive != self.alive_prev` / `self.bump("alive-set", now)` branch. Metric: epochs per cycle.
-- **Depends on:** none; re-run `scripts/stress_test.py` and `verify_ground_truth.py` after.
+## 2. Акты 2–3 и галерея BDA не проверены живьём
+- Компиляция проверена (п.1), но не полёт с DWELL, захват кадра `evidence.py` и вывод в галерею; Gazebo-часть не запускалась.
+- `scenarios/05_investor_demo.yaml`: времена триггеров помечены «стартовое приближение».
+
+## 3. manifest.json не переживает пересоздание контейнера
+- Лежит в файловой системе контейнера (`/opt/swarm/config/manifest.json`, не в томе): после `docker compose up -d` пропадает,
+  координатор ждёт его до 90 с и стартует без приказа.
+- Решение: именованный том или монтирование каталога; решить, что координатор делает по таймауту.
+
+## 4. Образ drone-agent устарел
+- Собран 15.10; `ew_agent.py` подмонтирован как временная мера (docker-compose.yml). Пересобрать образ, чтобы fallback был внутри.
+
+## 5. Остальные векторы хаос-набора не проверяют, что инъекция применилась
+- Вектор 1 исправлен (PASS требует `l3_effective`, `split_effective`, отсутствия ошибок агентов). Пройти по Векторам 2–4 тем же вопросом:
+  «убедились ли мы, что воздействие реально произошло».
+- Ранее отчёты показывали `link_q_during_L3` ≈ 0,95, но поле измерялось уже после автоснятия L3 (sleep 22 с при длительности 20 с); вывод «L3 был пустым»
+  по этим числам не следует.
+
+## 6. Время восстановления mesh упирается в переподключение, а не в логику эпох
+- `BumpGate` + `absorb` (swarm/bump_gate.py) примерно вдвое сократили число эпох за слияние (≈2–3 против 5–7), но устойчивого выигрыша по времени
+  слияния/стабилизации нет (~5 с, последний сосед виден на +3–4 с). Мерцание одного борта (`peer N DEAD/ALIVE` раз в секунду, `preempt-stalled_degraded`)
+  даёт посторонние смены эпохи: найти причину (нагрузка CPU на стенде?).
+
+## 7. Эмуляция деградации на ядрах без netem
+- nftables не умеет задержку/джиттер и пакетные потери: `unsupported` пишется в состояние агента, профиль «только задержка» отклоняется.
+  На этом стенде уже L1 (30% потерь) схлопывает связь в ноль (Zenoh поверх TCP): плавной шкалы L1→L3 нет. Для демо плавной деградации нужен стенд с netem.
+- Для записи озвучивать как «сетевая деградация», не как модель РЧ-глушения.
+
+## 8. Пакет `websockets` отсутствует в WSL
+- `scripts/test_hud.py` блок WS (6a/6b) не запускается; `pip install websockets` в WSL.
