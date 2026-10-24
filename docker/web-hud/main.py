@@ -278,6 +278,19 @@ async def ew_forward(method: str, path: str, body: dict | None = None):
     return JSONResponse(data, status_code=status)
 
 
+def agent_failures(data) -> list[str]:
+    """ew-controller отвечает HTTP 200 даже если агенты не применили правило: ошибки лежат в теле
+    ({"1": {"ok": false, "body": {"error": ...}}}). Возвращает тексты ошибок агентов."""
+    if not isinstance(data, dict):
+        return []
+    out = []
+    for k, v in data.items():
+        if isinstance(v, dict) and v.get("ok") is False:
+            err = (v.get("body") or {}).get("error") if isinstance(v.get("body"), dict) else v.get("body")
+            out.append(f"D{k}: {str(err or v.get('status'))[:160]}")
+    return out
+
+
 def split_groups() -> tuple[list[int], list[int]]:
     half = (N + 1) // 2                  # N=5 -> {1,2,3}|{4,5}, как в stress_test v1
     return list(range(1, half + 1)), list(range(half + 1, N + 1))
@@ -290,8 +303,11 @@ async def split():
     calls = [{"level": "L4", "drones": [d], "peers": other, "duration_s": SPLIT_MAX_S}
              for grp, other in ((ga, gb), (gb, ga)) for d in grp]
     results = await asyncio.gather(*(ew_call("POST", "/v1/ew/mesh", c) for c in calls))
-    if any(s != 200 for s, _ in results):
-        raise HTTPException(502, "split failed on ew-controller; нажмите Heal")
+    errors = [f"controller {s}" for s, _ in results if s != 200] + [e for _, d in results for e in agent_failures(d)]
+    if errors:
+        # частичное применение хуже, чем никакое: снимаем всё и не запускаем измерение
+        await ew_call("POST", "/v1/ew/restore", {"channel": "mesh", "drones": None})
+        raise HTTPException(502, "split не применён: " + "; ".join(sorted(set(errors))[:3]))
     TRACK.mark_split(time.monotonic())
     return {"ok": True, "groups": [ga, gb], "max_s": SPLIT_MAX_S}
 
@@ -300,8 +316,9 @@ async def split():
 async def heal():
     """Снятие разделения. Старт таймера слияния — момент, когда restore принят ew-controller."""
     status, data = await ew_call("POST", "/v1/ew/restore", {"channel": "mesh", "drones": None})
-    if status != 200:
-        raise HTTPException(502, "heal failed on ew-controller")
+    errors = ([f"controller {status}"] if status != 200 else []) + agent_failures(data)
+    if errors:
+        raise HTTPException(502, "heal не применён: " + "; ".join(sorted(set(errors))[:3]))
     TRACK.mark_heal(time.monotonic())
     return {"ok": True}
 

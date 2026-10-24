@@ -31,8 +31,8 @@ TICK = 0.05          # на Windows шаг time.monotonic() ~15 мс: разво
 class FakeEW:
     """Подмена httpx.AsyncClient: запоминает вызовы к ew-controller."""
 
-    def __init__(self, status=200):
-        self.status, self.calls = status, []
+    def __init__(self, status=200, agent_error=None):
+        self.status, self.agent_error, self.calls = status, agent_error, []
 
     async def request(self, method, url, json=None):
         self.calls.append((method, url.split("8080")[-1] if "8080" in url else url, json))
@@ -43,7 +43,10 @@ class FakeEW:
             text = "{}"
 
             def json(self):
-                return {"ok": outer.status == 200}
+                if outer.agent_error:                      # форма ответа ew-controller: HTTP 200, ошибки по агентам в теле
+                    return {"1": {"ok": False, "status": 500, "body": {"error": outer.agent_error}},
+                            "2": {"ok": True, "status": 200, "body": {}}}
+                return {"1": {"ok": outer.status == 200, "status": outer.status}}
         return R()
 
 
@@ -122,6 +125,22 @@ def test_split_failure_does_not_start_measurement(hud):
     main.CLIENT = FakeEW(status=500)
     assert hud.post("/api/split", headers=HUD).status_code == 502
     assert main.TRACK.phase == "idle"
+
+
+def test_split_with_agent_errors_is_not_reported_as_success(hud):
+    """Регрессия: ядро без netem/prio -> агенты отвечают 500 внутри HTTP 200; раньше HUD говорил «ok» и мерил несуществующее слияние."""
+    main.CLIENT = FakeEW(agent_error="tc qdisc add ... Error: Specified qdisc kind is unknown.")
+    r = hud.post("/api/split", headers=HUD)
+    assert r.status_code == 502 and "qdisc kind is unknown" in r.json()["detail"]
+    assert main.TRACK.phase == "idle"
+    assert any(c[1] == "/v1/ew/restore" for c in main.CLIENT.calls)          # частичное применение откатывается
+
+
+def test_heal_with_agent_errors_does_not_start_timer(hud):
+    hud.post("/api/split", headers=HUD)
+    main.CLIENT = FakeEW(agent_error="boom")
+    assert hud.post("/api/heal", headers=HUD).status_code == 502
+    assert main.TRACK.phase == "split"
 
 
 def test_heal_without_split_does_not_measure(hud):
