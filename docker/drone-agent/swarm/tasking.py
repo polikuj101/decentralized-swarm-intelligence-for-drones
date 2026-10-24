@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """swarm/tasking.py — компиляция NL-приказа оператора в Task Manifest локальным Qwen2.5-0.5B.
 HTTP-сервер (порт 9091, mgmt-net) + функция компиляции. Вызывается до взлёта, пока жив C2."""
+import hmac
 import json
 import os
 import time
@@ -113,7 +114,7 @@ def healthz():
 def post_tasking(r: TaskingReq, authorization: str = Header(default="")):
     if not EW_TOKEN:
         raise HTTPException(503, "EW_TOKEN not configured")
-    if authorization != f"Bearer {EW_TOKEN}":
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {EW_TOKEN}".encode()):
         raise HTTPException(401, "bad token")
     try:
         manifest = compile_order(r.prompt)

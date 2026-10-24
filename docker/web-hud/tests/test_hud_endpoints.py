@@ -60,7 +60,7 @@ def hud():
     for d in main.DR.values():
         d.update(pkt=None, rx=None, keys=set())
     main.CLIENT = FakeEW()
-    return TestClient(main.app)
+    return TestClient(main.app, client=("172.34.0.254", 50000))     # так HUD видит оператора с хоста (шлюз ui-net)
 
 
 def pkt(drone, epoch=7, alive=5, winners=None, alive_ids=None):
@@ -227,3 +227,34 @@ def test_agent_failures_walks_flat_and_nested_replies():
     nested = main.agent_failures({"c2": {"1": {"ok": True}}, "mesh": {"3": {"ok": False, "status": 500, "body": {"error": "y"}}}})
     assert nested == ["mesh/D3: y"]
     assert main.agent_failures(None) == [] and main.agent_failures([1, 2]) == []
+
+
+# ───────────── управляющие эндпоинты: только из сети оператора ─────────────
+
+def test_is_operator_host_defaults():
+    assert main.is_operator_host("127.0.0.1") and main.is_operator_host("172.34.0.254")
+    assert not main.is_operator_host("172.33.0.11")          # борт в mgmt-net
+    assert not main.is_operator_host("172.32.0.11")          # борт в c2-net
+    assert not main.is_operator_host("testclient") and not main.is_operator_host("")
+
+
+def test_drone_network_cannot_call_control_endpoints(hud):
+    """Регрессия: guard проверял только Origin и X-HUD — борт из mgmt-net с этим заголовком мог резать связь остальным."""
+    drone = TestClient(main.app, client=("172.33.0.12", 50000))
+    for path in ("/api/split", "/api/heal", "/api/ew/mesh", "/api/ew/restore", "/api/tasking"):
+        r = drone.post(path, json={"prompt": "x"}, headers=HUD)
+        assert r.status_code == 403 and "operator network" in r.json()["detail"], path
+    assert main.TRACK.phase == "idle" and not main.CLIENT.calls
+
+
+def test_drone_network_can_still_post_telemetry_with_the_token(hud):
+    drone = TestClient(main.app, client=("172.33.0.12", 50000))
+    assert drone.post("/api/ingest/2", json=pkt(2), headers=BEARER).status_code == 200
+
+
+def test_operator_network_is_configurable(hud, monkeypatch):
+    import ipaddress
+    monkeypatch.setattr(main, "OPERATOR_NETS", [ipaddress.ip_network("10.1.0.0/16")])
+    assert hud.post("/api/heal", headers=HUD).status_code == 403
+    other = TestClient(main.app, client=("10.1.2.3", 1))
+    assert other.post("/api/heal", headers=HUD).status_code == 200

@@ -181,3 +181,12 @@ def test_agent_auth_rejects_wrong_and_accepts_right_token(ew, monkeypatch):
         ew.auth("Bearer nope")
     assert e.value.status_code == 401
     assert ew.auth("Bearer s3cret") is None
+
+
+def test_agent_auth_handles_non_ascii_header_without_crashing(ew, monkeypatch):
+    """hmac.compare_digest над str падает на не-ASCII; сравнение идёт по байтам, поэтому это должен быть 401, а не 500."""
+    from fastapi import HTTPException
+    monkeypatch.setattr(ew, "EW_TOKEN", "s3cret")
+    with pytest.raises(HTTPException) as e:
+        ew.auth("Bearer токен")
+    assert e.value.status_code == 401

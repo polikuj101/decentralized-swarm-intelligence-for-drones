@@ -4,6 +4,7 @@ C2   -> nftables (drop по портам)
 Mesh -> tc netem (root netem либо prio + u32 по dst-IP пира); на ядрах без netem/prio — nftables (см. nft_mesh_script)
 GNSS -> MAVLink PARAM_SET параметров SIM_GPS_JAM / SIM_GPS_JAM_EPH (патч PX4, см. п. 2.5)
 """
+import hmac
 import ipaddress
 import json
 import logging
@@ -316,7 +317,7 @@ def reset_all(tolerate_gps: bool = False) -> None:
 def auth(authorization: str = Header(default="")):
     if not EW_TOKEN:
         raise HTTPException(503, "EW_TOKEN not configured")
-    if authorization != f"Bearer {EW_TOKEN}":
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {EW_TOKEN}".encode()):
         raise HTTPException(401, "bad token")
 
 

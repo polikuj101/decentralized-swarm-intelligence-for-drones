@@ -3,6 +3,7 @@
 лента «мыслей» LLM, WebSocket для браузера, прокси команд РЭБ (белый список)."""
 import asyncio
 import hmac
+import ipaddress
 import itertools
 import json
 import logging
@@ -33,6 +34,12 @@ MISSION_FILE = os.environ.get("MISSION_FILE", "/opt/swarm/config/mission.json")
 MAV_BIND = os.environ.get("MAV_BIND", "0.0.0.0:14550")
 ALLOWED = {o.strip() for o in os.environ.get(
     "HUD_ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",") if o.strip()}
+# Управляющие эндпоинты (/api/ew, /api/split, /api/heal, /api/tasking) принимают запросы только из сети оператора:
+# loopback и ui-net (порт HUD опубликован на 127.0.0.1, запросы с хоста приходят с шлюза ui-net). Борты сидят в mgmt-net
+# и c2-net — захваченный/скомпрометированный борт не должен уметь резать связь остальным. Origin + X-HUD (guard) защищают
+# от чужих вкладок браузера, а не от клиента внутри docker-сети.
+OPERATOR_NETS = [ipaddress.ip_network(c.strip()) for c in os.environ.get(
+    "HUD_OPERATOR_CIDRS", "127.0.0.0/8,172.34.0.0/24").split(",") if c.strip()]
 C2_LOST_S = 3.0
 MAX_BODY = 65536
 STATIC = Path(__file__).parent / "static"
@@ -135,8 +142,18 @@ def require_bearer(request: Request) -> None:
         raise HTTPException(401, "bad token")
 
 
+def is_operator_host(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in net for net in OPERATOR_NETS)
+
+
 def guard(request: Request) -> None:
-    """защита мутирующих запросов от чужих страниц: Origin + кастомный заголовок (вынуждает preflight)"""
+    """защита управляющих запросов: сеть оператора + от чужих страниц: Origin + кастомный заголовок (вынуждает preflight)"""
+    if not is_operator_host(request.client.host if request.client else ""):
+        raise HTTPException(403, "control endpoints are limited to the operator network")
     o = request.headers.get("origin")
     if o and o not in ALLOWED:
         raise HTTPException(403, "bad origin")
