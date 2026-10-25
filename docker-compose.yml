@@ -29,7 +29,9 @@ x-fc: &fc
   mem_limit: 1g
   restart: unless-stopped
   volumes:
-    - ./docker/px4-sitl/airframes/4901_gz_x500_swarm:/opt/px4/ROMFS/px4fmu_common/init.d-posix/airframes/4901_gz_x500_swarm:ro
+    # PX4 читает airframe из каталога СБОРКИ (build/.../etc/init.d-posix), а не из исходного ROMFS: монтирование в ROMFS ничего не меняло,
+    # и в образе (собран 02.10) работал старый airframe без ослабленных предполётных проверок и без UXRCE_DDS_PTCFG.
+    - ./docker/px4-sitl/airframes/4901_gz_x500_swarm:/opt/px4/build/px4_sitl_default/etc/init.d-posix/airframes/4901_gz_x500_swarm:ro
   depends_on:
     simulator-core: { condition: service_healthy }
 
@@ -180,6 +182,7 @@ services:
     volumes:
       - ./docker/web-hud/main.py:/app/main.py:ro
       - ./docker/web-hud/convergence.py:/app/convergence.py:ro
+      - ./docker/web-hud/order_consensus.py:/app/order_consensus.py:ro
       - ./docker/web-hud/static:/app/static:ro
     networks:
       ui-net:   {}

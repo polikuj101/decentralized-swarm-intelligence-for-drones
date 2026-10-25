@@ -36,3 +36,8 @@ def test_dwell_bounds():
 
 def test_non_object_rejected():
     assert manifest_problem([], 6) and manifest_problem(None, 6)
+
+
+def test_rtb_must_be_bool_when_present():
+    assert bad(rtb_on_complete="false") and bad(rtb_on_complete=0)
+    assert bad(rtb_on_complete=False) is None

@@ -12,6 +12,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from swarm import common
+from swarm.manifest_check import manifest_problem
 
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8080")
 GRAMMAR_FILE = os.environ.get("GRAMMAR_FILE", "/opt/grammar/manifest.gbnf")
@@ -108,6 +109,20 @@ class TaskingReq(BaseModel):
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+@app.post("/v1/manifest")
+def post_manifest(m: dict, authorization: str = Header(default="")):
+    """Принять готовый манифест (HUD выравнивает борты по большинству); проверка та же, что у координатора при загрузке."""
+    if not EW_TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {EW_TOKEN}".encode()):
+        raise HTTPException(401, "bad token")
+    bad = manifest_problem(m, common.COLS * common.ROWS)
+    if bad:
+        raise HTTPException(422, bad)
+    write_manifest(m)
+    return m
 
 
 @app.post("/v1/tasking")

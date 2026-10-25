@@ -9,7 +9,7 @@ COPY static/ /app/static/
 RUN mkdir -p static/vendor \
  && (test -f static/vendor/leaflet.js || curl -fsSL https://unpkg.com/leaflet@1.9.4/dist/leaflet.js -o static/vendor/leaflet.js) \
  && (test -f static/vendor/leaflet.css || curl -fsSL https://unpkg.com/leaflet@1.9.4/dist/leaflet.css -o static/vendor/leaflet.css)
-COPY main.py convergence.py /app/
+COPY main.py convergence.py order_consensus.py /app/
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]

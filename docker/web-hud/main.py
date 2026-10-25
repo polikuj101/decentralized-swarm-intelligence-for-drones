@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pymavlink import mavutil
 
 import convergence
+import order_consensus
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s web-hud %(message)s")
 log = logging.getLogger("web-hud")
@@ -416,8 +417,22 @@ async def post_tasking(request: Request):
         except Exception as e:
             return {"drone": i, "ok": False, "error": str(e)}
 
-    results = await asyncio.gather(*(one(i) for i in range(1, N + 1)))
-    return {"results": results}
+    results = list(await asyncio.gather(*(one(i) for i in range(1, N + 1))))
+    chosen, dissent, _missing = order_consensus.choose(results)
+    harmonized = []
+    if chosen is not None and dissent:                    # борты скомпилировали по-разному: раздаём манифест большинства
+        async def push(i):
+            try:
+                r = await CLIENT.post(f"http://{AGENT_MGMT_IPS[i]}:9091/v1/manifest", json=chosen,
+                                      headers={"Authorization": f"Bearer {TOKEN}"}, timeout=10.0)
+                return i, r.status_code == 200
+            except Exception:
+                return i, False
+        for i, ok in await asyncio.gather(*(push(i) for i in dissent)):
+            if ok:
+                harmonized.append(i)
+                results[i - 1] = {"drone": i, "ok": True, "body": chosen, "harmonized": True}
+    return {"results": results, "dissent": dissent, "harmonized": harmonized}
 
 
 # ───────────── статика ─────────────

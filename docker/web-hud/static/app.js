@@ -387,7 +387,7 @@ function buildTasking() {
           document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (сектора ${(b.active_sectors || []).join(",")}) | ` +
             `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
           mk("br"),
-          mk("span", "dim", "Имена зон → сектора заданы инженерами в таблице, а не выводятся из карты; цели на карте известны заранее."));
+          mk("span", "dim", "Исполняются: сектора, режим при контакте (SKIP — цели пропускаются, DWELL_ONLY — зависание без снимка, DWELL_RECON — со снимком), время зависания и возврат. Имена зон → сектора заданы в таблице, а не выводятся из карты; цели на карте известны заранее."));
       }
       if (!oks.length) {
         st.textContent = `Манифест не скомпилирован ни на одном борту (0/${N})`;
@@ -396,7 +396,9 @@ function buildTasking() {
         st.textContent = `ВНИМАНИЕ: борты скомпилировали РАЗНЫЕ манифесты (${sigs.size} варианта), принято ответов ${oks.length}/${N}`;
         st.className = "cmd-badge";
       } else {
-        st.textContent = `Скомпилирован на ${oks.length}/${N} бортах, жду подтверждения координаторов…`;
+        const dis = (data.dissent || []), fixed = (data.harmonized || []);
+        const note = dis.length ? ` · D${dis.join(",D")} скомпилировали иначе, ${fixed.length === dis.length ? "выровнены по большинству" : "НЕ выровнены"}` : "";
+        st.textContent = `Скомпилирован на ${oks.length}/${N} бортах${note}, жду подтверждения координаторов…`;
         st.className = "cmd-badge compiling";
         confirmManifest(firstOk.body.active_sectors || [], st);
       }

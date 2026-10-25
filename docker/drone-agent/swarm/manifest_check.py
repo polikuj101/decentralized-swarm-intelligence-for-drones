@@ -20,4 +20,6 @@ def manifest_problem(m, n_sectors: int):
     dwell = m.get("dwell_s")
     if isinstance(dwell, bool) or not isinstance(dwell, int) or not DWELL_MIN_S <= dwell <= DWELL_MAX_S:
         return f"dwell_s вне {DWELL_MIN_S}..{DWELL_MAX_S}: {dwell!r}"
+    if "rtb_on_complete" in m and not isinstance(m["rtb_on_complete"], bool):
+        return f"rtb_on_complete не bool: {m['rtb_on_complete']!r}"
     return None

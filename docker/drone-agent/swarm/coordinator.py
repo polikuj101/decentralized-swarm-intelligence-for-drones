@@ -17,6 +17,7 @@ from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
+from swarm.orders import needs_rebuild, order_params, target_dwell_s, task_enabled
 from swarm.replay import SeqFilter
 from swarm.supervise import withdraw_clearable
 
@@ -90,6 +91,7 @@ class Coordinator(Node):
         self.manifest_wait_timeout_s = 90.0
         self.active_zones, self.manifest, self.manifest_wait_t0 = None, None, now
         self._manifest_poll = 0.0
+        self.params = order_params(None, common.MISSION.get("target_dwell_s", 5.0))
         self.log("ожидание Task Manifest (NL-приказ оператора)...")
         self.create_timer(0.1, self.tick)
         self.log("coordinator started")
@@ -157,6 +159,7 @@ class Coordinator(Node):
                     self.log(f"manifest отклонён: {bad}")
                 return False
             self.active_zones, self.manifest = set(m["active_sectors"]), m
+            self.params = order_params(m, common.MISSION.get("target_dwell_s", 5.0))
             self.log(f"manifest загружен: zones={m.get('zones_named')} sectors={sorted(self.active_zones)} on_target={m.get('on_target')}")
             return True
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
@@ -175,10 +178,12 @@ class Coordinator(Node):
         if manifest_problem(m, common.COLS * common.ROWS) or m.get("manifest_id") == (self.manifest or {}).get("manifest_id"):
             return
         new = set(m["active_sectors"])
-        changed = new != self.active_zones
-        self.manifest = m
+        new_params = order_params(m, common.MISSION.get("target_dwell_s", 5.0))
+        changed = new != self.active_zones or needs_rebuild(self.params, new_params)
+        self.manifest, self.params = m, new_params
         if not changed:
-            self.log(f"manifest {m.get('manifest_id')} принят: сектора те же {sorted(new)}")
+            self.log(f"manifest {m.get('manifest_id')} принят: сектора те же {sorted(new)}, "
+                     f"on_target={new_params['on_target']} dwell={new_params['dwell_s']:.0f}s rtb={new_params['rtb']}")
             return
         self.active_zones, self.mission_done_sent = new, False
         self.override, self.exec_task = None, None
@@ -196,7 +201,8 @@ class Coordinator(Node):
     def open_tasks(self):
         if self.active_zones is None:
             return []
-        return [j for j in sorted(self.tasks) if not (self.done >> j) & 1 and self._zone_of(j) in self.active_zones]
+        return [j for j in sorted(self.tasks) if not (self.done >> j) & 1 and self._zone_of(j) in self.active_zones
+                and task_enabled(self.tasks[j].kind, self.params)]
 
     # ───────── ставки и CBAA ─────────
     def bid_for(self, j, now):
@@ -448,7 +454,8 @@ class Coordinator(Node):
     def _send_goal(self, kind, wps=None, dwell=0.0, task=wire.NONE, alt=None):
         self.goal_seq += 1
         self.goal = {"seq": self.goal_seq, "kind": kind, "wps": [list(w) for w in (wps or [])],
-                     "dwell_s": dwell, "task": task, "alt": alt if alt is not None else common.ALT}
+                     "dwell_s": dwell, "task": task, "alt": alt if alt is not None else common.ALT,
+                     "capture": self.params["capture"]}
         self._pub_goal()
 
     def _pub_goal(self):
@@ -458,8 +465,7 @@ class Coordinator(Node):
 
     def _start_task(self, j, now):
         t = self.tasks[j]
-        dwell = common.MISSION["target_dwell_s"] if t.kind == "TARGET" else 0.0
-        self._send_goal("WAYPOINTS", common.task_waypoints(t), dwell, j)
+        self._send_goal("WAYPOINTS", common.task_waypoints(t), target_dwell_s(t.kind, self.params), j)
         self.exec_task = j
         x, y, _ = self.pos()
         self.exec_dist_min = math.hypot(t.cx - x, t.cy - y)
@@ -563,8 +569,12 @@ class Coordinator(Node):
         if not self.open_tasks():
             if not self.mission_done_sent:
                 self.mission_done_sent, self.exec_task = True, None
-                self._send_goal("HOME", [common.HOME])
-                self.log("mission complete, returning home")
+                if self.params["rtb"]:
+                    self._send_goal("HOME", [common.HOME])
+                    self.log("mission complete, returning home")
+                else:
+                    self._send_goal("HOLD")
+                    self.log("mission complete, holding position (rtb_on_complete=false)")
             return
         x = self.cbaa.x
         if now - self.x_since < SETTLE_S:
@@ -654,8 +664,9 @@ class Coordinator(Node):
               "peers": peers, "events": list(self.events)[-10:], "last_cmd": self.last_cmd,
               "override": self.override["kind"] if self.override else None, "withdrawn": self.withdrawn,
               "phase": self.phase.value,
+              "goal": ({k: self.goal.get(k) for k in ("kind", "dwell_s", "capture", "task")} if self.goal else None),
               "manifest": ({"id": self.manifest.get("manifest_id"), "sectors": sorted(self.active_zones),
-                            "on_target": self.manifest.get("on_target"), "source": "operator"}
+                            "on_target": self.manifest.get("on_target"), "source": "operator", "effective": self.params}
                            if self.manifest else
                            {"id": None, "sectors": sorted(self.active_zones or []), "source": "fallback" if self.active_zones else "waiting"}),
               "mesh": {"ready": self.mesh.ready, "tuned": self.mesh.tuned, "zenoh_peers": self.mesh.peers_connected(),

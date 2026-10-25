@@ -83,7 +83,7 @@ class Evidence(Node):
         except json.JSONDecodeError:
             return
         is_dwell = nav.get("state") == "DWELL"
-        if is_dwell and not self.was_dwell and self.frame is not None:
+        if is_dwell and not self.was_dwell and self.frame is not None and nav.get("capture", True):    # DWELL_ONLY: без снимка
             threading.Thread(target=self._capture, args=(dict(nav),), daemon=True).start()
         self.was_dwell = is_dwell
 

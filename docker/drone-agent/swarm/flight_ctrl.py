@@ -286,7 +286,8 @@ class Flight(Node):
               "src": self.src, "sigma": round(self.sigma, 1), "gps_fix": self.gps_fix, "gps_suspect": self.suspect,
               "vio_ok": bool(self.vio and time.monotonic() - self.vio[2] < 1.0),
               "xy_valid": bool(n and n.xy_valid), "armed": bool(self.vs and self.vs.arming_state == 2),
-              "obst_min": round(self.obst_min, 2)}
+              "obst_min": round(self.obst_min, 2),
+              "capture": bool(self.goal.get("capture", True)) if self.goal else True}
         self.p_status.publish(String(data=json.dumps(st)))
 
 
