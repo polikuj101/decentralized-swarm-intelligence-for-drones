@@ -18,7 +18,6 @@ x-agent: &agent
     - ./docker/drone-agent/grammar:/opt/grammar:ro
     - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro   # образ от 15.10 без nftables-fallback для WSL2 (нет netem/prio)
     - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
-    - agent-state:/opt/swarm/state                 # manifest-N.json переживает пересоздание контейнера (отдельный каталог: /opt/swarm/config принадлежит образу)
   depends_on:
     simulator-core: { condition: service_healthy }
 
@@ -84,7 +83,13 @@ services:
   drone-agent-1:
     <<: *agent
     hostname: drone-agent-1
-    environment: { DRONE_ID: "1", MANIFEST_FILE: /opt/swarm/state/manifest-1.json, PX4_INSTANCE: "0", FC_ADDR: 172.30.0.11, XRCE_PORT: "8888", MAVLINK_ONBOARD_PORT: "14540", PEERS: "172.31.0.12,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.11 }
+    volumes:   # список заменяет общий из x-agent: отдельный том состояния на борт (manifest переживает пересоздание, борты не делят файлы)
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
+    - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro
+    - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
+    - agent-1-state:/opt/swarm/state
+    environment: { DRONE_ID: "1", MANIFEST_FILE: /opt/swarm/state/manifest.json, PX4_INSTANCE: "0", FC_ADDR: 172.30.0.11, XRCE_PORT: "8888", MAVLINK_ONBOARD_PORT: "14540", PEERS: "172.31.0.12,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.11 }
     networks:
       sim-net:  { ipv4_address: 172.30.0.21 }
       mesh-net: { ipv4_address: 172.31.0.11 }
@@ -93,7 +98,13 @@ services:
   drone-agent-2:
     <<: *agent
     hostname: drone-agent-2
-    environment: { DRONE_ID: "2", MANIFEST_FILE: /opt/swarm/state/manifest-2.json, PX4_INSTANCE: "1", FC_ADDR: 172.30.0.12, XRCE_PORT: "8889", MAVLINK_ONBOARD_PORT: "14541", PEERS: "172.31.0.11,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.12 }
+    volumes:   # список заменяет общий из x-agent: отдельный том состояния на борт (manifest переживает пересоздание, борты не делят файлы)
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
+    - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro
+    - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
+    - agent-2-state:/opt/swarm/state
+    environment: { DRONE_ID: "2", MANIFEST_FILE: /opt/swarm/state/manifest.json, PX4_INSTANCE: "1", FC_ADDR: 172.30.0.12, XRCE_PORT: "8889", MAVLINK_ONBOARD_PORT: "14541", PEERS: "172.31.0.11,172.31.0.13,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.12 }
     networks:
       sim-net:  { ipv4_address: 172.30.0.22 }
       mesh-net: { ipv4_address: 172.31.0.12 }
@@ -102,7 +113,13 @@ services:
   drone-agent-3:
     <<: *agent
     hostname: drone-agent-3
-    environment: { DRONE_ID: "3", MANIFEST_FILE: /opt/swarm/state/manifest-3.json, PX4_INSTANCE: "2", FC_ADDR: 172.30.0.13, XRCE_PORT: "8890", MAVLINK_ONBOARD_PORT: "14542", PEERS: "172.31.0.11,172.31.0.12,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.13 }
+    volumes:   # список заменяет общий из x-agent: отдельный том состояния на борт (manifest переживает пересоздание, борты не делят файлы)
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
+    - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro
+    - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
+    - agent-3-state:/opt/swarm/state
+    environment: { DRONE_ID: "3", MANIFEST_FILE: /opt/swarm/state/manifest.json, PX4_INSTANCE: "2", FC_ADDR: 172.30.0.13, XRCE_PORT: "8890", MAVLINK_ONBOARD_PORT: "14542", PEERS: "172.31.0.11,172.31.0.12,172.31.0.14,172.31.0.15", SELF_MESH_IP: 172.31.0.13 }
     networks:
       sim-net:  { ipv4_address: 172.30.0.23 }
       mesh-net: { ipv4_address: 172.31.0.13 }
@@ -111,7 +128,13 @@ services:
   drone-agent-4:
     <<: *agent
     hostname: drone-agent-4
-    environment: { DRONE_ID: "4", MANIFEST_FILE: /opt/swarm/state/manifest-4.json, PX4_INSTANCE: "3", FC_ADDR: 172.30.0.14, XRCE_PORT: "8891", MAVLINK_ONBOARD_PORT: "14543", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.15", SELF_MESH_IP: 172.31.0.14 }
+    volumes:   # список заменяет общий из x-agent: отдельный том состояния на борт (manifest переживает пересоздание, борты не делят файлы)
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
+    - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro
+    - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
+    - agent-4-state:/opt/swarm/state
+    environment: { DRONE_ID: "4", MANIFEST_FILE: /opt/swarm/state/manifest.json, PX4_INSTANCE: "3", FC_ADDR: 172.30.0.14, XRCE_PORT: "8891", MAVLINK_ONBOARD_PORT: "14543", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.15", SELF_MESH_IP: 172.31.0.14 }
     networks:
       sim-net:  { ipv4_address: 172.30.0.24 }
       mesh-net: { ipv4_address: 172.31.0.14 }
@@ -120,7 +143,13 @@ services:
   drone-agent-5:
     <<: *agent
     hostname: drone-agent-5
-    environment: { DRONE_ID: "5", MANIFEST_FILE: /opt/swarm/state/manifest-5.json, PX4_INSTANCE: "4", FC_ADDR: 172.30.0.15, XRCE_PORT: "8892", MAVLINK_ONBOARD_PORT: "14544", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.14", SELF_MESH_IP: 172.31.0.15 }
+    volumes:   # список заменяет общий из x-agent: отдельный том состояния на борт (manifest переживает пересоздание, борты не делят файлы)
+    - ./docker/drone-agent/swarm:/opt/swarm_agent/swarm:ro
+    - ./docker/drone-agent/grammar:/opt/grammar:ro
+    - ./docker/drone-agent/ew/ew_agent.py:/opt/ew/ew_agent.py:ro
+    - ./docker/drone-agent/supervisord.conf:/etc/supervisor/conf.d/swarm.conf:ro
+    - agent-5-state:/opt/swarm/state
+    environment: { DRONE_ID: "5", MANIFEST_FILE: /opt/swarm/state/manifest.json, PX4_INSTANCE: "4", FC_ADDR: 172.30.0.15, XRCE_PORT: "8892", MAVLINK_ONBOARD_PORT: "14544", PEERS: "172.31.0.11,172.31.0.12,172.31.0.13,172.31.0.14", SELF_MESH_IP: 172.31.0.15 }
     networks:
       sim-net:  { ipv4_address: 172.30.0.25 }
       mesh-net: { ipv4_address: 172.31.0.15 }
@@ -158,7 +187,11 @@ services:
       mgmt-net: { ipv4_address: 172.33.0.5 }
 
 volumes:
-  agent-state:
+  agent-1-state:
+  agent-2-state:
+  agent-3-state:
+  agent-4-state:
+  agent-5-state:
 
 networks:
   sim-net:

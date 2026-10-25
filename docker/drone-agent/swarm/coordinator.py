@@ -14,6 +14,7 @@ from collections import deque
 from swarm import actions as A, common, wire
 from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
+from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
@@ -143,6 +144,12 @@ class Coordinator(Node):
         try:
             with open(self.manifest_file, "r", encoding="utf-8") as f:
                 m = json.load(f)
+            bad = manifest_problem(m, common.COLS * common.ROWS)
+            if bad:
+                if bad != getattr(self, "_manifest_bad", None):      # не засорять лог каждым тактом ожидания
+                    self._manifest_bad = bad
+                    self.log(f"manifest отклонён: {bad}")
+                return False
             self.active_zones, self.manifest = set(m["active_sectors"]), m
             self.log(f"manifest загружен: zones={m.get('zones_named')} sectors={sorted(self.active_zones)} on_target={m.get('on_target')}")
             return True

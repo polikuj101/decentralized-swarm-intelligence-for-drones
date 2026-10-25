@@ -67,7 +67,7 @@ FIELD_LABEL = {"active_sectors": "зоны", "on_target": "on_target", "dwell_s"
 REPEAT_CASE = 0          # этот приказ повторяется для проверки детерминизма
 REPEATS = 3
 AGENTS = [f"swarm-sitl-drone-agent-{i}-1" for i in range(1, 6)]
-MANIFEST_PATHS = ("/opt/swarm/state/manifest-{n}.json", "/opt/swarm/config/manifest.json")   # том agent-state, затем старое место
+MANIFEST_PATHS = ("/opt/swarm/state/manifest.json", "/opt/swarm/config/manifest.json")   # том agent-N-state, затем старое место
 
 
 def post(url: str, prompt: str):
