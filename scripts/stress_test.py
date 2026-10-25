@@ -548,6 +548,24 @@ def v4_resource_pressure() -> Result:
 
 # ───────────────────────── Вектор 5: коллизия ставок ─────────────────────────
 
+def collision_resolved(timeline: list, n: int, min_agreed=3) -> bool:
+    """После первого согласия все n бортов видят одного победителя не менее min_agreed замеров подряд; дальше допустимо только
+    одно: задача выполнена и исчезла из winners сразу на всех бортах. Частичное расхождение или смена победителя — провал."""
+    first = next((i for i, t in enumerate(timeline) if t["agreed"] is not None), None)
+    if first is None:
+        return False
+    winner, agreed_run, finished = timeline[first]["agreed"], 0, False
+    for t in timeline[first:]:
+        vals = [t["per_board"].get(i) for i in range(1, n + 1)]
+        if all(v is None for v in vals):
+            finished = True
+        elif finished or any(v != winner for v in vals):
+            return False                                   # вернулся/смешался после завершения или борты расходятся
+        else:
+            agreed_run += 1
+    return agreed_run >= min_agreed
+
+
 def v5_bid_collision() -> Result:
     res = Result(5, "Two boards get the same SCAN_TARGET T2 command at once: all 5 boards must agree on one stable winner")
     sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/restore",
@@ -571,12 +589,11 @@ def v5_bid_collision() -> Result:
             last_winner = w
         time.sleep(1)
 
-    tail = [t["agreed"] for t in timeline[-5:]]
-    converged = all(w is not None for w in tail) and len(set(tail)) == 1
+    converged = collision_resolved(timeline, N_DEFAULT)
     res.metrics = {
         "timeline": timeline,
         "flap_count_after_first_agreement": flaps,
-        "all_boards_agree_last_5s": converged,
+        "boards_agreed_then_stayed_consistent": converged,
         "winner_id": last_winner,
         "note": "равные ставки не конструируются: проверяется согласие бортов, а не правило tie-break",
     }

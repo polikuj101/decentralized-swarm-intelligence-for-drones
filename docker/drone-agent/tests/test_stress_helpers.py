@@ -121,3 +121,31 @@ def test_swarm_settled_requires_full_alive_and_single_epoch(st):
     split_epoch = {i: {"alive": [1, 2, 3], "epoch": 4 + (i == 3)} for i in (1, 2, 3)}
     assert not st.swarm_settled(split_epoch, 3)
     assert not st.swarm_settled({1: {}, 2: {}, 3: {}}, 3)
+
+
+def _t(*vals):
+    return {"per_board": {i + 1: v for i, v in enumerate(vals)}, "agreed": vals[0] if len(set(vals)) == 1 else None}
+
+
+def test_collision_resolved_when_boards_agree_then_task_finishes(st):
+    tl = [_t(1, None, None)] + [_t(1, 1, 1)] * 4 + [_t(None, None, None)] * 3
+    assert st.collision_resolved(tl, 3)
+
+
+def test_collision_not_resolved_when_boards_disagree_after_agreement(st):
+    tl = [_t(1, 1, 1)] * 3 + [_t(1, 2, 1)]
+    assert not st.collision_resolved(tl, 3)
+
+
+def test_collision_not_resolved_when_only_some_boards_lose_the_task(st):
+    tl = [_t(1, 1, 1)] * 3 + [_t(1, None, 1)]
+    assert not st.collision_resolved(tl, 3)
+
+
+def test_collision_not_resolved_without_agreement_or_with_too_short_agreement(st):
+    assert not st.collision_resolved([_t(None, None, None)] * 5, 3)
+    assert not st.collision_resolved([_t(1, 1, 1)] * 2 + [_t(None, None, None)], 3)
+
+
+def test_collision_not_resolved_if_task_reappears_after_finishing(st):
+    assert not st.collision_resolved([_t(1, 1, 1)] * 3 + [_t(None, None, None), _t(1, 1, 1)], 3)
