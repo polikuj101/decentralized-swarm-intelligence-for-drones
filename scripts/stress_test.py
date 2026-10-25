@@ -156,6 +156,38 @@ def ew_agent_errors(r) -> list:
     return errs
 
 
+def container_running(service) -> bool:
+    r = sh(["docker", "inspect", "-f", "{{.State.Running}}", cid(service)], timeout=15)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def survivors_see_dead(states: dict, dead: list) -> bool:
+    """Выжившие борты (непустое состояние) не считают убитые живыми. Пустые состояния (ответа нет) не засчитываются:
+    раньше они выглядели как «никто не завис», и каскад проходил без единого наблюдения."""
+    live = [st for i, st in states.items() if i not in dead]
+    if not live or any(not st for st in live):
+        return False
+    return all(not (set(st.get("alive", [])) & set(dead)) for st in live)
+
+
+def gps_denial_visible(src_before, srcs_seen, suspect_seen) -> bool:
+    """Отказ GPS наблюдаем по бортовой навигации: источник позиции сменился (VIO/DR) или поднят gps_suspect."""
+    return bool(suspect_seen) or any(s in ("VIO", "DR") and s != src_before for s in srcs_seen)
+
+
+def cpu_limit_applied(nano_cpus, want_cpus: float) -> bool:
+    """docker inspect HostConfig.NanoCpus совпадает с запрошенным лимитом (docker update мог молча не примениться)."""
+    try:
+        return abs(int(nano_cpus) - int(want_cpus * 1e9)) < 1e6
+    except (TypeError, ValueError):
+        return False
+
+
+def rss_readings_valid(*readings: dict) -> bool:
+    """RSS system1_controller прочитан на всех бортах (ps вернул 0, если процесс не найден: рост 0 КБ ничего не доказывает)."""
+    return all(v > 0 for rd in readings for v in rd.values())
+
+
 def v1_netem(n=N_DEFAULT) -> Result:
     res = Result(1, "Zenoh network degradation (netem, split-brain, merge)")
     before = get_state("drone-agent-1")
@@ -251,6 +283,7 @@ def v2_attrition(n=N_DEFAULT) -> Result:
     print(f"v2: killing victim drone-agent-{victim} (task {task_before})", flush=True)
     t0 = time.time()
     sh(["docker", "compose", "kill", f"drone-agent-{victim}"])
+    victim_stopped = not container_running(f"drone-agent-{victim}")
     declared_at = None
     reassigned_at = None
     
@@ -288,6 +321,8 @@ def v2_attrition(n=N_DEFAULT) -> Result:
         time.sleep(3)
 
     stuck = []
+    killed_stopped = all(not container_running(f"drone-agent-{k}") for k in killed)
+    cascade_seen_dead = False
     t2 = time.time()
     while time.time() - t2 < 35:
         alive_ids = [i for i in survivors if i not in killed]
@@ -296,7 +331,8 @@ def v2_attrition(n=N_DEFAULT) -> Result:
             states2 = {i: f.result() for i, f in futs.items()}
         stuck = [i for i, st in states2.items() if st.get("nav", {}).get("phase") in ("WAIT",) and
                 (st.get("task") is None and not st.get("withdrawn"))]
-        if not stuck or time.time() - t2 > 30:
+        cascade_seen_dead = survivors_see_dead(states2, killed)
+        if (cascade_seen_dead and not stuck) or time.time() - t2 > 30:
             break
         time.sleep(1)
 
@@ -310,8 +346,18 @@ def v2_attrition(n=N_DEFAULT) -> Result:
         "single_kill_reassigned_s": reassigned_at,
         "cascade_log": cascade_log,
         "cascade_stuck_idle_survivors": stuck,
+        "victim_stopped": victim_stopped,
+        "cascade_killed_stopped": killed_stopped,
+        "cascade_survivors_marked_dead": cascade_seen_dead,
     }
-    res.verdict = ("PASS" if (declared_at is not None and declared_at <= 9.0 and reassign_ok and not stuck) else "FAIL")
+    chaos_applied = victim_stopped and killed_stopped and cascade_seen_dead
+    res.verdict = ("PASS" if (chaos_applied and declared_at is not None and declared_at <= 9.0 and reassign_ok and not stuck)
+                   else "FAIL")
+    if not chaos_applied:
+        res.notes = ("ХАОС НЕ ПРИМЕНЁН — результат ничего не доказывает: "
+                     f"одиночный борт {'остановлен' if victim_stopped else 'не остановлен'}, "
+                     f"каскад {'остановлен' if killed_stopped else 'не остановлен'}, "
+                     f"выжившие {'пометили убитых' if cascade_seen_dead else 'не пометили убитых мёртвыми (или не ответили)'}")
     return res
 
 
@@ -320,11 +366,13 @@ def v2_attrition(n=N_DEFAULT) -> Result:
 def v3_sensor_shock() -> Result:
     res = Result(3, "VIO loss + GPS spoof/denial at altitude")
     before = get_state("drone-agent-1").get("nav", {})
-    sh(["./scripts/ewctl.sh", "gps", "denied", "1", "20"])
+    ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "gps", "denied", "1", "20"]))
     t0 = time.time()
-    recovered_src, suspect_seen = None, False
+    recovered_src, suspect_seen, srcs_seen = None, False, set()
     while time.time() - t0 < 25:
         nav = get_state("drone-agent-1").get("nav", {})
+        if nav.get("src"):
+            srcs_seen.add(nav.get("src"))
         if nav.get("src") in ("VIO", "DR"):
             recovered_src = nav.get("src")
         if nav.get("gps_suspect"):
@@ -340,9 +388,9 @@ def v3_sensor_shock() -> Result:
     sh(["./scripts/ewctl.sh", "gps", "restore"])
 
     # GPS drift test
-    sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
+    ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
         "-H", "Content-Type: application/json",
-        "-d", json.dumps({"mode": "drift", "drones": [2], "rate_mps": 2.0, "heading_deg": 90, "sigma_m": 0.3})])
+        "-d", json.dumps({"mode": "drift", "drones": [2], "rate_mps": 2.0, "heading_deg": 90, "sigma_m": 0.3})]))
     t1, suspect2 = time.time(), None
     while time.time() - t1 < 25:
         nav = get_state("drone-agent-2").get("nav", {})
@@ -357,9 +405,18 @@ def v3_sensor_shock() -> Result:
         "gps_suspect_seen_on_denial": suspect_seen,
         "held_altitude_m": held_altitude,
         "crashed": bool(crashed),
-        "gps_drift_suspect_detected_s": suspect2 or 5.0,
+        "gps_drift_suspect_detected_s": suspect2,
+        "nav_src_before": before.get("src"),
+        "nav_srcs_seen_during_denial": sorted(srcs_seen),
+        "ew_agent_errors": sorted(set(ew_errors))[:5],
     }
-    res.verdict = "PASS" if not crashed else "FAIL"
+    denial_visible = gps_denial_visible(before.get("src"), srcs_seen, suspect_seen)
+    chaos_applied = denial_visible and not ew_errors
+    res.verdict = "PASS" if (chaos_applied and not crashed) else "FAIL"
+    if not chaos_applied:
+        res.notes = ("ХАОС НЕ ПРИМЕНЁН — результат ничего не доказывает: "
+                     f"отказ GPS {'виден в навигации' if denial_visible else 'не виден (src не сменился, gps_suspect не поднят)'}, "
+                     f"ошибки агентов: {sorted(set(ew_errors))[:2] or 'нет'}")
     return res
 
 
@@ -377,9 +434,9 @@ def _flood_start(duration_s, rate_hz=500, size=64):
         "    for p in peers: s.sendto(pkt, (p, 7447))\n"
         "    time.sleep(period)\n"
     )
-    sh(["docker", "run", "-d", "--rm", "--name", "chaos-flooder",
-        "--network", "swarm-sitl_mesh-net", "--cap-drop=ALL", "python:3.11-slim",
-        "python3", "-c", code])
+    return sh(["docker", "run", "-d", "--rm", "--name", "chaos-flooder",
+               "--network", "swarm-sitl_mesh-net", "--cap-drop=ALL", "python:3.11-slim",
+               "python3", "-c", code], timeout=180)
 
 
 def v4_resource_pressure() -> Result:
@@ -391,12 +448,16 @@ def v4_resource_pressure() -> Result:
         rss0[i] = int(r.stdout.strip() or 0)
 
     print("v4: launching flooder and cpus squeeze...", flush=True)
-    _flood_start(duration_s=50, rate_hz=500, size=64)
+    flood_started = _flood_start(duration_s=50, rate_hz=500, size=64).returncode == 0
     c1 = cid("drone-agent-1")
     sh(["docker", "update", "--cpus", "0.5", c1])
-    sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
-        "-H", "Content-Type: application/json", "-d", json.dumps({"mode": "denied", "drones": [1], "duration_s": 45})])
-    time.sleep(50)
+    ew_errors = ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
+        "-H", "Content-Type: application/json", "-d", json.dumps({"mode": "denied", "drones": [1], "duration_s": 45})]))
+    time.sleep(25)                                   # середина окна: флудер жив, лимит CPU выставлен
+    nano = sh(["docker", "inspect", "-f", "{{.HostConfig.NanoCpus}}", c1], timeout=15).stdout.strip()
+    cpu_limited = cpu_limit_applied(nano, 0.5)
+    flooder_alive = sh(["docker", "ps", "-q", "--filter", "name=chaos-flooder"]).stdout.strip() != ""
+    time.sleep(25)
     sh(["docker", "wait", "chaos-flooder"], check=False)
 
     rss1 = {}
@@ -419,8 +480,22 @@ def v4_resource_pressure() -> Result:
         "rss_growth_kb": rss_growth_kb,
         "supervisor_ok": sup_ok,
         "rss_over_800mb": {i: rss1[i] / 1024.0 > 800 for i in (1, 2)},
+        "cpu_limit_applied": cpu_limited,
+        "nano_cpus_mid_window": nano,
+        "flooder_started": flood_started,
+        "flooder_alive_mid_window": flooder_alive,
+        "ew_agent_errors": sorted(set(ew_errors))[:5],
+        "rss_readings_valid": rss_readings_valid(rss0, rss1),
     }
-    res.verdict = ("PASS" if (all(sup_ok.values()) and all(v <= 800 * 1024 for v in rss1.values()) and
+    chaos_applied = (cpu_limited and flood_started and flooder_alive and not ew_errors
+                     and rss_readings_valid(rss0, rss1))
+    if not chaos_applied:
+        res.notes = ("ХАОС НЕ ПРИМЕНЁН — результат ничего не доказывает: "
+                     f"лимит CPU {'выставлен' if cpu_limited else 'не выставлен'}, "
+                     f"флудер {'работал' if flood_started and flooder_alive else 'не работал'}, "
+                     f"ошибки агентов: {sorted(set(ew_errors))[:2] or 'нет'}, "
+                     f"RSS {'прочитан' if rss_readings_valid(rss0, rss1) else 'не прочитан (system1_controller не найден)'}")
+    res.verdict = ("PASS" if (chaos_applied and all(sup_ok.values()) and all(v <= 800 * 1024 for v in rss1.values()) and
                               all(v < 50 * 1024 for v in rss_growth_kb.values())) else "FAIL")
     return res
 

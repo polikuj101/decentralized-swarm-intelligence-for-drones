@@ -47,3 +47,37 @@ def test_non_json_output_counts_as_an_error(st):
 
 def test_empty_output_is_not_an_error(st):
     assert st.ew_agent_errors(reply("")) == []
+
+
+# -- Векторы 2-4: инъекция должна быть подтверждена наблюдаемым эффектом --
+
+def test_survivors_see_dead_requires_every_survivor_to_mark_them(st):
+    states = {1: {}, 2: {}, 3: {"alive": [3, 4, 5]}, 4: {"alive": [3, 4, 5]}, 5: {"alive": [3, 4, 5]}}
+    assert st.survivors_see_dead(states, [1, 2]) is True
+    states[4] = {"alive": [2, 3, 4, 5]}                       # борт 4 всё ещё считает убитого 2 живым
+    assert st.survivors_see_dead(states, [1, 2]) is False
+
+
+def test_survivors_see_dead_empty_state_is_not_evidence(st):
+    """Регрессия: ответ {} раньше выглядел как «никто не завис»; молчащий выживший = нет подтверждения."""
+    assert st.survivors_see_dead({1: {}, 2: {"alive": [2, 3]}, 3: {}}, [1]) is False
+    assert st.survivors_see_dead({1: {}}, [1]) is False       # выживших нет совсем
+
+
+def test_gps_denial_visible_by_src_change_or_suspect(st):
+    assert st.gps_denial_visible("GPS", {"GPS", "DR"}, False) is True
+    assert st.gps_denial_visible("GPS", {"GPS"}, True) is True
+    assert st.gps_denial_visible("GPS", {"GPS"}, False) is False       # GPS не отключали
+    assert st.gps_denial_visible("DR", {"DR"}, False) is False         # уже был DR до инъекции
+
+
+def test_cpu_limit_applied_matches_nanocpus(st):
+    assert st.cpu_limit_applied("500000000", 0.5) is True
+    assert st.cpu_limit_applied(4_000_000_000, 0.5) is False
+    assert st.cpu_limit_applied("", 0.5) is False
+    assert st.cpu_limit_applied(None, 0.5) is False
+
+
+def test_rss_readings_valid_rejects_missing_process(st):
+    assert st.rss_readings_valid({1: 120000, 2: 130000}, {1: 125000, 2: 131000}) is True
+    assert st.rss_readings_valid({1: 0, 2: 130000}, {1: 125000, 2: 131000}) is False
