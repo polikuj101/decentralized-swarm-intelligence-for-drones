@@ -15,6 +15,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 from swarm import common
+from swarm.supervise import DisarmWatch
 
 MS = common.MISSION
 VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, common.ALT
@@ -49,6 +50,7 @@ class Flight(Node):
         self.pz, self.hdg, self.ve, self.vn, self.sigma, self.src = 0.0, 0.0, 0.0, 0.0, 5.0, "NONE"
         self.suspect, self.bad, self.good, self.hist = False, 0, 0, deque()
         self.state, self.label = "WAIT", "IDLE"
+        self.disarm = DisarmWatch()
         self.ready_t, self.t_cmd = None, 0.0
         self.goal, self.seq, self.idx, self.done, self.dwell_t0 = None, None, 0, False, None
         self.obst_min = 99.0
@@ -79,6 +81,9 @@ class Flight(Node):
         if g.get("seq") == self.seq:
             return
         self.goal, self.seq, self.idx, self.done, self.dwell_t0 = g, g["seq"], 0, False, None
+        if self.state in ("LAND", "LANDED") and g.get("kind") == "WAYPOINTS":      # отзыв снят: борт возвращается к работе
+            self.get_logger().info("new waypoints after landing -> WAIT (re-arm and take off)")
+            self.state, self.label, self.ready_t = "WAIT", "IDLE", None
 
     def _ts(self):
         return int(self.get_clock().now().nanoseconds / 1000)
@@ -195,6 +200,12 @@ class Flight(Node):
 
         vx = vy = vz = 0.0
         st = self.state
+        if st in ("TAKEOFF", "FLY") and self.vs is not None and self.disarm.update(self.vs.arming_state == 2, now):
+            # PX4 разоружился после взлёта: раньше борт оставался в FLY и продолжал показывать NAV, сидя на земле
+            self.get_logger().warning("PX4 disarmed after takeoff -> back to WAIT (re-arm and take off)")
+            self.state, self.label, self.done, self.ready_t = "WAIT", "GROUNDED", False, None
+            self.disarm.reset()
+            st = self.state
         if st == "WAIT":
             ok = (self.lp is not None and self.lp.z_valid and (self.lp.xy_valid or self.lp.v_xy_valid))
             if ok:

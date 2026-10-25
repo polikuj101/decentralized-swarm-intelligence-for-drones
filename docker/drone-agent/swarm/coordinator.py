@@ -17,6 +17,7 @@ from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
+from swarm.supervise import withdraw_clearable
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
 T_DEAD, T_SUSPECT, SETTLE_S = 3.5, 3.0, 2.0
@@ -483,6 +484,10 @@ class Coordinator(Node):
                     self.log("manifest timeout -> fallback: все сектора активны")
                 self.reset_cbaa(now)
             self._poll_manifest(now)
+            if withdraw_clearable(self.withdrawn, self.phase == A.Phase.NOMINAL, now - self.phase_t):
+                self.withdrawn, self.mission_done_sent, self.exec_task = False, False, None
+                self.log("withdraw cleared: фаза NOMINAL устойчива, борт возвращается в работу")
+                self.bump("withdraw-cleared", now)
             self._liveness(now)
             self._exec(now)
             self._tx(now)
