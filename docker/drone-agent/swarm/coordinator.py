@@ -17,6 +17,7 @@ from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
+from swarm.replay import SeqFilter
 from swarm.supervise import withdraw_clearable
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
@@ -32,7 +33,7 @@ def sgt(a, b):
 
 class Peer:
     __slots__ = ("last_rx", "seq", "q", "x", "y", "z", "state", "flags", "sigma", "task", "epoch",
-                 "link_q", "heard", "heard_rx", "hb_s", "rx")
+                 "link_q", "heard", "heard_rx", "hb_s", "rx", "seqf")
 
     def __init__(self):
         self.last_rx = None
@@ -42,6 +43,7 @@ class Peer:
         self.state, self.flags, self.sigma, self.task = 0, 0, 0.0, wire.NONE
         self.epoch, self.link_q, self.heard, self.heard_rx = 0, 0, 0, None
         self.hb_s, self.rx = 0.5, 0
+        self.seqf = SeqFilter()
 
 
 class Coordinator(Node):
@@ -261,10 +263,11 @@ class Coordinator(Node):
 
     def _on_hb(self, s, seq, body, now):
         d, p = wire.dec_hb(body), self.peers[s]
-        if p.seq is not None:
-            gap = (seq - p.seq) & 0xFFFF
-            if gap == 0:
-                return
+        prev = p.seq
+        if not p.seqf.accept(seq):          # дубль или повтор старого пакета: не продлевает жизнь пира
+            return
+        if prev is not None:
+            gap = (seq - prev) & 0xFFFF
             if gap <= 200:
                 for _ in range(gap - 1):
                     p.q *= 0.9

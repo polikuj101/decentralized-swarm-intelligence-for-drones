@@ -6,6 +6,9 @@ ARG PX4_MSGS_REF=release/1.15
 ARG GGML_FLAGS="-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
 
 # ───────── stage 1: llama.cpp + модель ─────────
+# ВНИМАНИЕ (аудит 2026-10-25): это не сборка llama.cpp, а копирование llama-server и model.gguf из ПРЕДЫДУЩЕГО образа
+# swarm/drone-agent:latest. На чистой машине образ не соберётся, а ARG LLAMA_CPP_REF/GGML_FLAGS выше не используются.
+# TODO: собрать llama.cpp из LLAMA_CPP_REF в отдельной стадии и брать модель с проверкой контрольной суммы.
 FROM swarm/drone-agent:latest AS llama
 RUN mkdir -p /src/build/bin \
  && cp /usr/local/bin/llama-server /src/build/bin/llama-server \

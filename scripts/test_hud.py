@@ -5,7 +5,23 @@ import json
 import sys
 import asyncio
 
-token = "7f3c1d9b8a2e4f0165c7890ab4d5e6f1"
+import os
+from pathlib import Path
+
+
+def _token():
+    """EW_TOKEN из окружения или из .env (в репозитории токенов нет)."""
+    if os.environ.get("EW_TOKEN"):
+        return os.environ["EW_TOKEN"]
+    env = Path(__file__).resolve().parent.parent / ".env"
+    if env.exists():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if line.startswith("EW_TOKEN=") and line.split("=", 1)[1].strip():
+                return line.split("=", 1)[1].strip()
+    sys.exit("EW_TOKEN не задан: экспортируйте его или заполните .env")
+
+
+token = _token()
 url = "http://127.0.0.1:8000/api/ingest/1"
 
 print("Running E8 ingest tests...")

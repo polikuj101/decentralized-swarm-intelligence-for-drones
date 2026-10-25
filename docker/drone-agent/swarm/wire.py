@@ -4,7 +4,17 @@ import hmac
 import os
 import struct
 
-KEY = bytes.fromhex(os.environ.get("SWARM_KEY", "00" * 16))
+def _load_key() -> bytes:
+    """Ключ роя обязателен: нулевой ключ по умолчанию позволял бы любому в mesh подделывать пакеты без единого сообщения об этом."""
+    k = os.environ.get("SWARM_KEY", "")
+    if k:
+        return bytes.fromhex(k)
+    if os.environ.get("SWARM_INSECURE_DEV") == "1":
+        return bytes(16)
+    raise RuntimeError("SWARM_KEY не задан (для тестов: SWARM_INSECURE_DEV=1)")
+
+
+KEY = _load_key()
 MAX_PAYLOAD = 64
 TAG_LEN = 4
 HDR = struct.Struct("<BBHI")
