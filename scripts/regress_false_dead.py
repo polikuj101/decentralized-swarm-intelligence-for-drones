@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 sys.path.insert(0, "scripts")
-from stress_test import reset_stand, sh, rr, N_DEFAULT  # noqa: E402
+from stress_test import ew_agent_errors, reset_stand, sh, rr, N_DEFAULT  # noqa: E402
 
 THRESHOLDS = {"L1": 2, "L2": 1, "L3": 1, "L4": None}   # None = не нормируется (L4 — ожидаемый блэкаут, не тест)
 
@@ -29,11 +29,13 @@ rclpy.init()
 n = Node('false_dead_probe')
 events = []
 prev = {{}}
+samples = [0]
 def cb(m):
     try:
         st = json.loads(m.data)
     except json.JSONDecodeError:
         return
+    samples[0] += 1
     now = time.time()
     for k, p in st.get('peers', {{}}).items():
         was_alive = prev.get(k, {{}}).get('alive', True)
@@ -52,19 +54,24 @@ try:
     rclpy.shutdown()
 except Exception:
     pass
-print(json.dumps(events))
+print(json.dumps({{'events': events, 'samples': samples[0]}}))
 """
     try:
         r = rr(service, "python3", "-c", code, timeout=seconds + 25)
-        lines = [line.strip() for line in r.stdout.strip().splitlines() if line.strip().startswith("[")]
-        return json.loads(lines[-1]) if lines else []
+        lines = [line.strip() for line in r.stdout.strip().splitlines() if line.strip().startswith("{")]
+        return json.loads(lines[-1]) if lines else None
     except Exception:
-        return []
+        return None           # зонд не отработал: раньше это превращалось в «0 событий» и PASS
+
+
+def probes_valid(probes: dict, n: int, min_samples: int) -> bool:
+    """Каждый из n зондов вернул результат и реально получил состояния (иначе «нет событий» ничего не значит)."""
+    return (len(probes) == n and all(isinstance(p, dict) and p.get("samples", 0) >= min_samples for p in probes.values()))
 
 
 def run_level(level, duration):
     reset_stand(N_DEFAULT)
-    sh(["./scripts/ewctl.sh", "mesh", level, "all", str(duration + 10)])
+    ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "mesh", level, "all", str(duration + 10)]))
     import threading
     probes = {}
 
@@ -72,7 +79,7 @@ def run_level(level, duration):
         try:
             probes[i] = collect_events(f"drone-agent-{i}", duration)
         except Exception:
-            probes[i] = []
+            probes[i] = None
 
     threads = [threading.Thread(target=_collect, args=(i,)) for i in range(1, N_DEFAULT + 1)]
     for t in threads:
@@ -86,10 +93,13 @@ def run_level(level, duration):
         t.join()
     sh(["./scripts/ewctl.sh", "reset"])
 
-    all_dead = [e for ev in probes.values() for e in ev if e["ev"] == "dead"]
-    all_declared = [e for ev in probes.values() for e in ev if e["ev"] == "declared"]
+    valid = probes_valid(probes, N_DEFAULT, min_samples=max(1, duration))     # состояние публикуется ~5 Гц; берём с большим запасом
+    evs = [p["events"] for p in probes.values() if isinstance(p, dict)]
+    all_dead = [e for ev in evs for e in ev if e["ev"] == "dead"]
+    all_declared = [e for ev in evs for e in ev if e["ev"] == "declared"]
     # все 5 бортов были живы физически всё время -> каждое событие 'dead'/'declared' ложное по определению теста
-    return {"level": level, "duration_s": duration, "false_dead_count": len(all_dead),
+    return {"level": level, "duration_s": duration, "probes_valid": valid, "ew_agent_errors": sorted(set(ew_errors))[:5],
+            "samples": {i: (p or {}).get("samples") for i, p in probes.items()}, "false_dead_count": len(all_dead),
             "false_declared_failover_count": len(all_declared),
             "dead_events": all_dead, "declared_events": all_declared}
 
@@ -107,7 +117,8 @@ def main():
         res = run_level(lvl, a.duration)
         thr = THRESHOLDS.get(lvl)
         res["threshold"] = thr
-        res["verdict"] = "PASS" if (thr is None or res["false_declared_failover_count"] <= thr) else "FAIL"
+        measured = res["probes_valid"] and not res["ew_agent_errors"]       # без валидных зондов и применённого профиля PASS невозможен
+        res["verdict"] = "PASS" if (measured and (thr is None or res["false_declared_failover_count"] <= thr)) else "FAIL"
         print(json.dumps({k: v for k, v in res.items() if not k.endswith("_events")}, indent=2))
         results.append(res)
 

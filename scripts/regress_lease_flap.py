@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 sys.path.insert(0, "scripts")
-from stress_test import reset_stand, sh, rr, N_DEFAULT  # noqa: E402
+from stress_test import ew_agent_errors, reset_stand, sh, rr, N_DEFAULT  # noqa: E402
 
 
 def collect_zenoh_peers(service, seconds):
@@ -42,7 +42,13 @@ print(json.dumps(samples))
     try:
         return json.loads(r.stdout.strip().splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
-        return []
+        return None           # зонд не отработал — это не «0 флапов"
+
+
+def samples_usable(samples, min_samples) -> bool:
+    """Зонд вернул достаточно образцов, и в них есть числовое mesh.zenoh_peers (иначе 0 флапов ничего не доказывает)."""
+    return (isinstance(samples, list) and len(samples) >= min_samples
+            and any(isinstance(s.get("zenoh_peers"), (int, float)) and s["zenoh_peers"] > 0 for s in samples))
 
 
 def count_flaps(samples):
@@ -67,7 +73,7 @@ def main():
 
     print("=== Непрерывный L3 (без split/merge), наблюдение zenoh_peers на всех бортах ===", flush=True)
     reset_stand(N_DEFAULT)
-    sh(["./scripts/ewctl.sh", "mesh", "L3", "all", str(a.duration + 10)])
+    ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "mesh", "L3", "all", str(a.duration + 10)]))
 
     import threading
     probes = {}
@@ -82,17 +88,22 @@ def main():
         t.join()
     sh(["./scripts/ewctl.sh", "reset"])
 
-    per_drone = {i: count_flaps(samples) for i, samples in probes.items()}
+    usable = all(samples_usable(probes.get(i), max(1, a.duration)) for i in range(1, N_DEFAULT + 1))
+    per_drone = {i: count_flaps(samples or []) for i, samples in probes.items()}
     total_flaps = sum(per_drone.values())
 
     out = ROOT / "logs" / "verify" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    (out / "lease_flap.json").write_text(json.dumps({"per_drone_flaps": per_drone, "raw_samples": probes}, indent=2))
+    (out / "lease_flap.json").write_text(json.dumps({"per_drone_flaps": per_drone, "raw_samples": probes,
+                                                     "probes_usable": usable, "ew_agent_errors": ew_errors}, indent=2))
 
     print(json.dumps({"per_drone_flaps": per_drone, "total_flaps": total_flaps}, indent=2))
     # Порог: при lease=60000мс и keep_alive=20 ожидалось 0 переустановок за 3 минуты устойчивого L3 (п. 2.3 U9,
     # 4.6.3). При lease=4000мс любое количество > 0 указывает, что сессия не переживает L3 целиком и "быстрая
     # конвергенция" Вектора 1 вероятно объясняется переустановкой сессии, а не быстрым CBAA.
+    if not usable or ew_errors:
+        print(f"FAIL: измерение недействительно (зонды пригодны: {usable}; ошибки применения L3: {sorted(set(ew_errors))[:2] or 'нет'})")
+        sys.exit(1)
     ok = total_flaps == 0
     print(f"\n{'PASS' if ok else 'FAIL'}: "
           f"{'сессии Zenoh переживают устойчивый L3 без переустановок, lease=4000ms безопасен' if ok else f'{total_flaps} переустановок сессии за {a.duration}с устойчивого L3 — lease=4000ms слишком короткий для L3 (80% потерь); вернуть к lease=60000ms/keep_alive=20 (§4.6.3) и пересчитать Вектор 1 заново'}")

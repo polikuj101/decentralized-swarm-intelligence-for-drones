@@ -41,16 +41,16 @@ pass "drone-agent-1 providers: $providers (строго CPU)"
 echo "=== 3. Проверка cgroup лимитов drone-agent-1 (4 vCPU / 2 GiB) ==="
 # Лимит памяти из docker inspect
 mem_limit=$(docker inspect --format '{{.HostConfig.Memory}}' $(docker compose ps -q drone-agent-1))
-if [ "$mem_limit" -ne 0 ] && [ "$mem_limit" -gt 2147483648 ]; then
-  fail "Память drone-agent-1 превышает 2 GiB: $mem_limit"
+if [ "$mem_limit" -eq 0 ] || [ "$mem_limit" -gt 2147483648 ]; then
+  fail "Память drone-agent-1 не ограничена или превышает 2 GiB: $mem_limit"
 else
   pass "Лимит памяти drone-agent-1: $mem_limit байт (<= 2 GiB)"
 fi
 
 # Лимит CPU из docker inspect (NanoCpus = 4 * 10^9)
 nano_cpus=$(docker inspect --format '{{.HostConfig.NanoCpus}}' $(docker compose ps -q drone-agent-1))
-if [ "$nano_cpus" -ne 0 ] && [ "$nano_cpus" -gt 4000000000 ]; then
-  fail "CPU drone-agent-1 превышает 4 vCPU: $nano_cpus"
+if [ "$nano_cpus" -eq 0 ] || [ "$nano_cpus" -gt 4000000000 ]; then
+  fail "CPU drone-agent-1 не ограничен или превышает 4 vCPU: $nano_cpus"
 else
   pass "Лимит CPU drone-agent-1: $nano_cpus nano-cpus (<= 4 vCPU)"
 fi
@@ -68,7 +68,7 @@ if [ -n "$rss_kb" ] && [ "$rss_kb" -gt 0 ]; then
     pass "RSS System 1 в норме: ${rss_mb} МБ (<= 800 МБ)"
   fi
 else
-  echo "info: процесс system1_controller пока не запущен как демон"
+  fail "процесс system1_controller не найден в drone-agent-1: RSS проверить нельзя"
 fi
 
 echo -e "\n${GREEN}Все проверки изоляции (G8) пройдены успешно!${NC}"

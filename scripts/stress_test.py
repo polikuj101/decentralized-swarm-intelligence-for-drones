@@ -51,8 +51,9 @@ def pub_cmd(service, cmd_dict):
     code = (
         "import rclpy,json;from rclpy.node import Node;from std_msgs.msg import String;"
         "rclpy.init();n=Node('stress_pub');p=n.create_publisher(String,'/swarm/local/planner_cmd',10);"
-        f"p.publish(String(data='{json.dumps(cmd_dict)}'));"
-        "import time;t0=time.time()\n"
+        f"import time;d=json.loads('{json.dumps(cmd_dict)}');d['t_mono']=time.monotonic();"   # свежий штамп: иначе stale-отказ
+        "p.publish(String(data=json.dumps(d)));"
+        "t0=time.time()\n"
         "while time.time()-t0<0.5: rclpy.spin_once(n,timeout_sec=0.1)\n"
         "n.destroy_node();rclpy.shutdown()"
     )
@@ -124,8 +125,28 @@ def reset_stand(n=N_DEFAULT):
         name = cid(f"drone-agent-{i}")
         if name in exited:
             sh(["docker", "start", name])
-    wait_healthy(agents, 60)
-    time.sleep(2)
+    healthy = wait_healthy(agents, 60)
+    settled = wait_swarm_settled(n, 60) if healthy else False
+    if not (healthy and settled):
+        print(f"WARNING: стенд не вернулся в чистое состояние (контейнеры={healthy}, рой сошёлся={settled}) — "
+              "результат следующего вектора может быть недостоверен", flush=True)
+    return healthy and settled
+
+
+def swarm_settled(states: dict, n: int) -> bool:
+    """Все n бортов ответили, видят всех живыми и сидят в одной эпохе."""
+    sts = list(states.values())
+    return (len(sts) == n and all(st and len(st.get("alive", [])) == n for st in sts)
+            and len({st.get("epoch") for st in sts}) == 1)
+
+
+def wait_swarm_settled(n=N_DEFAULT, secs=60):
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        if swarm_settled(get_all_states(n, timeout=10), n):
+            return True
+        time.sleep(2)
+    return False
 
 
 @dataclass
@@ -143,6 +164,9 @@ def ew_agent_errors(r) -> list:
     """ew-controller отвечает HTTP 200, даже когда агент не применил правило ({"1": {"ok": false, "body": {"error": ...}}}),
     а `curl -f` и ewctl.sh этого не видят: раньше Вектор 1 проходил на рое, который на самом деле никто не резал
     (ядро WSL без netem/prio, старый образ агента). Возвращает тексты ошибок."""
+    rc = getattr(r, "returncode", 0)
+    if rc != 0:                                      # контроллер недоступен / 4xx / 5xx: curl -f молчит в stdout
+        return [f"команда завершилась с кодом {rc}: {(getattr(r, 'stderr', '') or '').strip()[:100]!r}"]
     try:
         data = json.loads((r.stdout or "").strip() or "{}")
     except ValueError:
@@ -186,6 +210,22 @@ def cpu_limit_applied(nano_cpus, want_cpus: float) -> bool:
 def rss_readings_valid(*readings: dict) -> bool:
     """RSS system1_controller прочитан на всех бортах (ps вернул 0, если процесс не найден: рост 0 КБ ничего не доказывает)."""
     return all(v > 0 for rd in readings for v in rd.values())
+
+
+def reassignment_ok(task_before, declared_at, reassigned_at, limit_s=6.0) -> bool:
+    """Задача убитого борта должна быть переназначена в течение limit_s после объявления отказа.
+    Раньше «не переназначили вообще» (reassigned_at is None) считалось успехом. Нет задачи у жертвы — проверять нечего."""
+    if task_before is None:
+        return True
+    return declared_at is not None and reassigned_at is not None and reassigned_at - declared_at <= limit_s
+
+
+def agreed_winner(winners_by_board: dict, n: int):
+    """Победитель задачи, одинаковый на всех n бортах; None, если не все ответили или мнения расходятся."""
+    vals = [winners_by_board.get(i) for i in range(1, n + 1)]
+    if any(v is None for v in vals) or len(set(vals)) != 1:
+        return None
+    return vals[0]
 
 
 def v1_netem(n=N_DEFAULT) -> Result:
@@ -340,7 +380,7 @@ def v2_attrition(n=N_DEFAULT) -> Result:
         sh(["docker", "compose", "start", f"drone-agent-{k}"])
     wait_healthy([f"drone-agent-{k}" for k in killed], 120)
 
-    reassign_ok = (reassigned_at is None) or (reassigned_at - declared_at <= 6.0)
+    reassign_ok = reassignment_ok(task_before, declared_at, reassigned_at)
     res.metrics = {
         "single_kill_declared_s": declared_at,
         "single_kill_reassigned_s": reassigned_at,
@@ -364,7 +404,7 @@ def v2_attrition(n=N_DEFAULT) -> Result:
 # ───────────────────────── Вектор 3: сенсорный шок ─────────────────────────
 
 def v3_sensor_shock() -> Result:
-    res = Result(3, "VIO loss + GPS spoof/denial at altitude")
+    res = Result(3, "GPS denial + slow GPS drift (spoofing and VIO loss are NOT injected)")
     before = get_state("drone-agent-1").get("nav", {})
     ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "gps", "denied", "1", "20"]))
     t0 = time.time()
@@ -401,7 +441,7 @@ def v3_sensor_shock() -> Result:
     sh(["./scripts/ewctl.sh", "gps", "restore"])
 
     res.metrics = {
-        "gps_denied_recovery_src": recovered_src or "DR",
+        "gps_denied_recovery_src": recovered_src,
         "gps_suspect_seen_on_denial": suspect_seen,
         "held_altitude_m": held_altitude,
         "crashed": bool(crashed),
@@ -412,11 +452,14 @@ def v3_sensor_shock() -> Result:
     }
     denial_visible = gps_denial_visible(before.get("src"), srcs_seen, suspect_seen)
     chaos_applied = denial_visible and not ew_errors
-    res.verdict = "PASS" if (chaos_applied and not crashed) else "FAIL"
+    drift_detected = suspect2 is not None
+    res.verdict = "PASS" if (chaos_applied and not crashed and drift_detected) else "FAIL"
     if not chaos_applied:
         res.notes = ("ХАОС НЕ ПРИМЕНЁН — результат ничего не доказывает: "
                      f"отказ GPS {'виден в навигации' if denial_visible else 'не виден (src не сменился, gps_suspect не поднят)'}, "
                      f"ошибки агентов: {sorted(set(ew_errors))[:2] or 'нет'}")
+    elif not drift_detected:
+        res.notes = "дрейф GPS (2 м/с, 25 с) не был обнаружен бортом D2 (gps_suspect не поднят)"
     return res
 
 
@@ -440,7 +483,7 @@ def _flood_start(duration_s, rate_hz=500, size=64):
 
 
 def v4_resource_pressure() -> Result:
-    res = Result(4, "Flooding + CPU squeeze (0.5 core) under System 1 + llama-server load")
+    res = Result(4, "UDP flood on mesh port + CPU squeeze (0.5 core) on D1 (no extra LLM load is generated)")
     rss0 = {}
     for i in (1, 2):
         r = dcx(f"drone-agent-{i}", "sh", "-c",
@@ -472,6 +515,8 @@ def v4_resource_pressure() -> Result:
 
     sh(["docker", "update", "--cpus", "4.0", c1])
     sh(["docker", "stop", "chaos-flooder"], check=False)
+    alive_after = {i: len(get_state(f"drone-agent-{i}").get("alive", [])) for i in (1, 2)}      # рой не должен развалиться от флуда
+    swarm_intact = all(v == N_DEFAULT for v in alive_after.values())
 
     rss_growth_kb = {i: rss1[i] - rss0[i] for i in (1, 2)}
     res.metrics = {
@@ -486,6 +531,7 @@ def v4_resource_pressure() -> Result:
         "flooder_alive_mid_window": flooder_alive,
         "ew_agent_errors": sorted(set(ew_errors))[:5],
         "rss_readings_valid": rss_readings_valid(rss0, rss1),
+        "alive_count_after": alive_after,
     }
     chaos_applied = (cpu_limited and flood_started and flooder_alive and not ew_errors
                      and rss_readings_valid(rss0, rss1))
@@ -495,7 +541,7 @@ def v4_resource_pressure() -> Result:
                      f"флудер {'работал' if flood_started and flooder_alive else 'не работал'}, "
                      f"ошибки агентов: {sorted(set(ew_errors))[:2] or 'нет'}, "
                      f"RSS {'прочитан' if rss_readings_valid(rss0, rss1) else 'не прочитан (system1_controller не найден)'}")
-    res.verdict = ("PASS" if (chaos_applied and all(sup_ok.values()) and all(v <= 800 * 1024 for v in rss1.values()) and
+    res.verdict = ("PASS" if (chaos_applied and swarm_intact and all(sup_ok.values()) and all(v <= 800 * 1024 for v in rss1.values()) and
                               all(v < 50 * 1024 for v in rss_growth_kb.values())) else "FAIL")
     return res
 
@@ -503,43 +549,42 @@ def v4_resource_pressure() -> Result:
 # ───────────────────────── Вектор 5: коллизия ставок ─────────────────────────
 
 def v5_bid_collision() -> Result:
-    res = Result(5, "Simultaneous equal bids on T2 (tie-breaking determinism)")
-    for i in (1, 2):
-        sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/restore",
-            "-H", "Content-Type: application/json", "-d", "{}"])
-    
-    cmd_payload = {"id": 9001, "tool": "SCAN_TARGET", "args": {"target": 2}}
+    res = Result(5, "Two boards get the same SCAN_TARGET T2 command at once: all 5 boards must agree on one stable winner")
+    sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/restore",
+        "-H", "Content-Type: application/json", "-d", "{}"])
+
+    # раньше в команде не было source/phase/t_mono: схема координатора отклоняла её, и Вектор 5 ничего не проверял
+    phase = get_state("drone-agent-1").get("phase", "NOMINAL")
+    cmd_payload = {"id": 9001, "source": "S1", "phase": phase, "t_mono": 0.0, "tool": "SCAN_TARGET", "args": {"target": 2}}
     pub_cmd("drone-agent-1", cmd_payload)
     pub_cmd("drone-agent-2", cmd_payload)
 
-    winners_over_time, flaps = [], 0
-    last_winner = None
+    timeline, flaps, last_winner = [], 0, None
     for _ in range(15):
-        st1 = get_state("drone-agent-1")
-        w = st1.get("winners", {}).get("8")  # T2 = id 8
-        winners_over_time.append(w)
+        states = get_all_states(N_DEFAULT)
+        per_board = {i: (st.get("winners") or {}).get("8") for i, st in states.items()}   # T2 = id 8
+        w = agreed_winner(per_board, N_DEFAULT)
+        timeline.append({"per_board": per_board, "agreed": w})
         if w is not None and last_winner is not None and w != last_winner:
             flaps += 1
         if w is not None:
             last_winner = w
         time.sleep(1)
 
-    converged = len(set(w for w in winners_over_time[-5:] if w is not None)) <= 1
-    # При равных ставках победитель должен быть детерминирован (меньший ID: 1 или наименьший участник)
-    deterministic_winner = (last_winner is not None)
-
+    tail = [t["agreed"] for t in timeline[-5:]]
+    converged = all(w is not None for w in tail) and len(set(tail)) == 1
     res.metrics = {
-        "winners_timeline": winners_over_time,
-        "flap_count_after_first_assignment": flaps,
-        "converged_last_5s": converged,
-        "winner_determined": deterministic_winner,
+        "timeline": timeline,
+        "flap_count_after_first_agreement": flaps,
+        "all_boards_agree_last_5s": converged,
         "winner_id": last_winner,
+        "note": "равные ставки не конструируются: проверяется согласие бортов, а не правило tie-break",
     }
-    res.verdict = "PASS" if (converged and flaps <= 2 and deterministic_winner) else "FAIL"
+    res.verdict = "PASS" if (converged and flaps <= 2) else "FAIL"
     if res.verdict == "PASS":
-        res.notes = "flaps <= 2 допускает первичное согласование; детерминизм CBAA соблюден"
+        res.notes = "все 5 бортов видят одного победителя T2 последние 5 с; tie-break по хэшу не проверялся (см. unit-тесты CBAA)"
     else:
-        res.notes = ("победитель задачи id 8 (T2) не наблюдался или флапал: проверьте, что такая задача есть в winners "
+        res.notes = ("борты не пришли к одному победителю задачи id 8 (T2) или он менялся: проверьте, что T2 есть в winners "
                      "(на неподнятом рое набор задач другой), и что рой действительно торгует")
     return res
 
@@ -569,9 +614,9 @@ def main():
 
     report = {"ts": time.time(), "results": [r.__dict__ for r in results]}
     (OUT / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    lines = ["# Отчёт стресс-теста (Хаос-инжиниринг роя)", "", "| Вектор | Тест | Вердикт |", "|---|---|---|"]
+    lines = ["# Отчёт стресс-теста (Хаос-инжиниринг роя)", "", "| Вектор | Тест | Вердикт | Примечание |", "|---|---|---|---|"]
     for r in results:
-        lines.append(f"| {r.vector} | {r.name} | **{r.verdict}** |")
+        lines.append(f"| {r.vector} | {r.name} | **{r.verdict}** | {(r.notes or '').replace('|', '/')} |")
     (OUT / "report.md").write_text("\n".join(lines))
     print(f"\nОтчёт: {OUT}/report.json, {OUT}/report.md")
     sys.exit(0 if all(r.verdict == "PASS" for r in results) else 1)

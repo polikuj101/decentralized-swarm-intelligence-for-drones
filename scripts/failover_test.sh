@@ -4,6 +4,7 @@ set -euo pipefail
 
 TARGET_PEER="${1:-3}"
 HALF_MODE=0
+RESULT=0
 if [ "${2:-}" = "--half" ]; then
   HALF_MODE=1
 fi
@@ -32,7 +33,8 @@ if [ "$HALF_MODE" -eq 1 ]; then
   if echo "$LOG" | grep -q "SWARM_LOSS\|ISOLATED"; then
     echo -e "\033[0;32m[PASS]\033[0m Фаза SWARM_LOSS/ISOLATED зафиксирована при изоляции половины роя"
   else
-    echo -e "\033[0;33m[WARN]\033[0m Фаза не сменилась на SWARM_LOSS/ISOLATED за время теста"
+    echo -e "\033[0;31m[FAIL]\033[0m Фаза не сменилась на SWARM_LOSS/ISOLATED за время теста"
+    RESULT=1
   fi
 
 else
@@ -53,10 +55,12 @@ else
   if echo "$LOG" | grep -q '"ev": "dead"\|"ev": "declared"'; then
     echo -e "\033[0;32m[PASS]\033[0m Дрон-агент 1 зафиксировал отказ дрона $TARGET_PEER"
   else
-    echo -e "\033[0;33m[INFO]\033[0m Событие отказа в логе:"
+    echo -e "\033[0;31m[FAIL]\033[0m Дрон-агент 1 не зафиксировал отказ дрона $TARGET_PEER за время теста"
+    RESULT=1
   fi
 fi
 
 cleanup
 trap - EXIT
-echo "=== Failover тест завершен ==="
+echo "=== Failover тест завершен (код выхода $RESULT) ==="
+exit "$RESULT"

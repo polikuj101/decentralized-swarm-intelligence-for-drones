@@ -16,7 +16,8 @@ get_rss() {
 
 initial_rss=$(get_rss)
 if [ -z "$initial_rss" ] || [ "$initial_rss" -le 0 ]; then
-  initial_rss=100000
+  echo -e "\033[0;31m[FAIL]\033[0m Процессы агента не найдены: измерять нечего" >&2
+  exit 1
 fi
 echo "Начальный суммарный RSS процессов агента: $((initial_rss / 1024)) МБ"
 
@@ -35,6 +36,10 @@ done
 echo ""
 
 final_rss=$(get_rss)
+if [ -z "$final_rss" ] || [ "$final_rss" -le 0 ]; then
+  echo -e "\033[0;31m[FAIL]\033[0m Процессы агента пропали к концу теста (упали или контейнер остановлен)" >&2
+  exit 1
+fi
 diff_mb=$(( (final_rss - initial_rss) / 1024 ))
 
 echo "=== Результаты Soak-теста ==="

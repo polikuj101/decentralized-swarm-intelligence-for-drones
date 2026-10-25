@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "docker" / "drone-agent"))
 
+from swarm.bids import compute_bid
 from swarm.cbaa import CBAA
 
 def test_heading_alignment():
@@ -25,26 +26,20 @@ def test_heading_alignment():
     d2_pos = (90.0, 100.0)
     d2_vel = (-5.0, 0.0)
     
-    def calc_bid(pos, vel, target, base_weight=1.0):
+    def calc_bid(pos, vel, target):
         dx, dy = target[0] - pos[0], target[1] - pos[1]
-        dist = math.hypot(dx, dy)
-        s = base_weight / (1.0 + dist / 25.0)
-        
-        vx, vy = vel
-        vmag = math.hypot(vx, vy)
-        if vmag > 0.5 and dist > 2.0:
-            cos_theta = (vx * dx + vy * dy) / (vmag * dist)
-            s *= (1.0 + 0.25 * cos_theta)
-        return int(round(min(1.5, s) * 2700))
-    
+        return compute_bid("TARGET", math.hypot(dx, dy), dx, dy, vel[0], vel[1])      # та же функция, что у coordinator
+
     bid1 = calc_bid(d1_pos, d1_vel, target_pos)
     bid2 = calc_bid(d2_pos, d2_vel, target_pos)
-    
+    still = calc_bid(d1_pos, (0.0, 0.0), target_pos)
+
     print(f"Drone 1 (dist=20m, flying TOWARDS target): bid = {bid1}")
     print(f"Drone 2 (dist=10m, flying AWAY from target):    bid = {bid2}")
-    
-    # Drone 1 flying towards target should have a competitive or winning bid over retreating drone
-    print(f"Heading alignment correctly favored advancing vector!")
+
+    assert bid1 > still, "движение к цели должно повышать ставку"
+    assert bid2 < calc_bid(d2_pos, (0.0, 0.0), target_pos), "движение от цели должно понижать ставку"
+    assert bid1 > bid2, f"летящий к цели борт (20 м) должен обыграть удаляющийся (10 м): {bid1} <= {bid2}"
     print("PASS: Heading alignment verified.\n")
 
 def test_preemption_drop():

@@ -96,7 +96,8 @@ def run_merge_scenario_ros_only():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenario", choices=["merge", "failover"], default="merge")
+    ap.add_argument("--scenario", choices=["merge"], default="merge")     # failover раньше принимался, но не запускался
+    # NB: shm и ROS меряются в разных прогонах, поэтому порог 0.5 с сравним с разбросом самой сходимости; см. verify_ground_truth.py
     ap.add_argument("--runs", type=int, default=5)
     a = ap.parse_args()
 

@@ -17,6 +17,11 @@ case "$(uname -r)" in
         echo "info: $m (builtin or skipped under WSL2)"
       fi
     done
+    # Без netem/prio РЭБ-агент режет mesh через nftables; без nf_tables профили L1-L4 не применятся и тесты хаоса будут вхолостую.
+    if ! { lsmod | grep -q '^nf_tables' || { [ -r /proc/config.gz ] && zcat /proc/config.gz | grep -q '^CONFIG_NF_TABLES=[ym]'; }; }; then
+      fail "в ядре WSL нет ни netem, ни nf_tables: эмуляция потерь mesh (L1-L4) невозможна"
+    fi
+    echo "ok: nf_tables доступен (запасной механизм эмуляции mesh)"
     ;;
   *)
     for m in sch_netem sch_prio cls_u32 nf_tables; do

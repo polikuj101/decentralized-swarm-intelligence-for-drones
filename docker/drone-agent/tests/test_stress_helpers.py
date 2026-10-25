@@ -49,6 +49,12 @@ def test_empty_output_is_not_an_error(st):
     assert st.ew_agent_errors(reply("")) == []
 
 
+def test_nonzero_exit_is_an_error_even_with_empty_output(st):
+    """Регрессия: curl -f при недоступном ew-controller возвращает код != 0 и пустой stdout — раньше это выглядело как «ошибок нет»."""
+    errs = st.ew_agent_errors(reply("", rc=22))
+    assert len(errs) == 1 and "22" in errs[0]
+
+
 # -- Векторы 2-4: инъекция должна быть подтверждена наблюдаемым эффектом --
 
 def test_survivors_see_dead_requires_every_survivor_to_mark_them(st):
@@ -81,3 +87,37 @@ def test_cpu_limit_applied_matches_nanocpus(st):
 def test_rss_readings_valid_rejects_missing_process(st):
     assert st.rss_readings_valid({1: 120000, 2: 130000}, {1: 125000, 2: 131000}) is True
     assert st.rss_readings_valid({1: 0, 2: 130000}, {1: 125000, 2: 131000}) is False
+
+
+# -- Вердикты, которые раньше проходили вхолостую
+
+def test_reassignment_not_happening_is_a_failure(st):
+    """Регрессия: reassigned_at is None (задачу так и не переназначили) раньше считалось успехом."""
+    assert not st.reassignment_ok(task_before=8, declared_at=3.0, reassigned_at=None)
+    assert not st.reassignment_ok(task_before=8, declared_at=None, reassigned_at=None)
+
+
+def test_reassignment_within_limit_passes_and_slow_fails(st):
+    assert st.reassignment_ok(8, 3.0, 8.0)
+    assert not st.reassignment_ok(8, 3.0, 9.5)
+
+
+def test_reassignment_without_victim_task_has_nothing_to_check(st):
+    assert st.reassignment_ok(None, None, None)
+
+
+def test_agreed_winner_needs_every_board_and_one_value(st):
+    assert st.agreed_winner({1: 2, 2: 2, 3: 2}, 3) == 2
+    assert st.agreed_winner({1: 2, 2: 3, 3: 2}, 3) is None
+    assert st.agreed_winner({1: 2, 2: None, 3: 2}, 3) is None
+    assert st.agreed_winner({1: 2, 2: 2}, 3) is None
+
+
+def test_swarm_settled_requires_full_alive_and_single_epoch(st):
+    ok = {i: {"alive": [1, 2, 3], "epoch": 4} for i in (1, 2, 3)}
+    assert st.swarm_settled(ok, 3)
+    ok[2] = {"alive": [1, 2], "epoch": 4}
+    assert not st.swarm_settled(ok, 3)
+    split_epoch = {i: {"alive": [1, 2, 3], "epoch": 4 + (i == 3)} for i in (1, 2, 3)}
+    assert not st.swarm_settled(split_epoch, 3)
+    assert not st.swarm_settled({1: {}, 2: {}, 3: {}}, 3)

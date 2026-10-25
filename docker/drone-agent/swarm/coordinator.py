@@ -12,6 +12,7 @@ from std_msgs.msg import String
 import math
 from collections import deque
 from swarm import actions as A, common, wire
+from swarm.bids import compute_bid
 from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.manifest_check import manifest_problem
@@ -200,24 +201,10 @@ class Coordinator(Node):
         t = self.tasks[j]
         x, y, _ = self.pos()
         dx, dy = t.cx - x, t.cy - y
-        dist = math.hypot(dx, dy)
-        s = (1.0 if t.kind == "TARGET" else 0.8) / (1.0 + dist / 25.0)
-
-        # Векторное выравнивание по скорости (устраняет слепые зоны на границах секторов)
-        vx = float(self.nav.get("vx", 0.0))
-        vy = float(self.nav.get("vy", 0.0))
-        vmag = math.hypot(vx, vy)
-        if vmag > 0.5 and dist > 2.0:
-            cos_theta = (vx * dx + vy * dy) / (vmag * dist)
-            s *= (1.0 + 0.25 * cos_theta)
-
-        if self.nav_degraded():
-            s *= 0.6
-        if j == self.exec_task:
-            s *= 1.4
-        if self.prefer.get(j, 0.0) > now:
-            s *= 1.5
-        return max(1, int(round(min(1.5, s) * 2700)))
+        return compute_bid(t.kind, math.hypot(dx, dy), dx, dy,
+                           float(self.nav.get("vx", 0.0)), float(self.nav.get("vy", 0.0)),
+                           degraded=self.nav_degraded(), executing=(j == self.exec_task),
+                           preferred=self.prefer.get(j, 0.0) > now)
 
     def _track_x(self, now):
         if self.cbaa.x != self._x_last:
