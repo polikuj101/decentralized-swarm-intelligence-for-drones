@@ -84,6 +84,7 @@ class Coordinator(Node):
         self.manifest_file = os.environ.get("MANIFEST_FILE", "/opt/swarm/config/manifest.json")
         self.manifest_wait_timeout_s = 90.0
         self.active_zones, self.manifest, self.manifest_wait_t0 = None, None, now
+        self._manifest_poll = 0.0
         self.log("ожидание Task Manifest (NL-приказ оператора)...")
         self.create_timer(0.1, self.tick)
         self.log("coordinator started")
@@ -155,6 +156,30 @@ class Coordinator(Node):
             return True
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             return False
+
+    def _poll_manifest(self, now):
+        """Новый приказ оператора в уже летящем рое: раньше манифест читался один раз, повторный приказ молча игнорировался."""
+        if now - self._manifest_poll < 2.0:
+            return
+        self._manifest_poll = now
+        try:
+            with open(self.manifest_file, "r", encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if manifest_problem(m, common.COLS * common.ROWS) or m.get("manifest_id") == (self.manifest or {}).get("manifest_id"):
+            return
+        new = set(m["active_sectors"])
+        changed = new != self.active_zones
+        self.manifest = m
+        if not changed:
+            self.log(f"manifest {m.get('manifest_id')} принят: сектора те же {sorted(new)}")
+            return
+        self.active_zones, self.mission_done_sent = new, False
+        self.override, self.exec_task = None, None
+        self._send_goal("HOLD")
+        self.log(f"manifest {m.get('manifest_id')} принят в полёте: zones={m.get('zones_named')} sectors={sorted(new)}")
+        self.bump("new-manifest", now)
 
     def _zone_of(self, j):
         if j < common.COLS * common.ROWS:
@@ -470,6 +495,7 @@ class Coordinator(Node):
                     self.active_zones = set(range(common.COLS * common.ROWS))
                     self.log("manifest timeout -> fallback: все сектора активны")
                 self.reset_cbaa(now)
+            self._poll_manifest(now)
             self._liveness(now)
             self._exec(now)
             self._tx(now)
@@ -630,6 +656,10 @@ class Coordinator(Node):
               "peers": peers, "events": list(self.events)[-10:], "last_cmd": self.last_cmd,
               "override": self.override["kind"] if self.override else None, "withdrawn": self.withdrawn,
               "phase": self.phase.value,
+              "manifest": ({"id": self.manifest.get("manifest_id"), "sectors": sorted(self.active_zones),
+                            "on_target": self.manifest.get("on_target"), "source": "operator"}
+                           if self.manifest else
+                           {"id": None, "sectors": sorted(self.active_zones or []), "source": "fallback" if self.active_zones else "waiting"}),
               "mesh": {"ready": self.mesh.ready, "tuned": self.mesh.tuned, "zenoh_peers": self.mesh.peers_connected(),
                        "dropped": self.dropped, "bad_tag": self.bad_tag, "tx_bytes": self.mesh.tx_bytes}}
         payload = json.dumps(st)

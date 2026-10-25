@@ -46,7 +46,7 @@ main{display:grid;grid-template-columns:1fr 440px;grid-template-rows:minmax(380p
 .fi .tool{color:#9ad1ff;margin-right:6px}.fi .args{color:var(--dim);margin-right:8px}
 .fi .why{margin-left:22px;color:#b8c4d3}.fi .why.err{color:#e0a458}
 .fi .v{padding:0 6px;border-radius:8px;font-size:11px}
-.v.ACCEPTED{background:#1e5b3a}.v.REJECTED{background:#6b5410}.v.FALLBACK{background:#5a2323}.v.NOOP{background:#3b4654}
+.v.ACCEPTED,.v.APPLIED{background:#1e5b3a}.v.UNCONFIRMED{background:#7a5a10}.v.REJECTED{background:#6b5410}.v.FALLBACK{background:#5a2323}.v.NOOP{background:#3b4654}
 .src{padding:0 5px;border-radius:7px;font-size:10px;margin-right:5px}.src.S1{background:#1b4b6b}.src.S2{background:#5b3a7a}
 .fi.event{color:var(--dim)}
 .b{padding:1px 8px;border-radius:9px;font-weight:600;font-size:11px;margin-left:4px;display:inline-block}

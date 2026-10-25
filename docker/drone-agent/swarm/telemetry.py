@@ -13,6 +13,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from swarm import common
+from swarm.verdicts import VerdictResolver
 
 URL = os.environ.get("HUD_URL", "http://172.33.0.5:8000/api/ingest") + f"/{common.DRONE_ID}"
 TOKEN = os.environ.get("EW_TOKEN", "")
@@ -23,6 +24,7 @@ class Tele(Node):
         super().__init__("telemetry")
         self.state, self.thoughts, self.llm = None, deque(maxlen=40), {}
         self.s1, self.phase = {}, "NOMINAL"
+        self.verdicts = VerdictResolver()
         self.q = queue.Queue(maxsize=4)
         self.create_subscription(String, "/swarm/local/state", self._on_state, 10)
         self.create_subscription(String, "/swarm/local/phase", self._on_phase, 10)
@@ -43,6 +45,12 @@ class Tele(Node):
         except (ValueError, KeyError, json.JSONDecodeError):
             pass
 
+    def _add_thought(self, d):
+        th = {k: d.get(k) for k in ("id", "source", "t", "trigger", "reasoning", "tool", "args", "verdict", "reason", "latency_ms")}
+        ready = self.verdicts.add(th, time.monotonic())
+        if ready is not None:
+            self.thoughts.append(ready)
+
     def _on_s1(self, m):
         try:
             d = json.loads(m.data)
@@ -51,14 +59,14 @@ class Tele(Node):
         if d.get("kind") == "stats":
             self.s1 = d
         else:
-            self.thoughts.append({k: d.get(k) for k in ("id", "source", "t", "trigger", "reasoning", "tool", "args", "verdict", "reason", "latency_ms")})
+            self._add_thought(d)
 
     def _on_log(self, m):
         try:
             d = json.loads(m.data)
         except json.JSONDecodeError:
             return
-        self.thoughts.append({k: d.get(k) for k in ("id", "source", "t", "trigger", "reasoning", "tool", "args", "verdict", "reason", "latency_ms")})
+        self._add_thought(d)
         self.llm = {"stats": d.get("stats", {}), "last_latency_ms": d.get("latency_ms"),
                     "model": "qwen2.5-" + os.environ.get("QWEN_VARIANT", "0.5b") + "-instruct-q4_k_m"}
 
@@ -66,9 +74,11 @@ class Tele(Node):
         s = self.state
         if not s:
             return
+        self.verdicts.observe(s.get("last_cmd"))
+        self.thoughts.extend(self.verdicts.drain(time.monotonic()))
         pkt = {"v": 1, "drone": common.DRONE_ID, "ts": time.time(), "pos": s["pos"], "nav": s["nav"],
                "swarm": {k: s[k] for k in ("epoch", "task_name", "winners", "done", "open", "alive", "peers", "events",
-                                           "withdrawn", "last_cmd", "total_tasks")},
+                                           "withdrawn", "last_cmd", "total_tasks", "manifest")},
                "mesh": {"link_q": s["link_q"], "periods": s["periods"], "heard": s["heard"], **s["mesh"]},
                "llm": self.llm, "thoughts": list(self.thoughts),
                "phase": self.phase, "s1": self.s1}

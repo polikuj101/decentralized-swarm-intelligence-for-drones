@@ -324,6 +324,30 @@ function buildCtrl() {
 }
 
 // ───────────── Commander Tasking & BDA Evidence ─────────────
+// Координатор читает манифест сам; «принят» = борт в телеметрии отдаёт те же active_sectors (не просто HTTP 200 от компиляции).
+async function confirmManifest(expected, st) {
+  const want = JSON.stringify([...expected].sort((a, b) => a - b));
+  let accepted = [];
+  for (let k = 0; k < 15; k++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const s = await (await fetch("/api/state")).json();
+      accepted = Object.entries(s.drones || {}).filter(([, d]) => {
+        const m = ((d.pkt || {}).swarm || {}).manifest;
+        return m && m.source === "operator" && JSON.stringify([...(m.sectors || [])].sort((a, b) => a - b)) === want;
+      }).map(([i]) => i);
+    } catch (e) { continue; }
+    if (accepted.length === N) break;
+  }
+  if (accepted.length === N) {
+    st.textContent = `Манифест принят координаторами всех бортов (${N}/${N})`;
+    st.className = "cmd-badge ready";
+  } else {
+    const miss = []; for (let i = 1; i <= N; i++) if (!accepted.includes(String(i))) miss.push("D" + i);
+    st.textContent = `НЕ принят координаторами: ${miss.join(", ")} (принято ${accepted.length}/${N})`;
+    st.className = "cmd-badge";
+  }
+}
 function buildTasking() {
   const btn = $("cmd-send");
   const inp = $("cmd-input");
@@ -351,17 +375,30 @@ function buildTasking() {
         st.className = "cmd-badge";
         return;
       }
-      const okCount = (data.results || []).filter(r => r.ok).length;
-      st.textContent = `Манифест согласован (${okCount}/${N} бортов)`;
-      st.className = "cmd-badge ready";
-
-      const firstOk = (data.results || []).find(r => r.ok && r.body);
-      if (firstOk && firstOk.body) {
+      const oks = (data.results || []).filter(r => r.ok && r.body);
+      const sig = (b) => JSON.stringify([b.active_sectors, b.on_target, b.dwell_s, b.rtb_on_complete]);
+      const sigs = new Set(oks.map(r => sig(r.body)));
+      const firstOk = oks[0];
+      if (firstOk) {
         const b = firstOk.body;
         card.style.display = "block";
-        card.innerHTML = `<b>Скомпилированный Task Manifest:</b> Зоны: <code>[${(b.zones_named || []).join(", ")}]</code> (сектора ${(b.active_sectors || []).join(",")}) | ` +
-                         `При контакте: <code>${b.on_target}</code> (${b.dwell_s}с) | RTB: <code>${b.rtb_on_complete}</code> | ` +
-                         `Инференс: <code>${b.latency_ms} мс</code>`;
+        card.replaceChildren(
+          mk("b", null, "Скомпилированный Task Manifest: "),
+          document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (сектора ${(b.active_sectors || []).join(",")}) | ` +
+            `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
+          mk("br"),
+          mk("span", "dim", "Имена зон → сектора заданы инженерами в таблице, а не выводятся из карты; цели на карте известны заранее."));
+      }
+      if (!oks.length) {
+        st.textContent = `Манифест не скомпилирован ни на одном борту (0/${N})`;
+        st.className = "cmd-badge";
+      } else if (sigs.size > 1) {
+        st.textContent = `ВНИМАНИЕ: борты скомпилировали РАЗНЫЕ манифесты (${sigs.size} варианта), принято ответов ${oks.length}/${N}`;
+        st.className = "cmd-badge";
+      } else {
+        st.textContent = `Скомпилирован на ${oks.length}/${N} бортах, жду подтверждения координаторов…`;
+        st.className = "cmd-badge compiling";
+        confirmManifest(firstOk.body.active_sectors || [], st);
       }
     } catch (e) {
       btn.disabled = false;
@@ -394,13 +431,14 @@ async function pollEvidence() {
         img.alt = `Target T${c.target_id}`;
 
         const body = mk("div", "ev-body");
-        const head = mk("div", "ev-head", `Цель T${c.target_id} (Борт D${c.drone})`);
-        const pos = mk("div", null, `ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.local_enu_m.z}м) | Дистанция: ${c.dist_to_target_m}м`);
+        const head = mk("div", "ev-head", `Ближайшая известная цель T${c.target_id} (Борт D${c.drone})`);
+        const pos = mk("div", null, `ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.local_enu_m.z}м) | До заранее известной точки цели: ${c.dist_to_target_m}м`);
         const geo = mk("div", "dim", `Координаты: ${c.approx_latlon.lat}°, ${c.approx_latlon.lon}°`);
         const src = mk("div", "dim", `Источник: ${c.nav_source || "VIO/DR"} (GPS fix: ${c.gps_fix || "denied"}) | Фото: ${c.image_bytes}B`);
         const note = mk("div", "ev-note", `* ${c.approx_latlon.note}`);
+        const idn = mk("div", "ev-note", "* Цель определена по карте сцены (позиция борта → ближайшая известная цель), а не распознана на снимке.");
 
-        body.append(head, pos, geo, src, note);
+        body.append(head, pos, geo, src, note, idn);
         d.append(img, body);
         gal.append(d);
       }
