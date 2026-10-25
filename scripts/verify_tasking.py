@@ -67,7 +67,7 @@ FIELD_LABEL = {"active_sectors": "зоны", "on_target": "on_target", "dwell_s"
 REPEAT_CASE = 0          # этот приказ повторяется для проверки детерминизма
 REPEATS = 3
 AGENTS = [f"swarm-sitl-drone-agent-{i}-1" for i in range(1, 6)]
-MANIFEST_PATH = "/opt/swarm/config/manifest.json"
+MANIFEST_PATHS = ("/opt/swarm/state/manifest-{n}.json", "/opt/swarm/config/manifest.json")   # том agent-state, затем старое место
 
 
 def post(url: str, prompt: str):
@@ -113,11 +113,14 @@ def run_case(url: str, prompt: str, expected: dict, lat: list) -> dict:
 
 
 def read_manifest(container: str):
-    try:
-        raw = subprocess.run(["docker", "exec", container, "cat", MANIFEST_PATH], capture_output=True, text=True, timeout=10).stdout
-        return json.loads(raw)
-    except Exception:  # noqa: BLE001
-        return None
+    n = container.split("-")[-2]
+    for path in MANIFEST_PATHS:
+        try:
+            raw = subprocess.run(["docker", "exec", container, "cat", path.format(n=n)], capture_output=True, text=True, timeout=10).stdout
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def pct(a: int, b: int) -> str:
