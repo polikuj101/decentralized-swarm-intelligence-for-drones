@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from swarm.orders import needs_rebuild, order_params, target_dwell_s, task_enabled  # noqa: E402
+from swarm.orders import manifest_signature, needs_rebuild, order_params, target_dwell_s, task_enabled  # noqa: E402
 
 
 def m(**kw):
@@ -53,3 +53,18 @@ def test_only_skip_change_rebuilds_the_auction():
     assert not needs_rebuild(base, order_params(m(dwell_s=3, rtb_on_complete=False)))
     assert not needs_rebuild(base, order_params(m(on_target="DWELL_ONLY")))
     assert needs_rebuild(base, order_params(m(on_target="SKIP")))
+
+
+def test_same_id_with_different_content_is_a_different_manifest():
+    """Регрессия (ревью): выровненный манифест несёт id большинства; борт с тем же id, но другим rtb, обязан его принять."""
+    a, b = m(rtb_on_complete=True), m(rtb_on_complete=False)
+    a["manifest_id"] = b["manifest_id"] = "m-1"
+    assert manifest_signature(a) != manifest_signature(b)
+
+
+def test_sector_order_is_not_a_difference():
+    assert manifest_signature(m(active_sectors=[1, 0])) == manifest_signature(m(active_sectors=[0, 1]))
+
+
+def test_signature_of_missing_manifest_is_stable():
+    assert manifest_signature(None) == manifest_signature({})

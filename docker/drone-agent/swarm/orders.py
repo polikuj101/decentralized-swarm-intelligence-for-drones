@@ -27,6 +27,13 @@ def target_dwell_s(kind: str, params: dict) -> float:
     return params["dwell_s"] if kind == "TARGET" else 0.0
 
 
+def manifest_signature(m) -> tuple:
+    """Содержимое приказа, влияющее на поведение. manifest_id для новизны недостаточен: две компиляции в одну секунду
+    получают один id, а выровненный манифест несёт id большинства."""
+    m = m or {}
+    return (tuple(sorted(m.get("active_sectors") or [])), m.get("on_target"), m.get("dwell_s"), m.get("rtb_on_complete"))
+
+
 def needs_rebuild(old: dict, new: dict) -> bool:
     """Нужно ли пересобрать аукцион: только если изменился набор открытых задач (SKIP)."""
     return old["skip_targets"] != new["skip_targets"]

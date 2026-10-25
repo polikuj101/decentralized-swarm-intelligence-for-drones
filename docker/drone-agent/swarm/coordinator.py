@@ -17,7 +17,7 @@ from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
-from swarm.orders import needs_rebuild, order_params, target_dwell_s, task_enabled
+from swarm.orders import manifest_signature, needs_rebuild, order_params, target_dwell_s, task_enabled
 from swarm.replay import SeqFilter
 from swarm.supervise import withdraw_clearable
 
@@ -175,8 +175,10 @@ class Coordinator(Node):
                 m = json.load(f)
         except (OSError, json.JSONDecodeError):
             return
-        if manifest_problem(m, common.COLS * common.ROWS) or m.get("manifest_id") == (self.manifest or {}).get("manifest_id"):
+        if manifest_problem(m, common.COLS * common.ROWS):
             return
+        if m.get("manifest_id") == (self.manifest or {}).get("manifest_id") and manifest_signature(m) == manifest_signature(self.manifest):
+            return                                  # тот же id и то же содержимое; один id с другим содержимым — это новый приказ
         new = set(m["active_sectors"])
         new_params = order_params(m, common.MISSION.get("target_dwell_s", 5.0))
         changed = new != self.active_zones or needs_rebuild(self.params, new_params)

@@ -325,7 +325,8 @@ function buildCtrl() {
 
 // ───────────── Commander Tasking & BDA Evidence ─────────────
 // Координатор читает манифест сам; «принят» = борт в телеметрии отдаёт те же active_sectors (не просто HTTP 200 от компиляции).
-async function confirmManifest(expected, st) {
+async function confirmManifest(man, st) {
+  const expected = man.active_sectors || [];
   const want = JSON.stringify([...expected].sort((a, b) => a - b));
   let accepted = [];
   for (let k = 0; k < 15; k++) {
@@ -334,7 +335,9 @@ async function confirmManifest(expected, st) {
       const s = await (await fetch("/api/state")).json();
       accepted = Object.entries(s.drones || {}).filter(([, d]) => {
         const m = ((d.pkt || {}).swarm || {}).manifest;
-        return m && m.source === "operator" && JSON.stringify([...(m.sectors || [])].sort((a, b) => a - b)) === want;
+        const e = (m && m.effective) || {};
+        return m && m.source === "operator" && JSON.stringify([...(m.sectors || [])].sort((a, b) => a - b)) === want &&
+          e.on_target === man.on_target && e.dwell_s === man.dwell_s && e.rtb === man.rtb_on_complete;
       }).map(([i]) => i);
     } catch (e) { continue; }
     if (accepted.length === N) break;
@@ -400,7 +403,7 @@ function buildTasking() {
         const note = dis.length ? ` · D${dis.join(",D")} скомпилировали иначе, ${fixed.length === dis.length ? "выровнены по большинству" : "НЕ выровнены"}` : "";
         st.textContent = `Скомпилирован на ${oks.length}/${N} бортах${note}, жду подтверждения координаторов…`;
         st.className = "cmd-badge compiling";
-        confirmManifest(firstOk.body.active_sectors || [], st);
+        confirmManifest(firstOk.body, st);
       }
     } catch (e) {
       btn.disabled = false;
