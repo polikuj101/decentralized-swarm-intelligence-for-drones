@@ -536,7 +536,11 @@ def v5_bid_collision() -> Result:
         "winner_id": last_winner,
     }
     res.verdict = "PASS" if (converged and flaps <= 2 and deterministic_winner) else "FAIL"
-    res.notes = "flaps <= 2 допускает первичное согласование; детерминизм CBAA соблюден"
+    if res.verdict == "PASS":
+        res.notes = "flaps <= 2 допускает первичное согласование; детерминизм CBAA соблюден"
+    else:
+        res.notes = ("победитель задачи id 8 (T2) не наблюдался или флапал: проверьте, что такая задача есть в winners "
+                     "(на неподнятом рое набор задач другой), и что рой действительно торгует")
     return res
 
 
