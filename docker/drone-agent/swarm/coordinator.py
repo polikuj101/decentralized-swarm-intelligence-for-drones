@@ -22,6 +22,7 @@ from swarm.supervise import withdraw_clearable
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
 T_DEAD, T_SUSPECT, SETTLE_S = 3.5, 3.0, 2.0
+AUTO_RESUME = os.environ.get("SWARM_AUTO_RESUME", "0") == "1"       # снятие отзыва (RETURN_HOME) без команды оператора — только по явному включению
 STATE_CODE = {"IDLE": 0, "TAKEOFF": 1, "NAV": 2, "HOLD": 3, "DWELL": 4, "RTB": 5, "LANDED": 6}
 CODE_STATE = {v: k for k, v in STATE_CODE.items()}
 
@@ -371,6 +372,8 @@ class Coordinator(Node):
 
     def _apply_cmd(self, cmd, now):
         tool, a = cmd.get("tool"), cmd.get("args", {})
+        if self.withdrawn and tool in ("HOLD_SECTOR", "EVADE_JAMMING", "NAVIGATE_TO", "SCAN_TARGET", "SPLIT_SECTOR"):
+            return False, "withdrawn: движение/задачи запрещены после RETURN_HOME"
         if tool in ("HOLD_SECTOR", "EVADE_JAMMING", "NAVIGATE_TO") and self.override:
             return False, "busy: override active"
         if tool == "HOLD_SECTOR":
@@ -487,7 +490,7 @@ class Coordinator(Node):
                     self.log("manifest timeout -> fallback: все сектора активны")
                 self.reset_cbaa(now)
             self._poll_manifest(now)
-            if withdraw_clearable(self.withdrawn, self.phase == A.Phase.NOMINAL, now - self.phase_t):
+            if AUTO_RESUME and withdraw_clearable(self.withdrawn, self.phase == A.Phase.NOMINAL, now - self.phase_t):
                 self.withdrawn, self.mission_done_sent, self.exec_task = False, False, None
                 self.log("withdraw cleared: фаза NOMINAL устойчива, борт возвращается в работу")
                 self.bump("withdraw-cleared", now)

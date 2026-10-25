@@ -2,6 +2,7 @@
 """flight_ctrl: offboard-управление PX4 по скорости, навигация по целям от coordinator, обход, монитор GPS."""
 import json
 import math
+import os
 import time
 from collections import deque
 
@@ -20,6 +21,7 @@ from swarm.supervise import DisarmWatch
 MS = common.MISSION
 VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, common.ALT
 KP, KZ, VZ_UP, VZ_DN = 0.8, 1.0, 1.2, 0.8
+AUTO_REARM = os.environ.get("FLIGHT_AUTO_REARM", "0") == "1"       # по умолчанию борт после разоружения/посадки сам не взлетает
 R_AVOID, R_STOP, K_REP = 4.0, 1.3, 2.0
 PX4_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                      history=HistoryPolicy.KEEP_LAST, depth=1)
@@ -81,7 +83,7 @@ class Flight(Node):
         if g.get("seq") == self.seq:
             return
         self.goal, self.seq, self.idx, self.done, self.dwell_t0 = g, g["seq"], 0, False, None
-        if self.state in ("LAND", "LANDED") and g.get("kind") == "WAYPOINTS":      # отзыв снят: борт возвращается к работе
+        if AUTO_REARM and self.state == "LANDED" and g.get("kind") == "WAYPOINTS":      # только по явному разрешению оператора
             self.get_logger().info("new waypoints after landing -> WAIT (re-arm and take off)")
             self.state, self.label, self.ready_t = "WAIT", "IDLE", None
 
@@ -202,8 +204,9 @@ class Flight(Node):
         st = self.state
         if st in ("TAKEOFF", "FLY") and self.vs is not None and self.disarm.update(self.vs.arming_state == 2, now):
             # PX4 разоружился после взлёта: раньше борт оставался в FLY и продолжал показывать NAV, сидя на земле
-            self.get_logger().warning("PX4 disarmed after takeoff -> back to WAIT (re-arm and take off)")
-            self.state, self.label, self.done, self.ready_t = "WAIT", "GROUNDED", False, None
+            # Разоружение могло быть аварийным (failsafe, kill switch): сами заново не взводим, если оператор не включил FLIGHT_AUTO_REARM=1
+            self.get_logger().warning("PX4 disarmed after takeoff -> " + ("re-arm" if AUTO_REARM else "GROUNDED, no automatic re-arm"))
+            self.state, self.label, self.done, self.ready_t = ("WAIT" if AUTO_REARM else "GROUNDED"), "GROUNDED", False, None
             self.disarm.reset()
             st = self.state
         if st == "WAIT":
