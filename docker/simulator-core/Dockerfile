@@ -15,6 +15,13 @@ RUN wget -q https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings
  && apt-get install -y --no-install-recommends gz-harmonic python3-gz-transport13 python3-gz-msgs10 \
  && rm -rf /var/lib/apt/lists/*
 
+# Mesa с исправлением утечки в d3d12 (кэш command signature), см. mesa/README.md
+COPY mesa/*.deb /tmp/mesa/
+RUN dpkg -i /tmp/mesa/*.deb \
+ && apt-mark hold libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libglapi-mesa libgbm1 \
+ && dpkg-query -W -f='${Package} ${Version}\n' libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libglapi-mesa libgbm1 | grep -c '+swarm1$' | grep -qx 5 \
+ && rm -rf /tmp/mesa
+
 RUN pip3 install --no-cache-dir "fastapi==0.115.*" "uvicorn[standard]==0.30.*" "pydantic==2.*"
 
 # Модели из PX4 (меши x500_base) скопированы локально в контекст сборки

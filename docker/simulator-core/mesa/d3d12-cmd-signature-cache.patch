@@ -1,0 +1,19 @@
+d3d12: искать command signature в кэше по key, а не по &key
+
+_mesa_hash_table_search получал адрес указателя на стеке, поэтому кэш
+никогда не срабатывал: каждый косвенный draw-вызов (ExecuteIndirect, его
+использует Ogre-next GL3Plus) создавал новый ID3D12CommandSignature, который
+освобождался только вместе с контекстом. В gz-sim это давало ~130 МБ/мин
+утечки (docs/gz_leak/REPORT.md). Та же строка есть и в Mesa 26.2.5.
+
+--- a/src/gallium/drivers/d3d12/d3d12_cmd_signature.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_cmd_signature.cpp
+@@ -65,7 +65,7 @@ ID3D12CommandSignature *
+ d3d12_get_cmd_signature(struct d3d12_context *ctx,
+                             const struct d3d12_cmd_signature_key *key)
+ {
+-   struct hash_entry *entry = _mesa_hash_table_search(ctx->cmd_signature_cache, &key);
++   struct hash_entry *entry = _mesa_hash_table_search(ctx->cmd_signature_cache, key);
+    
+    if (!entry) {
+       struct d3d12_cmd_signature *data =
