@@ -439,15 +439,31 @@ async function pollEvidence() {
         const d = mk("div", "ev-card");
         const img = mk("img", "ev-thumb");
         img.src = `/api/evidence/${c.id}/image`;
-        img.alt = `Target T${c.target_id}`;
+        const det = c.detection;
+        img.alt = det ? `Диск в кадре, D${c.drone}` : `Кадр D${c.drone}`;
 
         const body = mk("div", "ev-body");
-        const head = mk("div", "ev-head", `Ближайшая известная цель T${c.target_id} (Борт D${c.drone})`);
-        const pos = mk("div", null, `ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.local_enu_m.z}м) | До заранее известной точки цели: ${c.dist_to_target_m}м`);
+        let head, pos, idn;
+        if (!("detection" in c)) {   // карточки до детектора: цель бралась по карте сцены
+          head = mk("div", "ev-head", `Ближайшая известная цель T${c.target_id} (Борт D${c.drone})`);
+          pos = mk("div", null, `ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.local_enu_m.z}м) | До заранее известной точки цели: ${c.dist_to_target_m}м`);
+          idn = mk("div", "ev-note", "* Цель определена по карте сцены (позиция борта → ближайшая известная цель), а не распознана на снимке.");
+        } else if (det) {
+          const match = c.target_id !== null && c.target_id !== undefined
+            ? `совпадает с целью T${c.target_id} (${c.dist_to_target_m} м)` : "рядом нет известной цели";
+          head = mk("div", "ev-head", `Обнаружен ${det.tone} диск в кадре · ${match} (Борт D${c.drone})`);
+          const at = c.detected_enu_m ? `диск в ENU (${c.detected_enu_m.x}, ${c.detected_enu_m.y})` : "положение диска не оценено (нет высоты/курса)";
+          pos = mk("div", null, `Борт ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.height_m ?? c.local_enu_m.z}м) | ${at} | r=${det.r_px}px`);
+          idn = mk("div", "ev-note", "* Обнаружение — детектор диска на кадре (окружность-граница, радиус по дальномеру); цвет по чёрно-белой камере не определяется.");
+        } else {
+          const near = c.nearest_known_target || {};
+          head = mk("div", "ev-head", `Цель в кадре не обнаружена (Борт D${c.drone})`);
+          pos = mk("div", null, `Борт ENU: (${c.local_enu_m.x}, ${c.local_enu_m.y}, h=${c.height_m ?? c.local_enu_m.z}м) | ближайшая известная цель T${near.id}: ${near.dist_m} м`);
+          idn = mk("div", "ev-note", "* Борт был в точке задачи, но детектор не нашёл диск на кадрах за время зависания.");
+        }
         const geo = mk("div", "dim", `Координаты: ${c.approx_latlon.lat}°, ${c.approx_latlon.lon}°`);
         const src = mk("div", "dim", `Источник: ${c.nav_source || "VIO/DR"} (GPS fix: ${c.gps_fix || "denied"}) | Фото: ${c.image_bytes}B`);
         const note = mk("div", "ev-note", `* ${c.approx_latlon.note}`);
-        const idn = mk("div", "ev-note", "* Цель определена по карте сцены (позиция борта → ближайшая известная цель), а не распознана на снимке.");
 
         body.append(head, pos, geo, src, note, idn);
         d.append(img, body);
