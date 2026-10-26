@@ -6,13 +6,29 @@ ARG PX4_MSGS_REF=release/1.15
 ARG GGML_FLAGS="-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
 
 # ───────── stage 1: llama.cpp + модель ─────────
-# ВНИМАНИЕ (аудит 2026-10-25): это не сборка llama.cpp, а копирование llama-server и model.gguf из ПРЕДЫДУЩЕГО образа
-# swarm/drone-agent:latest. На чистой машине образ не соберётся, а ARG LLAMA_CPP_REF/GGML_FLAGS выше не используются.
-# TODO: собрать llama.cpp из LLAMA_CPP_REF в отдельной стадии и брать модель с проверкой контрольной суммы.
-FROM swarm/drone-agent:latest AS llama
-RUN mkdir -p /src/build/bin \
- && cp /usr/local/bin/llama-server /src/build/bin/llama-server \
- && cp /opt/models/model.gguf /model.gguf
+# Сборка из исходников тега LLAMA_CPP_REF (так был собран образ 15.10: «version: 0 (unknown)» — сборка из архива без git).
+# Модель — официальный GGUF Qwen с проверкой sha256 (значения из LFS-указателей Hugging Face; модель в образе 15.10 совпадает с 0.5b).
+FROM ubuntu:22.04 AS llama
+ARG DEBIAN_FRONTEND=noninteractive
+ARG LLAMA_CPP_REF
+ARG QWEN_VARIANT
+ARG GGML_FLAGS
+RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /src \
+ && curl -4 -fL --retry 5 --retry-delay 3 "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMA_CPP_REF}.tar.gz" | tar -xz --strip-components=1 -C /src \
+ && cmake -S /src -B /src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_CURL=OFF ${GGML_FLAGS} \
+ && cmake --build /src/build --target llama-server -j8
+RUN case "${QWEN_VARIANT}" in \
+      0.5b) R=Qwen/Qwen2.5-0.5B-Instruct-GGUF; F=qwen2.5-0.5b-instruct-q4_k_m.gguf; \
+            SHA=74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db ;; \
+      1.5b) R=Qwen/Qwen2.5-1.5B-Instruct-GGUF; F=qwen2.5-1.5b-instruct-q4_k_m.gguf; \
+            SHA=6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e ;; \
+      *) echo "QWEN_VARIANT must be 0.5b or 1.5b"; exit 1 ;; esac \
+ && curl -4 -fL --retry 5 --retry-delay 3 -o /model.gguf "https://huggingface.co/${R}/resolve/main/${F}" \
+ && echo "${SHA}  /model.gguf" | sha256sum --strict --check
 
 # ───────── stage 2: XRCE-агент, mavlink-router, px4_msgs ─────────
 FROM ros:humble-ros-base-jammy AS rosbuild
@@ -60,7 +76,7 @@ COPY --from=llama /src/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=llama /model.gguf /opt/models/model.gguf
 RUN echo "/opt/ros/humble/lib" > /etc/ld.so.conf.d/ros.conf && ldconfig
 
-COPY grammar/actions.gbnf /opt/grammar/actions.gbnf
+COPY grammar/ /opt/grammar/
 COPY dds/fastdds_loopback.xml /opt/dds/fastdds_loopback.xml
 COPY ew/ew_agent.py /opt/ew/ew_agent.py
 COPY ew/ew-tc.sh /usr/local/bin/ew-tc.sh
