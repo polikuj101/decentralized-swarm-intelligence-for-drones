@@ -165,4 +165,33 @@ if MARK not in c:
     c = call.sub(lambda m: f"{m.group(1)}swarm_apply_gps_jam(sensor_gps); // {MARK}\n{m.group(0)}", c)
     cpp.write_text(c)
 print(f"P4 {cpp.stem} GPS jam: ok")
+
+# ── P5. uxrce_dds_client: пересоздать сессию, если передача встала ────────────────────────────
+# После перезапуска только агента (при живом PX4) новый агент отвечает на пинги (они работают и без сессии), поэтому клиент не считает
+# себя отключённым, но старой сессии агент не знает: надёжный поток упирается в неподтверждённые пакеты, Payload tx = 0 B/s, борт не
+# получает команд (живые прогоны 2026-10-26). Клиент всегда что-то публикует (vehicle_status и др. не реже 1 Гц), так что нулевая
+# передача дольше 5 с — признак мёртвой сессии: разрываем её, клиент заново создаёт сессию с новым агентом.
+dds_cpp = need(ROOT / "src/modules/uxrce_dds_client/uxrce_dds_client.cpp")
+c = dds_cpp.read_text()
+if MARK not in c:
+    decl = re.compile(r"^([ \t]*)int poll_error_counter = 0;[ \t]*$", re.M)
+    if len(decl.findall(c)) != 1:
+        die("uxrce_dds_client.cpp: ожидалось одно объявление 'int poll_error_counter = 0;' перед циклом сессии")
+    c = decl.sub(lambda m: f"{m.group(0)}\n{m.group(1)}hrt_abstime tx_stall_since = 0; // {MARK}", c)
+    rates = re.compile(r"^([ \t]*)last_status_update = now;\n[ \t]*\}\n", re.M)
+    if len(rates.findall(c)) != 1:
+        die("uxrce_dds_client.cpp: ожидался один блок пересчёта _last_payload_tx_rate с 'last_status_update = now;'")
+
+    def stall(m):
+        ind = m.group(1)[:-1]          # отступ уровня цикла (блок if на табуляцию глубже)
+        return (m.group(0) +
+                f"{ind}// {MARK}: передача встала при «живых» пингах — сессия мертва, пересоздаём\n"
+                f"{ind}if (_last_payload_tx_rate > 0) {{\n{ind}\ttx_stall_since = 0;\n\n"
+                f"{ind}}} else if (tx_stall_since == 0) {{\n{ind}\ttx_stall_since = now;\n\n"
+                f"{ind}}} else if (now - tx_stall_since > 5_s) {{\n"
+                f"{ind}\tPX4_WARN(\"payload tx stalled for 5 s while the agent answers pings: recreating session\");\n"
+                f"{ind}\t_connected = false;\n{ind}}}\n\n")
+    c = rates.sub(stall, c)
+    dds_cpp.write_text(c)
+print("P5 uxrce_dds_client stalled-session reconnect: ok")
 print("ALL PATCHES APPLIED")
