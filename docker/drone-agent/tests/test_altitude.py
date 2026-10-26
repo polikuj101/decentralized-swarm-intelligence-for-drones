@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from swarm.altitude import fused_height, smooth_alpha, vio_outlier  # noqa: E402
+from swarm.altitude import fused_height, object_below, smooth_alpha, vio_jump, vio_outlier  # noqa: E402
 
 
 def test_fresh_lidar_wins_over_a_biased_ekf():
@@ -128,3 +128,39 @@ def test_inf_with_ekf_far_above_ground_means_high():
     f = _fuser(); f.update_over_range(10.0)
     z, src = f.height(30.0, 10.2)
     assert src == "over" and z > 20.0
+
+
+def test_vio_without_history_is_not_a_jump():
+    assert not vio_jump(2.0, 0.0, [], now=10.0)
+
+
+def test_vio_consistent_with_recent_accepted_is_kept():
+    recent = [(9.8, 1.0, 0.2), (9.9, 1.1, 0.1), (10.0, 1.0, 0.0)]
+    assert not vio_jump(1.3, 0.1, recent, now=10.07)
+
+
+def test_vio_jump_away_from_recent_accepted_is_rejected():
+    """Ложный пик фазовой корреляции: 3 м/с в другую сторону за один кадр."""
+    recent = [(9.8, 1.0, 0.2), (9.9, 1.1, 0.1), (10.0, 1.0, 0.0)]
+    assert vio_jump(-1.5, 2.5, recent, now=10.07)
+
+
+def test_old_reference_allows_larger_change():
+    """После паузы в кадрах борт мог разогнаться: допуск растёт с возрастом опоры."""
+    recent = [(9.0, 0.0, 0.0)]
+    assert vio_jump(2.5, 0.0, recent, now=9.1)
+    assert not vio_jump(2.5, 0.0, recent, now=9.5)
+
+
+def test_drone_passing_below_is_an_object_not_ground():
+    assert object_below(3.2, 6.2, 0.0, 0.05)          # D2 под D5, прогон 2026-10-26
+
+
+def test_normal_descent_is_not_an_object():
+    assert not object_below(5.6, 6.2, -1.0, 0.5)      # снижение 1 м/с: прогноз 5,7
+    assert not object_below(6.0, 6.2, 0.0, 0.05)      # шум
+
+
+def test_low_altitude_needs_at_least_a_metre_jump():
+    assert not object_below(1.3, 2.0, 0.0, 0.05)
+    assert object_below(0.8, 2.0, 0.0, 0.05)

@@ -16,6 +16,8 @@ x-swarm-env: &swarm-env
   S1_TAU: "0.5"
   S2_MIN_GAP_S: "15"
   S2_PERIOD_S: "20"
+  VIO_DEROT: ${VIO_DEROT:--1}            # поправка VIO на поворот борта между кадрами (см. swarm/vio_node.py), 0 — выключить
+  VIO_FRAME_LOG: ${VIO_FRAME_LOG:-}      # покадровый журнал VIO для сверки с Gazebo (docs/gz_leak/vio_eval.py), по умолчанию выключен
 
 services:
   drone-agent-1: { environment: *swarm-env }

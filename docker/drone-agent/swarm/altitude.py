@@ -77,6 +77,31 @@ def vio_outlier(vn, ve, px4_vn=None, px4_ve=None, px4_valid=False) -> bool:
     return False
 
 
+VIO_ACC_MAX = 4.0           # м/с²: быстрее борт скорость не меняет (x500, наклон до ~20°)
+
+
+def vio_jump(vn, ve, recent, now, tol_abs=VIO_TOL_ABS, acc_max=VIO_ACC_MAX) -> bool:
+    """Проверка VIO без GPS: скорость не может скачком уйти от недавно принятых. recent — [(t, vn, ve)] принятых за последнюю секунду.
+    Сравнивать без GPS со скоростью EKF нельзя: она сама строится на VIO, и когда EKF уплывает, отбраковка верных измерений не даёт ему
+    вернуться (HANDOFF п. 1: PX4 терял xy_valid и садил борт). Опора — медиана недавних принятых, допуск растёт с возрастом опоры."""
+    if not recent:
+        return False
+    ts, ns, es = zip(*recent)
+    ref_n, ref_e = sorted(ns)[len(ns) // 2], sorted(es)[len(es) // 2]
+    age = max(0.0, now - max(ts))
+    return math.hypot(vn - ref_n, ve - ref_e) > tol_abs + acc_max * age
+
+
+def object_below(range_m, h_prev, vz_up, dt_s) -> bool:
+    """Дальномер резко показал ближе, чем земля по прогнозу (прежняя высота + вертикальная скорость EKF), — под бортом посторонний
+    объект (другой борт, край крыши), а не земля. Прогон 2026-10-26: под D5 прошёл D2, дальномер дал 3,2-4,8 м вместо 6,2,
+    и масштаб VIO исказился в разы. Высоту для масштаба в такие моменты держим по прогнозу."""
+    if h_prev is None or range_m is None or not math.isfinite(range_m):
+        return False
+    pred = h_prev + (vz_up or 0.0) * dt_s
+    return range_m < pred - max(1.0, 0.25 * pred)
+
+
 def smooth_alpha(dt_s, tau_s=0.3):
     """Коэффициент экспоненциального сглаживания по времени, а не по числу сообщений (при другой частоте дальномера лаг не меняется)."""
     if dt_s <= 0:
