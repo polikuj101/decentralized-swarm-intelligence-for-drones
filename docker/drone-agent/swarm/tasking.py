@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from swarm import common
+from swarm import common, order_rules
 from swarm.manifest_check import manifest_problem
 
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8080")
@@ -40,9 +40,35 @@ class TaskingError(Exception):
     pass
 
 
+DEFAULTS = {"on_target": "DWELL_RECON", "dwell_s": 8, "rtb_on_complete": True}   # те же значения по умолчанию, что в SYSTEM
+
+
 def compile_order(prompt: str, timeout_s: float = 20.0) -> dict:
-    """Детерминированно: temperature=0, top_k=1, seed=42 -> одинаковый prompt на разных бортах даёт
-    одинаковый manifest без обмена по сети (см. п. 9.3, D2)."""
+    """Зоны и явно названные параметры — из order_rules (детерминированно); модель спрашивается, только если какого-то поля в тексте нет,
+    и её ответ заполняет лишь такие поля; если модель недоступна, они берутся по умолчанию. temperature=0, top_k=1, seed=42."""
+    rules = order_rules.parse(prompt)
+    if rules["zones"] is None:
+        raise TaskingError("в приказе не названа ни одна зона: назовите квадраты (Альфа…Фокстрот) или «все»")
+    t0 = time.monotonic()
+    llm, llm_error = ({}, None) if all(v is not None for v in rules.values()) else _ask_llm(prompt, timeout_s)
+    fields, parsed_by = order_rules.merge(rules, llm)
+    for k, v in DEFAULTS.items():
+        if k not in fields:
+            fields[k], parsed_by[k] = v, "default"
+    zones = fields["zones"]
+    sectors = sorted(set(ZONE_TO_SECTOR.values())) if "all" in zones else sorted({ZONE_TO_SECTOR[z] for z in zones})
+
+    return {
+        "manifest_id": f"m-{int(time.time())}", "source_prompt": prompt.strip()[:300],
+        "zones_named": zones, "active_sectors": sectors, "on_target": fields["on_target"],
+        "dwell_s": int(fields["dwell_s"]), "rtb_on_complete": bool(fields["rtb_on_complete"]),
+        "parsed_by": parsed_by, "llm_zones": llm.get("zones"), "llm_error": llm_error,
+        "compiled_at": time.time(), "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+    }
+
+
+def _ask_llm(prompt: str, timeout_s: float):
+    """-> (ответ модели, ошибка | None). Без модели приказ всё равно разбирается: правила + значения по умолчанию."""
     grammar = None
     candidates = [
         GRAMMAR_FILE,
@@ -61,6 +87,8 @@ def compile_order(prompt: str, timeout_s: float = 20.0) -> dict:
     if not grammar:
         raise TaskingError(f"manifest.gbnf not found in candidates: {candidates}")
 
+    # cache_prompt включён: без него обработка системного промпта на каждом приказе давала p50 11 с, p95 14 с (живой прогон 2026-10-26,
+    # рой в полёте). Возможная разница ответов модели между вызовами касается только полей, которых нет в тексте; HUD выравнивает по большинству.
     body = {
         "prompt": f"<|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n{prompt.strip()}<|im_end|>\n<|im_start|>assistant\n",
         "grammar": grammar, "n_predict": 100, "temperature": 0.0, "top_k": 1, "seed": 42,
@@ -68,27 +96,11 @@ def compile_order(prompt: str, timeout_s: float = 20.0) -> dict:
     }
     req = urllib.request.Request(LLM_URL + "/completion", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
-    t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout_s) as r:
-        res = json.loads(r.read())
     try:
-        out = json.loads(res["content"])
-    except (json.JSONDecodeError, KeyError) as e:
-        raise TaskingError(f"malformed completion: {e!r}") from e
-
-    if "all" in out["zones"]:
-        sectors = sorted(set(ZONE_TO_SECTOR.values()))
-    else:
-        sectors = sorted({ZONE_TO_SECTOR[z] for z in out["zones"] if z in ZONE_TO_SECTOR})
-    if not sectors:
-        raise TaskingError("manifest resolved to zero active sectors")
-
-    return {
-        "manifest_id": f"m-{int(time.time())}", "source_prompt": prompt.strip()[:300],
-        "zones_named": out["zones"], "active_sectors": sectors, "on_target": out["on_target"],
-        "dwell_s": int(out["dwell_s"]), "rtb_on_complete": bool(out["rtb_on_complete"]),
-        "compiled_at": time.time(), "latency_ms": round((time.monotonic() - t0) * 1000, 1),
-    }
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            return json.loads(json.loads(r.read())["content"]), None
+    except Exception as e:  # noqa: BLE001 — без модели приказ всё равно разбирается правилами
+        return {}, repr(e)[:200]
 
 
 def write_manifest(manifest: dict) -> None:
@@ -133,7 +145,9 @@ def post_tasking(r: TaskingReq, authorization: str = Header(default="")):
         raise HTTPException(401, "bad token")
     try:
         manifest = compile_order(r.prompt)
-    except (TaskingError, Exception) as e:  # noqa: BLE001
+    except TaskingError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"tasking compile failed: {e!r}")
     write_manifest(manifest)
     return manifest

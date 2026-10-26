@@ -384,11 +384,17 @@ function buildTasking() {
       const firstOk = oks[0];
       if (firstOk) {
         const b = firstOk.body;
+        const SRC = {rules: "из текста", llm: "модель", default: "по умолчанию"};
+        const by = b.parsed_by || {};
+        const src = (k) => SRC[by[k]] || "модель";
         card.style.display = "block";
         card.replaceChildren(
           mk("b", null, "Скомпилированный Task Manifest: "),
           document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (сектора ${(b.active_sectors || []).join(",")}) | ` +
             `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
+          mk("br"),
+          mk("span", "dim", `Разбор: зоны — ${src("zones")}, при контакте — ${src("on_target")}, время — ${src("dwell_s")}, RTB — ${src("rtb_on_complete")}` +
+            (b.llm_error ? " · бортовая модель недоступна" : (b.llm_zones ? ` · модель предлагала зоны [${b.llm_zones.join(", ")}]` : ""))),
           mk("br"),
           mk("span", "dim", "Исполняются: сектора, режим при контакте (SKIP — цели пропускаются, DWELL_ONLY — зависание без снимка, DWELL_RECON — со снимком), время зависания и возврат. Имена зон → сектора заданы в таблице, а не выводятся из карты; цели на карте известны заранее."));
       }

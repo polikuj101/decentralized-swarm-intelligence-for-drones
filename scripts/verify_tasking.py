@@ -185,7 +185,7 @@ def main() -> int:
         print(f"манифест на 5 бортах совпадает с исходным (без manifest_id/compiled_at/latency_ms): {'да' if restored_ok else 'НЕТ'}", flush=True)
         failed |= not restored_ok
 
-    print("\nТОЧНОСТЬ КОМПИЛЯЦИИ (измерение, tasking.py не менялся):")
+    print("\nТОЧНОСТЬ КОМПИЛЯЦИИ (измерение; зоны и явные параметры — swarm/order_rules.py, остальное — модель):")
     for ln in accuracy_report(rows):
         print("  " + ln, flush=True)
     wrong_all = [(i + 1, k, w) for i, r in enumerate(results) for k, w in r["wrong"].items()]
