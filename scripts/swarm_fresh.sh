@@ -3,6 +3,8 @@
 # Порядок важен: сначала PX4, потом агенты. Перезапуск ТОЛЬКО агента (при живом PX4) оставляет у PX4 протухшую сессию DDS:
 # «connected», но Payload tx = 0 B/s, борт не взлетает (живые прогоны 2026-10-26, D1 и D5).
 # Перезапуск PX4 посреди полёта тоже нельзя: борт разоружается, а локальная система координат PX4 сбрасывается.
+# Мир Gazebo тоже перезапускается: упавшие/перевёрнутые модели (после аварий и тестов) остаются лежать, и PX4 отказывается взводиться
+# («Preflight Fail: Attitude failure (pitch)», репетиция демо 2026-10-26: все 5 бортов лежали на боку или вверх колёсами).
 # Использование: ./scripts/swarm_fresh.sh [--task "Обследовать все квадраты"]
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -12,6 +14,11 @@ AG="drone-agent-1 drone-agent-2 drone-agent-3 drone-agent-4 drone-agent-5"
 FC="fc-1 fc-2 fc-3 fc-4 fc-5"
 say(){ echo "$(date +%T) $*"; }
 say "остановка агентов и PX4"; docker compose stop $AG $FC >/dev/null 2>&1
+say "перезапуск мира Gazebo (модели возвращаются в точки старта)"
+docker compose restart simulator-core >/dev/null 2>&1
+for k in $(seq 1 60); do
+  [ "$(docker inspect -f '{{.State.Health.Status}}' swarm-sitl-simulator-core-1 2>/dev/null)" = healthy ] && break; sleep 3
+done
 say "запуск PX4"; docker compose up -d --no-deps $FC >/dev/null 2>&1; sleep 25
 say "запуск агентов"; docker compose up -d --no-deps $AG >/dev/null 2>&1
 for k in $(seq 1 40); do

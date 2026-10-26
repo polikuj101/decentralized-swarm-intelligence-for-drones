@@ -62,3 +62,69 @@ def test_takeoff_falls_back_to_ekf_when_the_rangefinder_never_appears():
     from swarm.altitude import takeoff_complete
     assert takeoff_complete(5.3, "ekf", 5.4, elapsed_s=31.0)
     assert not takeoff_complete(2.0, "ekf", 5.4, elapsed_s=31.0)
+
+
+# -- HeightFuser: дальномер + счисление по вертикальной скорости, без погони за EKF
+
+def _fuser():
+    from swarm.altitude import HeightFuser
+    return HeightFuser()
+
+
+def test_fresh_lidar_is_used_directly():
+    f = _fuser(); f.update_lidar(3.1, 10.0)
+    assert f.height(7.0, 10.5) == (3.1, "lidar")
+
+
+def test_between_slow_lidar_samples_height_follows_vertical_speed():
+    f = _fuser(); f.update_lidar(3.0, 10.0); f.update_vz(0.5, 11.9)
+    z, src = f.height(9.0, 12.0)             # дальномеру 2 с: «свежим» не считается, держимся на его отсчёте и скорости
+    assert src == "lidar+vz" and abs(z - 4.0) < 1e-9
+
+
+def test_without_any_reference_height_is_none_instead_of_chasing_the_ekf():
+    f = _fuser()
+    assert f.height(5.9, 100.0) == (None, "none")
+    f.update_lidar(3.0, 10.0)
+    assert f.height(5.9, 20.0) == (None, "none")            # отсчёт давно устарел
+
+
+def test_out_of_range_lidar_means_high_and_commands_descent():
+    f = _fuser(); f.update_lidar(18.0, 10.0); f.update_over_range(11.0)
+    z, src = f.height(2.0, 11.5)
+    assert src == "over" and z > 20.0
+
+
+def test_new_valid_lidar_cancels_the_over_range_flag():
+    f = _fuser(); f.update_over_range(10.0); f.update_lidar(12.0, 11.0)
+    assert f.height(2.0, 11.2) == (12.0, "lidar")
+
+
+def test_invalid_lidar_samples_are_ignored():
+    f = _fuser()
+    for bad in (0.05, 31.0, float("inf"), float("nan"), None):
+        f.update_lidar(bad, 1.0)
+    assert f.height(4.0, 1.1) == (None, "none")
+
+
+def test_takeoff_accepts_dead_reckoned_lidar_height():
+    from swarm.altitude import takeoff_complete
+    assert takeoff_complete(5.3, "lidar+vz", 5.4, elapsed_s=3.0)
+    assert not takeoff_complete(5.3, "none", 5.4, elapsed_s=3.0)
+
+
+def test_inf_on_the_ground_is_not_treated_as_high():
+    """Регрессия: дальномер на земле (ближе минимальной дальности) отдаёт inf; борт 'снижался' в землю и PX4 разоружал его."""
+    f = _fuser(); f.update_over_range(5.0)
+    assert f.height(1.5, 5.2) == (None, "none")
+
+
+def test_inf_after_being_high_means_even_higher():
+    f = _fuser(); f.update_lidar(12.0, 10.0); f.update_over_range(10.5)
+    assert f.height(2.0, 10.8)[1] == "over"
+
+
+def test_inf_with_ekf_far_above_ground_means_high():
+    f = _fuser(); f.update_over_range(10.0)
+    z, src = f.height(30.0, 10.2)
+    assert src == "over" and z > 20.0

@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from swarm.supervise import DisarmWatch, suspect_may_clear, withdraw_clearable  # noqa: E402
+from swarm.supervise import DisarmWatch, OffboardWatch, speed_cap, suspect_may_clear, withdraw_clearable  # noqa: E402
 
 
 def test_armed_never_trips():
@@ -55,3 +55,42 @@ def test_gps_suspect_cleared_when_consistent_and_close():
 
 def test_gps_suspect_needs_enough_consistent_checks():
     assert not suspect_may_clear(good_count=7, offset_m=0.5)
+
+
+def test_speed_cap_is_cruise_when_gps_navigation_is_healthy():
+    assert speed_cap("PX4", 3, False, 3.0) == 3.0
+
+
+def test_speed_cap_drops_without_gps_or_on_vio_dr_or_suspect():
+    assert speed_cap("PX4", 0, False, 3.0) == 1.0
+    assert speed_cap("VIO", 3, False, 3.0) == 1.0
+    assert speed_cap("DR", 3, False, 3.0) == 1.0
+    assert speed_cap("PX4", 3, True, 3.0) == 1.0
+    assert speed_cap("NONE", 0, False, 3.0) == 1.0
+
+
+def test_speed_cap_never_exceeds_cruise():
+    assert speed_cap("VIO", 0, True, 0.6) == 0.6
+
+
+def test_offboard_watch_stays_quiet_in_offboard_or_when_disarmed():
+    w = OffboardWatch()
+    assert not any(w.update(True, 14, t) for t in range(10))
+    assert not any(w.update(False, 1, t) for t in range(10, 20))
+    assert not w.update(True, None, 30.0)
+
+
+def test_offboard_watch_asks_for_reentry_after_grace_and_retries_slowly():
+    w = OffboardWatch(grace_s=1.0, retry_s=2.0)
+    assert not w.update(True, 1, 0.0)
+    assert not w.update(True, 1, 0.5)
+    assert w.update(True, 1, 1.0)
+    assert not w.update(True, 1, 2.0)        # ещё рано повторять
+    assert w.update(True, 1, 3.1)
+
+
+def test_offboard_watch_resets_when_back_in_offboard():
+    w = OffboardWatch()
+    w.update(True, 1, 0.0)
+    w.update(True, 14, 0.5)
+    assert not w.update(True, 1, 0.8)        # отсчёт начался заново

@@ -27,7 +27,7 @@ param set-default EKF2_HGT_REF 0
 param set-default EKF2_GPS_CTRL 7
 param set-default EKF2_EV_CTRL 4
 param set-default EKF2_EV_DELAY 40
-param set-default EKF2_EV_NOISE_MD 0
+param set-default EKF2_EV_NOISE_MD 1      # дисперсия берётся из сообщения VIO: z-скорость VIO практически не учитывается (см. vio_node.py)
 param set-default EKF2_EVV_NOISE 0.15
 param set-default EKF2_NOAID_TOUT 5000000
 

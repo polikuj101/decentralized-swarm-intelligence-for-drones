@@ -23,6 +23,36 @@ class DisarmWatch:
         self.since = None
 
 
+DEGRADED_SPEED_MPS = 1.0
+OFFBOARD_NAV_STATE = 14
+
+
+def speed_cap(src, gps_fix, suspect, cruise_mps, degraded_mps=DEGRADED_SPEED_MPS) -> float:
+    """Потолок скорости: без GPS (источник не PX4, gps_fix < 3 или подозрение на GPS) навигация идёт по оптическому потоку, который при редких кадрах
+    (рендер отдаёт камеру 1-5 Гц) на крейсерской скорости теряет совпадение изображений: в репетиции демо ошибка позиции росла до 44-106 м."""
+    degraded = src != "PX4" or (gps_fix is not None and gps_fix < 3) or bool(suspect)
+    return min(cruise_mps, degraded_mps) if degraded else cruise_mps
+
+
+class OffboardWatch:
+    """PX4 может выйти из OFFBOARD (потеря оценки позиции — аварийный режим), а flight_ctrl продолжал слать уставки в пустоту:
+    борт спускался и лежал на земле в HOLD. Возвращает True, когда борт взведён, но не в OFFBOARD дольше grace_s (и не чаще retry_s)."""
+
+    def __init__(self, grace_s=1.0, retry_s=2.0):
+        self.grace_s, self.retry_s, self.since, self.last = grace_s, retry_s, None, -1e9
+
+    def update(self, armed: bool, nav_state, now: float) -> bool:
+        if not armed or nav_state == OFFBOARD_NAV_STATE or nav_state is None:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        if now - self.since >= self.grace_s and now - self.last >= self.retry_s:
+            self.last = now
+            return True
+        return False
+
+
 def suspect_may_clear(good_count, offset_m, need=8, max_offset_m=8.0) -> bool:
     """Подозрение на GPS снимается, только когда PX4 и VIO согласованы по движению (good_count) И абсолютное расхождение позиций мало.
     Живой прогон: после подмены GPS (дрейф 2 м/с) EKF сделал скачок на ~80 м, смещения за окно снова совпали, подозрение сняли,

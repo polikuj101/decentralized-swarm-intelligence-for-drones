@@ -16,8 +16,8 @@ from sensor_msgs.msg import LaserScan, Range
 from std_msgs.msg import String
 
 from swarm import common
-from swarm.altitude import fused_height, takeoff_complete
-from swarm.supervise import DisarmWatch, suspect_may_clear
+from swarm.altitude import HeightFuser, takeoff_complete
+from swarm.supervise import DisarmWatch, OffboardWatch, speed_cap, suspect_may_clear
 
 MS = common.MISSION
 VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, common.ALT
@@ -55,12 +55,15 @@ class Flight(Node):
         self.suspect, self.bad, self.good, self.hist = False, 0, 0, deque()
         self.state, self.label = "WAIT", "IDLE"
         self.disarm = DisarmWatch()
+        self.offb = OffboardWatch()
         self.ready_t, self.t_cmd = None, 0.0
         self.goal, self.seq, self.idx, self.done, self.dwell_t0 = None, None, 0, False, None
         self.obst_min = 99.0
-        self.h_lidar, self.h_t = None, 0.0        # высота над землёй по нисходящему дальномеру
+        self.hf = HeightFuser()                   # высота над землёй: дальномер + счисление по вертикальной скорости
+        self.z_ok = False                         # есть ли опорная высота для вертикального управления
         self.zc, self.zsrc = 0.0, "ekf"          # высота для управления и её источник
         self.t_takeoff = 0.0
+        self._t_dbg = 0.0
         self._t_off_log = 0.0
         self._t_last = self._t_mon = self._t_stat = time.monotonic()
         self.create_timer(0.05, self._tick)
@@ -79,8 +82,11 @@ class Flight(Node):
         self.scan, self.scan_t = m, time.monotonic()
 
     def _on_range(self, m):
+        now = time.monotonic()
         if m.min_range <= m.range <= m.max_range:
-            self.h_lidar, self.h_t = float(m.range), time.monotonic()
+            self.hf.update_lidar(float(m.range), now)
+        elif math.isinf(m.range) and m.range > 0 or m.range > m.max_range:
+            self.hf.update_over_range(now)
 
     def _on_vio(self, m):
         self.vio = (m.point.x, m.point.y, time.monotonic())
@@ -114,6 +120,7 @@ class Flight(Node):
             return False
         wx, wy = common.ned_to_world(lp.x, lp.y)
         self.pz, self.hdg, self.ve, self.vn = -lp.z, lp.heading, lp.vy, lp.vx
+        self.hf.update_vz(-lp.vz, now)
         vio_fresh = self.vio is not None and now - self.vio[2] < 1.0
         if lp.xy_valid and not self.suspect:
             self.px, self.py, self.src = wx, wy, "PX4"
@@ -172,7 +179,7 @@ class Flight(Node):
                 self.get_logger().warning(f"GPS движется согласованно с VIO, но смещён на {offset:.0f} м: остаёмся на VIO")
 
     # ───────── обход препятствий ─────────
-    def _avoid(self, vgx, vgy, now):
+    def _avoid(self, vgx, vgy, now, vmax=VMAX):
         sc = self.scan
         if sc is None or now - self.scan_t > 0.5:
             self.obst_min = 99.0
@@ -200,8 +207,8 @@ class Flight(Node):
                 vx += 0.5 * K_REP * mag * (-vgy / g)     # тангенциальная составляющая (обход влево)
                 vy += 0.5 * K_REP * mag * (vgx / g)
         n = math.hypot(vx, vy)
-        if n > VMAX:
-            vx, vy = vx * VMAX / n, vy * VMAX / n
+        if n > vmax:
+            vx, vy = vx * vmax / n, vy * vmax / n
         return vx, vy
 
     # ───────── главный цикл ─────────
@@ -216,7 +223,9 @@ class Flight(Node):
         self.p_mode.publish(mode)
 
         have = self._estimate(now, dt)
-        self.zc, self.zsrc = fused_height(self.pz, self.h_lidar, now - self.h_t if self.h_lidar is not None else None)
+        z_ref, self.zsrc = self.hf.height(self.pz, now)
+        self.z_ok = z_ref is not None
+        self.zc = z_ref if z_ref is not None else self.pz      # для статуса и взлёта; в полёте без опоры вертикаль не двигаем
         if now - self._t_mon >= 1.0:
             self._t_mon = now
             self._monitor(now)
@@ -230,6 +239,9 @@ class Flight(Node):
             self.state, self.label, self.done, self.ready_t = ("WAIT" if AUTO_REARM else "GROUNDED"), "GROUNDED", False, None
             self.disarm.reset()
             st = self.state
+        if st in ("TAKEOFF", "FLY") and self.vs is not None and self.offb.update(self.vs.arming_state == 2, self.vs.nav_state, now):
+            self.get_logger().warning(f"PX4 вышел из OFFBOARD (nav_state={self.vs.nav_state}): возвращаю режим")
+            self._cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
         if st == "WAIT":
             ok = (self.lp is not None and self.lp.z_valid and (self.lp.xy_valid or self.lp.v_xy_valid))
             if ok:
@@ -247,6 +259,10 @@ class Flight(Node):
                 self._cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
         elif st == "TAKEOFF":
             vz = clamp(KZ * (ALT - self.zc), -VZ_DN, VZ_UP)
+            if now - self._t_dbg >= 2.0:
+                self._t_dbg = now
+                self.get_logger().info(f"TAKEOFF zc={self.zc:.2f} src={self.zsrc} pz={self.pz:.2f} vz_cmd={vz:.2f} armed={bool(self.vs and self.vs.arming_state == 2)} "
+                                       f"nav_state={getattr(self.vs, 'nav_state', None)} t={now - self.t_takeoff:.0f}s")
             if takeoff_complete(self.zc, self.zsrc, ALT, now - self.t_takeoff):
                 self.state, self.label = "FLY", "HOLD"
         elif st == "FLY":
@@ -272,7 +288,7 @@ class Flight(Node):
     def _fly(self, now, have):
         g = self.goal
         alt = g["alt"] if g else ALT
-        vz = clamp(KZ * (alt - self.zc), -VZ_DN, VZ_UP)
+        vz = clamp(KZ * (alt - self.zc), -VZ_DN, VZ_UP) if self.z_ok else 0.0      # нет опорной высоты — держим вертикаль
         if not have or g is None or g["kind"] == "HOLD" or (self.done and g["kind"] == "WAYPOINTS"):
             self.label = "HOLD"
             return 0.0, 0.0, vz
@@ -296,13 +312,15 @@ class Flight(Node):
             self.idx, self.dwell_t0 = self.idx + 1, None
             return 0.0, 0.0, vz
         v = min(VMAX, max(0.5, KP * dist))
-        vx, vy = self._avoid(dx / dist * v, dy / dist * v, now)
+        cap = speed_cap(self.src, self.gps_fix, self.suspect, VMAX)
+        v = min(v, cap)
+        vx, vy = self._avoid(dx / dist * v, dy / dist * v, now, cap)
         return vx, vy, vz
 
     def _publish_status(self):
         n = self.lp
         st = {"seq": self.seq, "idx": self.idx, "done": bool(self.done), "state": self.label, "phase": self.state,
-              "x": round(self.px, 2), "y": round(self.py, 2), "z": round(self.zc, 2), "z_ekf": round(self.pz, 2), "z_src": self.zsrc,
+              "x": round(self.px, 2), "y": round(self.py, 2), "z": round(self.zc, 2), "z_ekf": round(self.pz, 2), "z_src": self.zsrc, "z_ok": self.z_ok,
               "vx": round(self.ve, 2), "vy": round(self.vn, 2), "hdg": round(math.degrees(self.hdg), 1),
               "src": self.src, "sigma": round(self.sigma, 1), "gps_fix": self.gps_fix, "gps_suspect": self.suspect,
               "vio_ok": bool(self.vio and time.monotonic() - self.vio[2] < 1.0),

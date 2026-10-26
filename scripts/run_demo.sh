@@ -8,6 +8,7 @@ PROMPT="${DEMO_PROMPT:-Разведать квадрат Браво, вскры�
 KILL_AT_S="${DEMO_KILL_AT_S:-100}"
 KILL_DRONE="${DEMO_KILL_DRONE:-2}"
 RF_AT_S="${DEMO_RF_AT_S:-25}"
+TAKEOFF_TIMEOUT_S="${DEMO_TAKEOFF_TIMEOUT_S:-240}"
 
 echo "[1/4] сброс РЭБ и проверка живости бортов"
 ./scripts/ewctl.sh reset >/dev/null 2>&1 || true
@@ -16,6 +17,18 @@ for i in 1 2 3 4 5; do
     || docker start "swarm-sitl-drone-agent-$i-1" >/dev/null 2>&1 || true
 done
 curl -fsS http://127.0.0.1:8000/healthz >/dev/null || { echo "HUD не отвечает — проверьте 'make up'"; exit 1; }
+echo "ok"
+
+echo "[1б] связь PX4 с агентами (Payload tx > 0 у всех пяти)"
+for k in $(seq 1 24); do
+  bad=0
+  for i in 1 2 3 4 5; do
+    tx=$(docker exec "swarm-sitl-fc-$i-1" px4-shell uxrce_dds_client status 2>&1 | awk '/Payload tx/{print $5}')
+    [ "${tx:-0}" = 0 ] && bad=1
+  done
+  [ $bad = 0 ] && break; sleep 5
+done
+[ $bad = 0 ] || { echo "нет обмена PX4-агент у части бортов: ./scripts/swarm_fresh.sh и повторите"; exit 1; }
 echo "ok"
 
 echo "[2/4] приказ оператора (pre-flight, C2 ещё жив)"
@@ -30,7 +43,23 @@ else
   read -rp "Enter — когда манифест скомпилирован и рой взлетел..." _
 fi
 
-echo "[3/4] таймлайн: РЭБ через ${RF_AT_S}с, поражение борта $KILL_DRONE через ${KILL_AT_S}с"
+# Таймлайн отсчитывается от взлёта роя, а не от приказа: на стенде взлёт занимает 1-2 минуты, и РЭБ «на 25-й секунде» приходился на землю
+# (отказ GPS до взлёта не даёт PX4 взвестись, рой не взлетал вообще — репетиция 2026-10-26).
+echo "ожидание взлёта: не менее 4 бортов в воздухе (до ${TAKEOFF_TIMEOUT_S}с)"
+airborne=0
+for k in $(seq 1 $((TAKEOFF_TIMEOUT_S / 5))); do
+  airborne=$(curl -s -m 5 http://127.0.0.1:8000/api/state | python3 -c "
+import sys, json
+s = json.load(sys.stdin); c = 0
+for d in s['drones'].values():
+    n = ((d.get('pkt') or {}).get('nav') or {})
+    if n.get('state') in ('NAV', 'HOLD', 'DWELL') and (n.get('z') or 0) > 1.0: c += 1
+print(c)" 2>/dev/null)
+  [ "${airborne:-0}" -ge 4 ] && break; sleep 5
+done
+[ "${airborne:-0}" -ge 4 ] || { echo "рой не взлетел за ${TAKEOFF_TIMEOUT_S}с (в воздухе: ${airborne:-0}); РЭБ не запускаю"; exit 1; }
+echo "в воздухе: $airborne, отсчёт таймлайна пошёл"
+echo "[3/4] таймлайн: РЭБ через ${RF_AT_S}с, поражение борта $KILL_DRONE через ${KILL_AT_S}с (от взлёта)"
 ( sleep "$RF_AT_S" && ./scripts/ewctl.sh scenario run 05_investor_demo >/dev/null \
     && echo "  РЭБ: C2/GPS подавление включено" ) &
 ( sleep "$KILL_AT_S" && (docker kill "swarm-sitl-drone-agent-$KILL_DRONE-1" >/dev/null 2>&1 || docker kill "drone-agent-$KILL_DRONE" >/dev/null 2>&1 || true) \

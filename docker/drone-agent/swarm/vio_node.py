@@ -97,9 +97,12 @@ class Vio(Node):
         o.timestamp = o.timestamp_sample = now_us
         o.pose_frame, o.velocity_frame = VehicleOdometry.POSE_FRAME_NED, VehicleOdometry.VELOCITY_FRAME_NED
         o.position, o.q, o.angular_velocity = [NAN] * 3, [NAN] * 4, [NAN] * 3
-        o.velocity = [dN / dt, dE / dt, -self.vz]
+        # Вертикальную скорость из разности высот по дальномеру в EKF не отдаём: на скачках рельефа (края препятствий) и при редких отсчётах
+        # она даёт ложные всплески, а без GPS это единственная вертикальная «помощь» EKF — борты раскачивались по высоте на 0-30 м
+        # (репетиция демо 2026-10-26). z-скорость с большой дисперсией (EKF2_EV_NOISE_MD=1), высоту держит барометр.
+        o.velocity = [dN / dt, dE / dt, 0.0]
         o.position_variance, o.orientation_variance = [NAN] * 3, [NAN] * 3
-        o.velocity_variance = [0.0225] * 3
+        o.velocity_variance = [0.0225, 0.0225, 25.0]
         o.reset_counter, o.quality = 0, int(min(100, resp * 100))
         self.pub_odo.publish(o)
         d = PointStamped()
