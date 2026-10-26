@@ -4,10 +4,9 @@ import json
 import math
 import os
 import time
-from collections import deque
 
 import rclpy
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, Vector3Stamped
 from px4_msgs.msg import (OffboardControlMode, SensorGps, TrajectorySetpoint, VehicleCommand,
                           VehicleLocalPosition, VehicleStatus)
 from rclpy.node import Node
@@ -17,6 +16,7 @@ from std_msgs.msg import String
 
 from swarm import common
 from swarm.altitude import HeightFuser, takeoff_complete
+from swarm.gps_check import SpoofDetector, latlon_to_enu
 from swarm.supervise import DisarmWatch, OffboardWatch, speed_cap, suspect_may_clear
 
 MS = common.MISSION
@@ -24,6 +24,8 @@ VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, 
 KP, KZ, VZ_UP, VZ_DN = 0.8, 1.0, 1.2, 0.8
 AUTO_REARM = os.environ.get("FLIGHT_AUTO_REARM", "0") == "1"       # по умолчанию борт после разоружения/посадки сам не взлетает
 R_AVOID, R_STOP, K_REP = 4.0, 1.3, 2.0
+SPOOF_MIN_ALT_M = 2.0                     # ниже детектор подмены GPS не работает (см. _monitor)
+ORIGIN_LAT, ORIGIN_LON = common.SCENE["origin"]["lat_deg"], common.SCENE["origin"]["lon_deg"]   # начало мира Gazebo (ENU)
 PX4_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                      history=HistoryPolicy.KEEP_LAST, depth=1)
 
@@ -46,13 +48,14 @@ class Flight(Node):
         self.create_subscription(LaserScan, "/sensors/lidar_ring/scan", self._on_scan, qos_profile_sensor_data)
         self.create_subscription(Range, "/sensors/lidar_down/range", self._on_range, qos_profile_sensor_data)
         self.create_subscription(PointStamped, "/swarm/local/vio_disp", self._on_vio, 10)
+        self.create_subscription(Vector3Stamped, "/swarm/local/vio_vel", self._on_vio_vel, 10)
         self.create_subscription(String, "/swarm/local/nav_goal", self._on_goal, 10)
 
         self.lp = self.vs = self.scan = self.vio = self.anc = None
         self.gps_fix, self.scan_t = 0, 0.0
         self.px, self.py = common.SPAWN
         self.pz, self.hdg, self.ve, self.vn, self.sigma, self.src = 0.0, 0.0, 0.0, 0.0, 5.0, "NONE"
-        self.suspect, self.bad, self.good, self.hist = False, 0, 0, deque()
+        self.suspect, self.spoof, self.gps = False, SpoofDetector(), None     # gps: (широта, долгота, время приёма)
         self.state, self.label = "WAIT", "IDLE"
         self.disarm = DisarmWatch()
         self.offb = OffboardWatch()
@@ -77,6 +80,10 @@ class Flight(Node):
 
     def _on_gps(self, m):
         self.gps_fix = int(m.fix_type)
+        lat = getattr(m, "latitude_deg", None)
+        lat, lon = (lat, m.longitude_deg) if lat is not None else (m.lat * 1e-7, m.lon * 1e-7)
+        if self.gps_fix >= 3 and math.isfinite(lat) and math.isfinite(lon):
+            self.gps = (float(lat), float(lon), time.monotonic())
 
     def _on_scan(self, m):
         self.scan, self.scan_t = m, time.monotonic()
@@ -90,6 +97,9 @@ class Flight(Node):
 
     def _on_vio(self, m):
         self.vio = (m.point.x, m.point.y, time.monotonic())
+
+    def _on_vio_vel(self, m):
+        self.spoof.add_vio(time.monotonic(), m.vector.x, m.vector.y)
 
     def _on_goal(self, msg):
         try:
@@ -141,37 +151,30 @@ class Flight(Node):
         return self.src != "NONE"
 
     def _monitor(self, now):
-        lp = self.lp
-        if not (lp and lp.xy_valid and self.vio and now - self.vio[2] < 2.0):
-            self.bad = self.good = 0
+        """Подмена GPS: скорость сырого GPS против скорости VIO (swarm/gps_check.py), вызывается на каждом такте."""
+        lp, g = self.lp, self.gps
+        # только в устойчивом полёте: на взлёте у земли VIO неточен (малая высота, большие сдвиги, резкие ускорения) — живой прогон
+        # 2026-10-26 дал там единственную ложную тревогу из пяти бортов
+        steady = self.state == "FLY" and self.zsrc in ("lidar", "lidar+vz") and self.zc >= SPOOF_MIN_ALT_M
+        if not (lp and lp.xy_valid and self.vio and now - self.vio[2] < 1.0 and g and now - g[2] < 1.0 and self.gps_fix >= 3 and steady):
+            self.spoof.reset()
             return
         wx, wy = common.ned_to_world(lp.x, lp.y)
-        self.hist.append((now, wx, wy, self.vio[0], self.vio[1]))
-        while self.hist and now - self.hist[0][0] > 20.0:
-            self.hist.popleft()
-        ref = next((h for h in self.hist if now - h[0] <= 10.0), None)
-        if ref is None or now - ref[0] < 6.0:
-            return
-        dvo = (self.vio[0] - ref[3], self.vio[1] - ref[4])
-        diff = math.hypot((wx - ref[1]) - dvo[0], (wy - ref[2]) - dvo[1])
-        if diff > 3.0 + 0.15 * math.hypot(*dvo):
-            self.bad, self.good = self.bad + 1, 0
-        else:
-            self.good, self.bad = self.good + 1, 0
-        if not self.suspect and self.bad >= 3:
-            self.suspect = True
-            old = [h for h in self.hist if now - h[0] >= 8.0]
-            h = old[-1] if old else self.hist[0]
-            self.anc = (h[1], h[2], h[3], h[4])
-            self.get_logger().warning(f"GPS SUSPECT: px4-vio mismatch {diff:.1f} m -> nav source VIO")
-        elif self.suspect and self.good >= 8:
+        ge, gn = latlon_to_enu(g[0], g[1], ORIGIN_LAT, ORIGIN_LON)
+        anchor = self.spoof.update(now, ge, gn, self.vio[0], self.vio[1], wx, wy)
+        if anchor and not self.suspect:
+            self.suspect, self.anc = True, anchor
+            self.get_logger().warning(f"GPS SUSPECT: скорость GPS расходится с VIO на {self.spoof.innov:.1f} м/с (допуск {self.spoof.tol:.1f}) "
+                                      f"-> nav source VIO, привязка к состоянию до начала расхождения")
+        elif self.suspect and self.spoof.consistent_s >= self.spoof.CLEAR_S and now - self._t_mon >= 1.0:
+            self._t_mon = now
             if self.anc is not None:
                 ex = self.anc[0] + self.vio[0] - self.anc[2]
                 ey = self.anc[1] + self.vio[1] - self.anc[3]
                 offset = math.hypot(wx - ex, wy - ey)
             else:
                 offset = 0.0
-            if suspect_may_clear(self.good, offset):
+            if suspect_may_clear(int(self.spoof.consistent_s), offset):
                 self.suspect = False
                 self.get_logger().info("GPS consistent again -> nav source PX4")
             elif now - self._t_off_log > 10.0:
@@ -226,9 +229,7 @@ class Flight(Node):
         z_ref, self.zsrc = self.hf.height(self.pz, now)
         self.z_ok = z_ref is not None
         self.zc = z_ref if z_ref is not None else self.pz      # для статуса и взлёта; в полёте без опоры вертикаль не двигаем
-        if now - self._t_mon >= 1.0:
-            self._t_mon = now
-            self._monitor(now)
+        self._monitor(now)
 
         vx = vy = vz = 0.0
         st = self.state
