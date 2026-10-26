@@ -29,6 +29,7 @@ COPY models /opt/px4-gz/models
 
 COPY gen_swarm.py /opt/swarm/gen_swarm.py
 COPY gps_jam_bridge.py /opt/gps_jam_bridge.py
+COPY range_sim.py /opt/range_sim.py
 COPY supervisord.conf /etc/supervisor/conf.d/swarm.conf
 COPY entrypoint.sh /usr/local/bin/sim-entrypoint.sh
 RUN chmod +x /usr/local/bin/sim-entrypoint.sh

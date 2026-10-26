@@ -15,6 +15,10 @@ BASE = pathlib.Path(os.environ.get("PX4_GZ_DIR", "/opt/px4-gz")) / "models/x500_
 OUT = pathlib.Path(os.environ.get("SWARM_OUT", "/opt/swarm/generated"))
 SCENE_DIR = pathlib.Path(os.environ.get("SWARM_SCENE_DIR", "/opt/swarm/scene"))
 LAT, LON, ELEV = 47.397971057728974, 8.546163739800146, 535.0   # как в стандартных мирах PX4
+# "analytic": дальномеры считает range_sim.py по геометрии мира (рендер только камерам); "gpu": прежние gpu_lidar в SDF
+RANGE_SENSORS = os.environ.get("RANGE_SENSORS", "analytic")
+if RANGE_SENSORS not in ("analytic", "gpu"):
+    sys.exit(f"gen_swarm: RANGE_SENSORS должен быть analytic или gpu, а не {RANGE_SENSORS!r}")
 
 CAM = dict(w=320, h=240, hfov=1.2, rate=15)            # нижняя камера, моно 8 бит
 RING = dict(samples=36, rmin=0.2, rmax=15.0, rate=10)  # кольцевой дальномер, шаг 10°
@@ -124,7 +128,10 @@ def build_model(n: int):
     for need in ("air_pressure_sensor",):   # эти берём из upstream
         if not any(s.get("name") == need for s in model.iter("sensor")):
             die(f"x500_base: нет сенсора {need} (изменилась структура модели PX4?)")
-    for xml in (imu_xml(), navsat_xml(n), camera_xml(n), ring_xml(n), down_xml(n)):
+    sensors = [imu_xml(), navsat_xml(n), camera_xml(n)]
+    if RANGE_SENSORS == "gpu":            # иначе дальномеры считает range_sim.py по геометрии мира, без рендера
+        sensors += [ring_xml(n), down_xml(n)]
+    for xml in sensors:
         base.append(ET.fromstring(xml))
     for num, direction in [("0", "ccw"), ("1", "ccw"), ("2", "cw"), ("3", "cw")]:
         model.append(ET.fromstring(motor_xml(num, direction)))
@@ -223,7 +230,9 @@ def build_scene():
         "drones": [{"id": n, "model": f"x500_swarm_{n}", "x_m": (n - 1) * SPACING, "y_m": 0.0} for n in range(1, N + 1)],
         "obstacles": [dict(name=o[0], x_m=o[1], y_m=o[2], size_m=[o[3], o[4], o[5]]) for o in OBSTACLES],
         "targets": [dict(name=t[0], x_m=t[1], y_m=t[2], radius_m=t[3]) for t in TARGETS],
+        "ground": {"x_m": 25.0, "y_m": 0.0, "size_m": [100.0, 100.0]},   # видимый пол (swarm_ground), за краем — небо
         "sensors": {"cam_down": CAM, "lidar_ring": RING, "lidar_down": DOWN},
+        "range_sensors": RANGE_SENSORS,
     }
     SCENE_DIR.mkdir(parents=True, exist_ok=True)
     (SCENE_DIR / "scene.json").write_text(json.dumps(scene, indent=2))
