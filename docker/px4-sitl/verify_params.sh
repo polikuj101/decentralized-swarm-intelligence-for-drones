@@ -4,6 +4,8 @@ set -u
 declare -A expect=(
   [MAV_SYS_ID]="${PX4_SYS_ID:-1}" [SIM_GPS_JAM]=0 [NAV_DLL_ACT]=0 [NAV_RCL_ACT]=0
   [COM_RC_IN_MODE]=4 [COM_RCL_EXCEPT]=7 [COM_ARM_WO_GPS]=1 [EKF2_HGT_REF]=0 [EKF2_EV_CTRL]=4
+  # параметры, из-за которых борты не армировались (старый образ без ослабленных проверок): проверяем значение, а не только наличие
+  [EKF2_REQ_HDRIFT]="5\.0000" [EKF2_REQ_VDRIFT]="5\.0000" [COM_ARM_EKF_POS]="50\.0000" [UXRCE_DDS_PTCFG]=1
 )
 for p in SIM_GPS_JAM_EPH COM_OF_LOSS_T EKF2_EV_DELAY EKF2_EVV_NOISE EKF2_NOAID_TOUT EKF2_GPS_CTRL SDLOG_MODE; do
   expect[$p]=""   # достаточно существования
