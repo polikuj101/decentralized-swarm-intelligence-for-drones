@@ -25,6 +25,10 @@ class DisarmWatch:
 
 DEGRADED_SPEED_MPS = 1.0
 OFFBOARD_NAV_STATE = 14
+# Мягкие аварийные режимы, в которые PX4 переходит при потере оценки позиции (наблюдалось: ALTCTL). Из посадки (18), возврата (5), снижения (12),
+# аварийного завершения (13), ручных и внешних режимов возвращать OFFBOARD нельзя: это отмена сознательного или аварийного решения PX4/оператора.
+OFFBOARD_REENTRY_FROM = frozenset({1, 2, 4})       # ALTCTL, POSCTL, AUTO_LOITER
+OFFBOARD_MAX_TRIES = 15
 
 
 def speed_cap(src, gps_fix, suspect, cruise_mps, degraded_mps=DEGRADED_SPEED_MPS) -> float:
@@ -38,17 +42,23 @@ class OffboardWatch:
     """PX4 может выйти из OFFBOARD (потеря оценки позиции — аварийный режим), а flight_ctrl продолжал слать уставки в пустоту:
     борт спускался и лежал на земле в HOLD. Возвращает True, когда борт взведён, но не в OFFBOARD дольше grace_s (и не чаще retry_s)."""
 
-    def __init__(self, grace_s=1.0, retry_s=2.0):
+    def __init__(self, grace_s=1.0, retry_s=2.0, max_tries=OFFBOARD_MAX_TRIES):
         self.grace_s, self.retry_s, self.since, self.last = grace_s, retry_s, None, -1e9
+        self.max_tries, self.tries = max_tries, 0
 
     def update(self, armed: bool, nav_state, now: float) -> bool:
-        if not armed or nav_state == OFFBOARD_NAV_STATE or nav_state is None:
+        if not armed or nav_state is None or nav_state == OFFBOARD_NAV_STATE:
             self.since = None
+            if nav_state == OFFBOARD_NAV_STATE:
+                self.tries = 0
+            return False
+        if nav_state not in OFFBOARD_REENTRY_FROM:
+            self.since = None                              # сознательный/аварийный режим PX4: не вмешиваемся
             return False
         if self.since is None:
             self.since = now
-        if now - self.since >= self.grace_s and now - self.last >= self.retry_s:
-            self.last = now
+        if now - self.since >= self.grace_s and now - self.last >= self.retry_s and self.tries < self.max_tries:
+            self.last, self.tries = now, self.tries + 1
             return True
         return False
 

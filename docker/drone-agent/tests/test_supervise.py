@@ -94,3 +94,25 @@ def test_offboard_watch_resets_when_back_in_offboard():
     w.update(True, 1, 0.0)
     w.update(True, 14, 0.5)
     assert not w.update(True, 1, 0.8)        # отсчёт начался заново
+
+
+def test_offboard_watch_never_reenters_from_land_rtl_descend_termination_or_manual():
+    """Замечание проверки безопасности: нельзя отменять посадку, возврат или аварийное завершение."""
+    for state in (0, 5, 12, 13, 18, 3, 23):
+        w = OffboardWatch()
+        assert not any(w.update(True, state, t) for t in range(0, 20)), state
+
+
+def test_offboard_watch_reenters_from_benign_fallbacks_only():
+    for state in (1, 2, 4):
+        w = OffboardWatch()
+        w.update(True, state, 0.0)
+        assert w.update(True, state, 1.5), state
+
+
+def test_offboard_watch_gives_up_after_the_retry_cap_and_recovers_after_success():
+    w = OffboardWatch(grace_s=0.0, retry_s=1.0, max_tries=3)
+    fired = [w.update(True, 1, t) for t in range(0, 10)]
+    assert sum(fired) == 3
+    w.update(True, 14, 20.0)                  # вернулись в OFFBOARD — счётчик сброшен
+    assert w.update(True, 1, 21.0) or w.update(True, 1, 22.5)
