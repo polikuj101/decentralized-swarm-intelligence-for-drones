@@ -36,7 +36,7 @@ class FakeEW:
     def __init__(self, status=200, agent_error=None, nested=False):
         self.status, self.agent_error, self.nested, self.calls = status, agent_error, nested, []
 
-    async def request(self, method, url, json=None):
+    async def request(self, method, url, json=None, headers=None):
         self.calls.append((method, url.split("8080")[-1] if "8080" in url else url, json))
         outer = self
 

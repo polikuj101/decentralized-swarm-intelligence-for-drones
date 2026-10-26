@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """gps-jam-bridge: ретранслятор gz.msgs.NavSat между сырым топиком сенсора и топиком PX4.
 Режимы на борт: pass | noise | drift | spoof. HTTP API на :9100 (mgmt-net)."""
+import hmac
 import logging
 import math
 import os
@@ -10,7 +11,7 @@ import time
 from typing import Literal
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from gz.msgs10.navsat_pb2 import NavSat
 from gz.transport13 import Node
 from pydantic import BaseModel, Field
@@ -23,6 +24,7 @@ N = int(os.environ.get("SWARM_SIZE", "5"))
 RAW_T = "/swarm/{n}/navsat_raw"
 OUT_T = "/world/{w}/model/x500_swarm_{n}/link/base_link/sensor/navsat_sensor/navsat"
 M_PER_DEG_LAT = 111_320.0
+EW_TOKEN = os.environ.get("EW_TOKEN", "")
 
 
 class Chan:
@@ -106,7 +108,11 @@ def get_gps():
 
 
 @app.post("/v1/gps")
-def post_gps(r: Req):
+def post_gps(r: Req, authorization: str = Header(default="")):
+    if not EW_TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {EW_TOKEN}".encode()):
+        raise HTTPException(401, "bad token")
     ids = r.drones or list(chans)
     for n in ids:
         c = chans[n]

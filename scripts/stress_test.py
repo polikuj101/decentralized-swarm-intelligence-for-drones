@@ -23,6 +23,21 @@ N_DEFAULT = 5
 OUT = ROOT / "logs" / "stress" / time.strftime("%Y%m%d-%H%M%S")
 OUT.mkdir(parents=True, exist_ok=True)
 
+def ew_token():
+    """Bearer для изменяющих методов ew-controller: EW_TOKEN из окружения или из .env в корне репозитория."""
+    tok = os.environ.get("EW_TOKEN")
+    if tok:
+        return tok
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    try:
+        for line in open(env, encoding="utf-8"):
+            if line.startswith("EW_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
 
 def sh(cmd, check=False, timeout=60, **kw):
     r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout, **kw)
@@ -245,11 +260,11 @@ def v1_netem(n=N_DEFAULT) -> Result:
     groupA, groupB = [1, 2, 3], [4, 5]
     t0 = time.time()
     for a in groupA:
-        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/mesh",
                                          "-H", "Content-Type: application/json",
                                          "-d", json.dumps({"level": "L4", "drones": [a], "peers": [b for b in groupB]})]))
     for b in groupB:
-        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+        ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/mesh",
                                          "-H", "Content-Type: application/json",
                                          "-d", json.dumps({"level": "L4", "drones": [b], "peers": [a for a in groupA]})]))
     split_hold_s = 20
@@ -439,7 +454,7 @@ def v3_sensor_shock() -> Result:
     sh(["./scripts/ewctl.sh", "gps", "restore"])
 
     # GPS drift test
-    ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
+    ew_errors += ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/gps",
         "-H", "Content-Type: application/json",
         "-d", json.dumps({"mode": "drift", "drones": [2], "rate_mps": 2.0, "heading_deg": 90, "sigma_m": 0.3})]))
     t1, suspect2 = time.time(), None
@@ -506,7 +521,7 @@ def v4_resource_pressure() -> Result:
     flood_started = _flood_start(duration_s=50, rate_hz=500, size=64).returncode == 0
     c1 = cid("drone-agent-1")
     sh(["docker", "update", "--cpus", "0.5", c1])
-    ew_errors = ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/gps",
+    ew_errors = ew_agent_errors(sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/gps",
         "-H", "Content-Type: application/json", "-d", json.dumps({"mode": "denied", "drones": [1], "duration_s": 45})]))
     time.sleep(25)                                   # середина окна: флудер жив, лимит CPU выставлен
     nano = sh(["docker", "inspect", "-f", "{{.HostConfig.NanoCpus}}", c1], timeout=15).stdout.strip()
@@ -580,7 +595,7 @@ def collision_resolved(timeline: list, n: int, min_agreed=3) -> bool:
 
 def v5_bid_collision() -> Result:
     res = Result(5, "Two boards get the same SCAN_TARGET T2 command at once: all 5 boards must agree on one stable winner")
-    sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/restore",
+    sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/restore",
         "-H", "Content-Type: application/json", "-d", "{}"])
 
     # раньше в команде не было source/phase/t_mono: схема координатора отклоняла её, и Вектор 5 ничего не проверял

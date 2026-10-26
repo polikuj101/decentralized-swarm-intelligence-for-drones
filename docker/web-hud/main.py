@@ -288,7 +288,7 @@ EW_POST = {"c2": "/v1/ew/c2", "gps": "/v1/ew/gps", "mesh": "/v1/ew/mesh", "resto
 
 async def ew_call(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     try:
-        r = await CLIENT.request(method, EW_URL + path, json=body)
+        r = await CLIENT.request(method, EW_URL + path, json=body, headers={"Authorization": f"Bearer {TOKEN}"})
     except httpx.HTTPError as e:
         raise HTTPException(502, f"ew-controller unreachable: {type(e).__name__}")
     try:

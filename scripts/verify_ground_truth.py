@@ -128,6 +128,21 @@ class GroundTruthHarness:
             except Exception:
                 pass
 
+def ew_token():
+    """Bearer для изменяющих методов ew-controller: EW_TOKEN из окружения или из .env в корне репозитория."""
+    tok = os.environ.get("EW_TOKEN")
+    if tok:
+        return tok
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    try:
+        for line in open(env, encoding="utf-8"):
+            if line.startswith("EW_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
 
 def read_shm(service):
     r = dcx(service, "cat", "/dev/shm/swarm_state.json", timeout=2)
@@ -151,11 +166,11 @@ def run_merge_test(harness, run_idx, max_wait=40.0):
     groupA, groupB = [1, 2, 3], [4, 5]
     print("Включение сетевого разделения L4 ({1,2,3} | {4,5})...", flush=True)
     for a in groupA:
-        sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+        sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/mesh",
             "-H", "Content-Type: application/json",
             "-d", json.dumps({"level": "L4", "drones": [a], "peers": groupB})])
     for b in groupB:
-        sh(["curl", "-fsS", "-X", "POST", "http://127.0.0.1:8080/v1/ew/mesh",
+        sh(["curl", "-fsS", "-X", "POST", "-H", f"Authorization: Bearer {ew_token()}", "http://127.0.0.1:8080/v1/ew/mesh",
             "-H", "Content-Type: application/json",
             "-d", json.dumps({"level": "L4", "drones": [b], "peers": groupA})])
 

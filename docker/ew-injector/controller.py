@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ew-controller: оркестратор РЭБ. HTTP/WS API + таймерные сценарии (YAML)."""
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -9,7 +10,7 @@ from typing import Any, Literal
 
 import httpx
 import yaml
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s ew-controller %(message)s")
@@ -251,6 +252,14 @@ runner = Runner()
 app = FastAPI(title="ew-controller")
 
 
+def require_token(request: Request):
+    """Изменяющие методы РЭБ — только с Bearer EW_TOKEN (HUD, ewctl.sh, скрипты стенда). Пустой токен = отказ, а не «без проверки»."""
+    if not TOKEN:
+        raise HTTPException(503, "EW_TOKEN not configured")
+    if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
+        raise HTTPException(401, "bad token")
+
+
 async def build_state() -> dict:
     ids = list(range(1, N + 1))
     agents, bridge = await asyncio.gather(to_agents(ids, "GET", "/v1/status"), call(BRIDGE, "GET", "/v1/gps"))
@@ -290,22 +299,22 @@ async def ws(sock: WebSocket):
         return
 
 
-@app.post("/v1/ew/c2")
+@app.post("/v1/ew/c2", dependencies=[Depends(require_token)])
 async def ep_c2(r: C2Req):
     return await do_c2(r)
 
 
-@app.post("/v1/ew/gps")
+@app.post("/v1/ew/gps", dependencies=[Depends(require_token)])
 async def ep_gps(r: GpsReq):
     return await do_gps(r)
 
 
-@app.post("/v1/ew/mesh")
+@app.post("/v1/ew/mesh", dependencies=[Depends(require_token)])
 async def ep_mesh(r: MeshReq):
     return await do_mesh(r)
 
 
-@app.post("/v1/ew/restore")
+@app.post("/v1/ew/restore", dependencies=[Depends(require_token)])
 async def ep_restore(r: RestoreReq):
     return await do_restore(r)
 
@@ -328,7 +337,7 @@ async def scenarios():
     return out
 
 
-@app.post("/v1/scenarios/run")
+@app.post("/v1/scenarios/run", dependencies=[Depends(require_token)])
 async def run_scenario(r: RunReq):
     if r.inline:
         sc, name = r.inline, "inline"
@@ -347,7 +356,7 @@ async def run_scenario(r: RunReq):
     return runner.info()
 
 
-@app.post("/v1/scenarios/stop")
+@app.post("/v1/scenarios/stop", dependencies=[Depends(require_token)])
 async def stop_scenario(r: StopReq):
     await runner.stop(restore=r.restore)
     return runner.info()
