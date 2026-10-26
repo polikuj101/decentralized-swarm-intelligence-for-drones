@@ -1,0 +1,13 @@
+[22:23:07] before: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66589 B/s INFO [uxrce_dds_client] Payload rx: 1581 B/s 
+[22:23:21] agent-3 restarted
+[22:23:24] t+2s: INFO [uxrce_dds_client] Running, disconnected 
+[22:23:28] t+5s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 0 B/s INFO [uxrce_dds_client] Payload rx: 0 B/s 
+[22:23:31] t+8s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 0 B/s INFO [uxrce_dds_client] Payload rx: 0 B/s 
+[22:23:36] t+12s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66650 B/s INFO [uxrce_dds_client] Payload rx: 1777 B/s 
+[22:23:40] t+16s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66669 B/s INFO [uxrce_dds_client] Payload rx: 1800 B/s 
+[22:23:44] t+20s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66954 B/s INFO [uxrce_dds_client] Payload rx: 1777 B/s 
+[22:23:55] t+30s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66854 B/s INFO [uxrce_dds_client] Payload rx: 1705 B/s 
+[22:24:10] t+45s: INFO [uxrce_dds_client] Running, connected INFO [uxrce_dds_client] Payload tx: 66490 B/s INFO [uxrce_dds_client] Payload rx: 1754 B/s 
+INFO  [uxrce_dds_client] No ping response, disconnecting
+INFO  [uxrce_dds_client] synchronized with time offset 1793049462181051us
+[22:24:11] HUD D3 nav state/armed: IDLE False

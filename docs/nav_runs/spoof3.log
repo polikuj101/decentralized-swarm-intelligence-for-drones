@@ -1,0 +1,9 @@
+[22:53:10] airborne 5/5
+[22:53:30] drift 2 m/s heading 45 on D1,D2 for 90 s
+{"bridge":{"ok":true,"status":200,"body":{"1":{"mode":"drift","rate_mps":2.0,"heading_deg":45.0,"sigma_m":0.0,"bias_north_m":0.0,"bias_east_m":0.0},"2":{"mode":"drift","rate_mps":2.0,"heading_deg":45.
+D1 (дрейф 2 м/с): тревога t+3.4 с; снято t+129.8 с
+D2 (дрейф 2 м/с): тревога t+3.8 с
+D3 (без подмены): тревог нет
+D4 (без подмены): тревог нет
+D5 (без подмены): тревог нет
+[22:56:22] done

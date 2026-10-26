@@ -1,0 +1,11 @@
+D1 [WARN] [1793049072.668478871] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 1.9 м/с (допуск 1.0) -> nav source VIO, привязка к состоянию до начала расхождения
+D1 [WARN] [1793049561.035988589] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 2.2 м/с (допуск 1.2) -> nav source VIO, привязка к состоянию до начала расхождения
+D1 [INFO] [1793049687.334622178] [flight_ctrl]: GPS consistent again -> nav source PX4
+D2 [WARN] [1793049052.009244955] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 1.4 м/с (допуск 0.7) -> nav source VIO, привязка к состоянию до начала расхождения
+D2 [INFO] [1793049182.977564952] [flight_ctrl]: GPS consistent again -> nav source PX4
+D2 [WARN] [1793049559.813591123] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 1.8 м/с (допуск 1.2) -> nav source VIO, привязка к состоянию до начала расхождения
+D2 [INFO] [1793049665.112512668] [flight_ctrl]: GPS consistent again -> nav source PX4
+D3 [WARN] [1793049087.374253894] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 1.4 м/с (допуск 0.5) -> nav source VIO, привязка к состоянию до начала расхождения
+D3 [INFO] [1793049109.874799377] [flight_ctrl]: GPS consistent again -> nav source PX4
+D3 [WARN] [1793049505.727099798] [flight_ctrl]: GPS SUSPECT: скорость GPS расходится с VIO на 1.3 м/с (допуск 1.1) -> nav source VIO, привязка к состоянию до начала расхождения
+D3 [INFO] [1793049539.254033804] [flight_ctrl]: GPS consistent again -> nav source PX4

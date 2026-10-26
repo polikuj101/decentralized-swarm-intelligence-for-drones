@@ -1,0 +1,14 @@
+== RANGE_SENSORS=gpu
+  /swarm/3/cam_down/image: 12.65 Hz
+  /swarm/3/lidar_ring/scan: 9 Hz
+  /swarm/3/lidar_down/scan: 17.6 Hz
+real_time_factor: 1.0004624637738795 real_time_factor: 0.99797510850484372 real_time_factor: 1.0022116305156403 
+     21 root      20   0 2598868 552356 165560 S  73.3   5.4   1:47.77 ruby
+     72 root      20   0   47712  29496  14524 S   0.0   0.3   0:00.16 python3
+== RANGE_SENSORS=analytic
+  /swarm/3/cam_down/image: 14.9 Hz
+  /swarm/3/lidar_ring/scan: 8.95 Hz
+  /swarm/3/lidar_down/scan: 16.65 Hz
+real_time_factor: 1.0010558636722082 real_time_factor: 0.99992850511188447 real_time_factor: 1.0001627764918741 
+     21 root      20   0 2575344 539196 165872 S  66.7   5.3   1:31.78 ruby
+     57 root      20   0  383228  51820  24856 S   6.7   0.5   0:08.65 python3
