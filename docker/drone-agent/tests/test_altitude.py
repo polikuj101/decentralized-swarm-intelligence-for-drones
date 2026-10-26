@@ -1,0 +1,64 @@
+"""tests/test_altitude.py — высота по дальномеру с запасным EKF и отбраковка выбросов VIO."""
+import math
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from swarm.altitude import fused_height, smooth_alpha, vio_outlier  # noqa: E402
+
+
+def test_fresh_lidar_wins_over_a_biased_ekf():
+    assert fused_height(4.6, 2.4, 0.1) == (2.4, "lidar")
+
+
+def test_stale_missing_or_out_of_range_lidar_falls_back_to_ekf():
+    assert fused_height(4.6, 2.4, 0.9) == (4.6, "ekf")
+    assert fused_height(4.6, None, None) == (4.6, "ekf")
+    assert fused_height(4.6, 0.05, 0.1) == (4.6, "ekf")          # ниже минимальной дальности
+    assert fused_height(4.6, 31.0, 0.1) == (4.6, "ekf")
+    assert fused_height(4.6, float("inf"), 0.1) == (4.6, "ekf")
+    assert fused_height(4.6, float("nan"), 0.1) == (4.6, "ekf")
+
+
+def test_plausible_vio_increment_is_kept():
+    assert not vio_outlier(2.8, 0.1, px4_vn=3.0, px4_ve=0.0, px4_valid=True)
+
+
+def test_near_zero_vio_while_px4_moves_is_an_outlier():
+    """Окно с масштабом VIO/истина 0,03 при движении 3 м/с."""
+    assert vio_outlier(0.1, 0.0, px4_vn=3.0, px4_ve=0.0, px4_valid=True)
+
+
+def test_wrong_direction_vio_is_an_outlier():
+    assert vio_outlier(-2.5, 1.5, px4_vn=3.0, px4_ve=0.0, px4_valid=True)
+
+
+def test_absurd_speed_is_an_outlier_even_without_px4_reference():
+    assert vio_outlier(9.0, 0.0)
+    assert not vio_outlier(2.0, 1.0)
+    assert vio_outlier(float("nan"), 0.0)
+
+
+def test_px4_reference_ignored_when_not_valid():
+    assert not vio_outlier(0.1, 0.0, px4_vn=3.0, px4_ve=0.0, px4_valid=False)
+
+
+def test_smoothing_depends_on_time_not_on_message_count():
+    a_fast, a_slow = smooth_alpha(0.05), smooth_alpha(0.2)
+    assert 0 < a_fast < a_slow < 1
+    assert math.isclose(1 - (1 - a_fast) ** 4, a_slow, rel_tol=1e-9)       # четыре быстрых шага = один медленный
+    assert smooth_alpha(0.0) == 0.0
+
+
+def test_takeoff_needs_lidar_height_not_a_glitchy_ekf():
+    from swarm.altitude import takeoff_complete
+    assert not takeoff_complete(8.3, "ekf", 5.4, elapsed_s=3.0)          # EKF показывает 8 м на земле
+    assert takeoff_complete(5.3, "lidar", 5.4, elapsed_s=3.0)
+    assert not takeoff_complete(2.0, "lidar", 5.4, elapsed_s=3.0)       # ещё не набрали высоту
+
+
+def test_takeoff_falls_back_to_ekf_when_the_rangefinder_never_appears():
+    from swarm.altitude import takeoff_complete
+    assert takeoff_complete(5.3, "ekf", 5.4, elapsed_s=31.0)
+    assert not takeoff_complete(2.0, "ekf", 5.4, elapsed_s=31.0)

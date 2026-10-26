@@ -14,6 +14,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import CameraInfo, Image, Range
 
 from swarm import common
+from swarm.altitude import smooth_alpha, vio_outlier
 
 RESP_MIN = float(os.environ.get("VIO_RESP_MIN", "0.08"))
 FLIP_X = float(os.environ.get("VIO_FLIP_X", "1"))
@@ -36,16 +37,22 @@ class Vio(Node):
         self.fx, self.h, self.hdg, self.win = None, None, None, None
         self.prev, self.prev_t, self.h_prev, self.vz = None, None, None, 0.0
         self.E = self.N = 0.0
+        self.h_t, self.lp = 0.0, None
+        self.rejected, self.accepted, self._log_t = 0, 0, 0.0
 
     def _on_info(self, m):
         self.fx = m.k[0]
 
     def _on_range(self, m):
         if m.min_range <= m.range <= m.max_range:
-            self.h = m.range if self.h is None else 0.7 * self.h + 0.3 * m.range
+            now = time.monotonic()
+            # сглаживание по времени (а не по числу сообщений): при другой частоте дальномера лаг масштаба не меняется
+            self.h = m.range if self.h is None or now - self.h_t > 1.0 else self.h + smooth_alpha(now - self.h_t) * (m.range - self.h)
+            self.h_t = now
 
     def _on_lpos(self, m):
         self.hdg = m.heading
+        self.lp = m
 
     def _on_image(self, m):
         if m.encoding != "mono8" or m.width * m.height != len(m.data):
@@ -63,6 +70,8 @@ class Vio(Node):
         dt = t - prev_t
         if not 0.01 < dt < 0.5:
             return
+        if self.h is None or time.monotonic() - self.h_t > 1.0:       # высота устарела: масштаб смещения неизвестен
+            return
         (dx, dy), resp = cv2.phaseCorrelate(prev, img, self.win)
         if resp < RESP_MIN:
             return
@@ -70,6 +79,14 @@ class Vio(Node):
         f, r = FLIP_Y * dy * s, -FLIP_X * dx * s   # смещение вперёд / вправо, м
         c, sn = math.cos(self.hdg), math.sin(self.hdg)
         dN, dE = f * c - r * sn, f * sn + r * c
+        lp = self.lp
+        if vio_outlier(dN / dt, dE / dt, getattr(lp, "vx", None), getattr(lp, "vy", None), bool(lp and lp.v_xy_valid)):
+            self.rejected += 1
+            if time.monotonic() - self._log_t > 10.0:
+                self._log_t = time.monotonic()
+                self.get_logger().warning(f"VIO outlier rejected ({self.rejected} rejected / {self.accepted} accepted)")
+            return
+        self.accepted += 1
         if self.h_prev is not None:
             self.vz = 0.5 * self.vz + 0.5 * (self.h - self.h_prev) / dt   # вверх
         self.h_prev = self.h

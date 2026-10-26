@@ -12,10 +12,11 @@ from px4_msgs.msg import (OffboardControlMode, SensorGps, TrajectorySetpoint, Ve
                           VehicleLocalPosition, VehicleStatus)
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Range
 from std_msgs.msg import String
 
 from swarm import common
+from swarm.altitude import fused_height, takeoff_complete
 from swarm.supervise import DisarmWatch
 
 MS = common.MISSION
@@ -43,6 +44,7 @@ class Flight(Node):
         self.create_subscription(VehicleStatus, f"{ns}/out/vehicle_status", self._on_vs, qos_profile_sensor_data)
         self.create_subscription(SensorGps, f"{ns}/out/vehicle_gps_position", self._on_gps, qos_profile_sensor_data)
         self.create_subscription(LaserScan, "/sensors/lidar_ring/scan", self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(Range, "/sensors/lidar_down/range", self._on_range, qos_profile_sensor_data)
         self.create_subscription(PointStamped, "/swarm/local/vio_disp", self._on_vio, 10)
         self.create_subscription(String, "/swarm/local/nav_goal", self._on_goal, 10)
 
@@ -56,6 +58,9 @@ class Flight(Node):
         self.ready_t, self.t_cmd = None, 0.0
         self.goal, self.seq, self.idx, self.done, self.dwell_t0 = None, None, 0, False, None
         self.obst_min = 99.0
+        self.h_lidar, self.h_t = None, 0.0        # высота над землёй по нисходящему дальномеру
+        self.zc, self.zsrc = 0.0, "ekf"          # высота для управления и её источник
+        self.t_takeoff = 0.0
         self._t_last = self._t_mon = self._t_stat = time.monotonic()
         self.create_timer(0.05, self._tick)
 
@@ -71,6 +76,10 @@ class Flight(Node):
 
     def _on_scan(self, m):
         self.scan, self.scan_t = m, time.monotonic()
+
+    def _on_range(self, m):
+        if m.min_range <= m.range <= m.max_range:
+            self.h_lidar, self.h_t = float(m.range), time.monotonic()
 
     def _on_vio(self, m):
         self.vio = (m.point.x, m.point.y, time.monotonic())
@@ -196,6 +205,7 @@ class Flight(Node):
         self.p_mode.publish(mode)
 
         have = self._estimate(now, dt)
+        self.zc, self.zsrc = fused_height(self.pz, self.h_lidar, now - self.h_t if self.h_lidar is not None else None)
         if now - self._t_mon >= 1.0:
             self._t_mon = now
             self._monitor(now)
@@ -219,20 +229,20 @@ class Flight(Node):
                 self.ready_t = None
         elif st == "ARMING":
             if self.vs and self.vs.arming_state == 2:
-                self.state, self.label = "TAKEOFF", "TAKEOFF"
+                self.state, self.label, self.t_takeoff = "TAKEOFF", "TAKEOFF", now
             elif now - self.t_cmd > 1.0:
                 self.t_cmd = now
                 self._cmd(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, 1.0, 6.0)
                 self._cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
         elif st == "TAKEOFF":
-            vz = clamp(KZ * (ALT - self.pz), -VZ_DN, VZ_UP)
-            if self.pz > ALT - 0.3:
+            vz = clamp(KZ * (ALT - self.zc), -VZ_DN, VZ_UP)
+            if takeoff_complete(self.zc, self.zsrc, ALT, now - self.t_takeoff):
                 self.state, self.label = "FLY", "HOLD"
         elif st == "FLY":
             vx, vy, vz = self._fly(now, have)
         elif st == "LAND":
             vz = -VZ_DN * 0.75
-            if self.pz < 0.2:
+            if self.zc < 0.25:
                 self._cmd(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0)
                 self.state, self.label = "LANDED", "LANDED"
 
@@ -251,7 +261,7 @@ class Flight(Node):
     def _fly(self, now, have):
         g = self.goal
         alt = g["alt"] if g else ALT
-        vz = clamp(KZ * (alt - self.pz), -VZ_DN, VZ_UP)
+        vz = clamp(KZ * (alt - self.zc), -VZ_DN, VZ_UP)
         if not have or g is None or g["kind"] == "HOLD" or (self.done and g["kind"] == "WAYPOINTS"):
             self.label = "HOLD"
             return 0.0, 0.0, vz
@@ -281,7 +291,7 @@ class Flight(Node):
     def _publish_status(self):
         n = self.lp
         st = {"seq": self.seq, "idx": self.idx, "done": bool(self.done), "state": self.label, "phase": self.state,
-              "x": round(self.px, 2), "y": round(self.py, 2), "z": round(self.pz, 2),
+              "x": round(self.px, 2), "y": round(self.py, 2), "z": round(self.zc, 2), "z_ekf": round(self.pz, 2), "z_src": self.zsrc,
               "vx": round(self.ve, 2), "vy": round(self.vn, 2), "hdg": round(math.degrees(self.hdg), 1),
               "src": self.src, "sigma": round(self.sigma, 1), "gps_fix": self.gps_fix, "gps_suspect": self.suspect,
               "vio_ok": bool(self.vio and time.monotonic() - self.vio[2] < 1.0),
