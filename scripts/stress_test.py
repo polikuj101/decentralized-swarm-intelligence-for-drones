@@ -194,9 +194,12 @@ def survivors_see_dead(states: dict, dead: list) -> bool:
     return all(not (set(st.get("alive", [])) & set(dead)) for st in live)
 
 
-def gps_denial_visible(src_before, srcs_seen, suspect_seen) -> bool:
-    """Отказ GPS наблюдаем по бортовой навигации: источник позиции сменился (VIO/DR) или поднят gps_suspect."""
-    return bool(suspect_seen) or any(s in ("VIO", "DR") and s != src_before for s in srcs_seen)
+def gps_denial_visible(src_before, srcs_seen, suspect_seen, fix_before=None, fix_min_seen=None) -> bool:
+    """Отказ GPS наблюдаем по бортовой навигации: gps_fix упал ниже 3, либо источник позиции сменился (VIO/DR), либо поднят gps_suspect.
+    Живой прогон 2026-10-26: при отказе GPS PX4 держит позицию на скорости VIO (src остаётся PX4), а наблюдаемым признаком служит gps_fix 3 -> 0
+    и фаза DEGRADED_NAV; прежний критерий (только смена src) считал такой отказ «не применённым»."""
+    fix_dropped = fix_before is not None and fix_before >= 3 and fix_min_seen is not None and fix_min_seen < 3
+    return bool(suspect_seen) or fix_dropped or any(s in ("VIO", "DR") and s != src_before for s in srcs_seen)
 
 
 def cpu_limit_applied(nano_cpus, want_cpus: float) -> bool:
@@ -406,18 +409,26 @@ def v2_attrition(n=N_DEFAULT) -> Result:
 def v3_sensor_shock() -> Result:
     res = Result(3, "GPS denial + slow GPS drift (spoofing and VIO loss are NOT injected)")
     before = get_state("drone-agent-1").get("nav", {})
+    if before.get("src") in (None, "NONE") or not before.get("armed"):
+        res.notes = ("ТЕСТ НЕПРИМЕНИМ — D1 не летит (nav.src=%s, armed=%s): отказ GPS нечем наблюдать. Подготовьте рой в полёте "
+                     "(приказ + взлёт) и проверьте связь PX4 с агентом: uxrce_dds_client status, Payload tx > 0." % (before.get("src"), before.get("armed")))
+        res.metrics = {"nav_src_before": before.get("src"), "armed_before": before.get("armed")}
+        return res
     ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "gps", "denied", "1", "20"]))
     t0 = time.time()
     recovered_src, suspect_seen, srcs_seen = None, False, set()
+    fix_before, fix_min_seen = before.get("gps_fix"), None
     while time.time() - t0 < 25:
         nav = get_state("drone-agent-1").get("nav", {})
+        if nav.get("gps_fix") is not None:
+            fix_min_seen = nav["gps_fix"] if fix_min_seen is None else min(fix_min_seen, nav["gps_fix"])
         if nav.get("src"):
             srcs_seen.add(nav.get("src"))
         if nav.get("src") in ("VIO", "DR"):
             recovered_src = nav.get("src")
         if nav.get("gps_suspect"):
             suspect_seen = True
-        if recovered_src:
+        if suspect_seen or (fix_min_seen is not None and fix_min_seen < 3 and fix_before is not None and fix_before >= 3):
             break
         time.sleep(1)
 
@@ -432,7 +443,7 @@ def v3_sensor_shock() -> Result:
         "-H", "Content-Type: application/json",
         "-d", json.dumps({"mode": "drift", "drones": [2], "rate_mps": 2.0, "heading_deg": 90, "sigma_m": 0.3})]))
     t1, suspect2 = time.time(), None
-    while time.time() - t1 < 25:
+    while time.time() - t1 < 75:             # замер 2026-10-26: подозрение на дрейф поднималось через ~40 с (EKF PX4 сначала сопротивляется)
         nav = get_state("drone-agent-2").get("nav", {})
         if nav.get("gps_suspect"):
             suspect2 = time.time() - t1
@@ -448,9 +459,10 @@ def v3_sensor_shock() -> Result:
         "gps_drift_suspect_detected_s": suspect2,
         "nav_src_before": before.get("src"),
         "nav_srcs_seen_during_denial": sorted(srcs_seen),
+        "gps_fix_before": fix_before, "gps_fix_min_during_denial": fix_min_seen,
         "ew_agent_errors": sorted(set(ew_errors))[:5],
     }
-    denial_visible = gps_denial_visible(before.get("src"), srcs_seen, suspect_seen)
+    denial_visible = gps_denial_visible(before.get("src"), srcs_seen, suspect_seen, fix_before, fix_min_seen)
     chaos_applied = denial_visible and not ew_errors
     drift_detected = suspect2 is not None
     res.verdict = "PASS" if (chaos_applied and not crashed and drift_detected) else "FAIL"

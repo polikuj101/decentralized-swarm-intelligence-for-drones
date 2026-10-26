@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from swarm.supervise import DisarmWatch, withdraw_clearable  # noqa: E402
+from swarm.supervise import DisarmWatch, suspect_may_clear, withdraw_clearable  # noqa: E402
 
 
 def test_armed_never_trips():
@@ -42,3 +42,16 @@ def test_withdraw_needs_nominal_held_long_enough():
 def test_withdraw_not_cleared_while_phase_degraded_or_not_withdrawn():
     assert not withdraw_clearable(True, False, 100.0)
     assert not withdraw_clearable(False, True, 100.0)
+
+
+def test_gps_suspect_not_cleared_while_gps_is_offset_from_vio():
+    """Регрессия: после дрейфа GPS позиции совпали по движению, но PX4 смещён на 81 м — оставаться на VIO."""
+    assert not suspect_may_clear(good_count=10, offset_m=81.0)
+
+
+def test_gps_suspect_cleared_when_consistent_and_close():
+    assert suspect_may_clear(good_count=8, offset_m=2.0)
+
+
+def test_gps_suspect_needs_enough_consistent_checks():
+    assert not suspect_may_clear(good_count=7, offset_m=0.5)

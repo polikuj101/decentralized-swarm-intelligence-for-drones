@@ -17,7 +17,7 @@ from std_msgs.msg import String
 
 from swarm import common
 from swarm.altitude import fused_height, takeoff_complete
-from swarm.supervise import DisarmWatch
+from swarm.supervise import DisarmWatch, suspect_may_clear
 
 MS = common.MISSION
 VMAX, WP_R, HOME, ALT = MS["cruise_speed_mps"], MS["wp_radius_m"], common.HOME, common.ALT
@@ -61,6 +61,7 @@ class Flight(Node):
         self.h_lidar, self.h_t = None, 0.0        # высота над землёй по нисходящему дальномеру
         self.zc, self.zsrc = 0.0, "ekf"          # высота для управления и её источник
         self.t_takeoff = 0.0
+        self._t_off_log = 0.0
         self._t_last = self._t_mon = self._t_stat = time.monotonic()
         self.create_timer(0.05, self._tick)
 
@@ -157,8 +158,18 @@ class Flight(Node):
             self.anc = (h[1], h[2], h[3], h[4])
             self.get_logger().warning(f"GPS SUSPECT: px4-vio mismatch {diff:.1f} m -> nav source VIO")
         elif self.suspect and self.good >= 8:
-            self.suspect = False
-            self.get_logger().info("GPS consistent again -> nav source PX4")
+            if self.anc is not None:
+                ex = self.anc[0] + self.vio[0] - self.anc[2]
+                ey = self.anc[1] + self.vio[1] - self.anc[3]
+                offset = math.hypot(wx - ex, wy - ey)
+            else:
+                offset = 0.0
+            if suspect_may_clear(self.good, offset):
+                self.suspect = False
+                self.get_logger().info("GPS consistent again -> nav source PX4")
+            elif now - self._t_off_log > 10.0:
+                self._t_off_log = now
+                self.get_logger().warning(f"GPS движется согласованно с VIO, но смещён на {offset:.0f} м: остаёмся на VIO")
 
     # ───────── обход препятствий ─────────
     def _avoid(self, vgx, vgy, now):

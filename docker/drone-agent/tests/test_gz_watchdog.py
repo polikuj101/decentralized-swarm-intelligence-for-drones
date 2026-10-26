@@ -77,3 +77,26 @@ def test_parse_airborne(wd):
     assert wd.parse_airborne(POSE % ("0.13", "0.13")) is False
     assert wd.parse_airborne(POSE % ("0.13", "3.5")) is True
     assert wd.parse_airborne("nothing here") is None
+
+
+def test_parse_dds_tx(wd):
+    out = "INFO  [uxrce_dds_client] Running, connected\nINFO  [uxrce_dds_client] Payload tx:          0 B/s\nINFO  [uxrce_dds_client] Payload rx:          0 B/s\n"
+    assert wd.parse_dds_tx(out) == 0
+    assert wd.parse_dds_tx("INFO  [uxrce_dds_client] Payload tx:          66644 B/s") == 66644
+    assert wd.parse_dds_tx("not running") is None
+
+
+def test_dds_stale_needs_three_zero_checks_in_a_row(wd):
+    counts = {}
+    assert wd.dds_stale_boards({1: 0, 2: 6000}, counts) == []
+    assert wd.dds_stale_boards({1: 0, 2: 6000}, counts) == []
+    assert wd.dds_stale_boards({1: 0, 2: 6000}, counts) == [1]
+
+
+def test_dds_zero_counter_resets_when_traffic_returns_and_unknown_is_not_zero(wd):
+    counts = {}
+    wd.dds_stale_boards({1: 0}, counts)
+    wd.dds_stale_boards({1: 5000}, counts)
+    assert counts[1] == 0
+    wd.dds_stale_boards({1: None}, counts)
+    assert counts[1] == 0

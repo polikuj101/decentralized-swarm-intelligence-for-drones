@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""gz_watchdog.py — корректно перезапускает симулятор до того, как утечка памяти gz-sim приведёт к OOM.
+"""gz_watchdog.py — сторож стенда: (1) перезапуск симулятора до OOM при росте памяти gz-sim; (2) перезапуск PX4 борта с протухшей сессией DDS.
+
+Утечка gz-sim с 2026-10-26 устранена исправленной Mesa (docker/simulator-core/mesa/), пункт (1) остаётся страховкой.
+(2) Живые прогоны: после перезапуска агента PX4 показывает «connected», но Payload tx = 0 B/s (борт не получает данных и не взлетает);
+сторож замечает это три проверки подряд и перезапускает только этот PX4.
 
 Причина (замеры 2026-10-26): рендер сенсоров через GPU в WSL2 (Mesa D3D12) течёт ~100-240 МБ/мин пока на сенсоры кто-то подписан;
 ядро убивало `gz sim` примерно раз в час, мир сбрасывался, и рой оказывался на земле с недостоверными оценками позиции.
@@ -67,6 +71,25 @@ def parse_airborne(gz_pose_output: str):
     if not zs:
         return None
     return any(z > GROUND_Z_M for z in zs)
+
+
+def parse_dds_tx(status_output: str):
+    """Payload tx (Б/с) из `uxrce_dds_client status`; None, если строки нет."""
+    m = re.search(r"Payload tx:\s*(\d+)\s*B/s", status_output)
+    return int(m.group(1)) if m else None
+
+
+def dds_stale_boards(tx_by_board: dict, zero_counts: dict, need=3) -> list:
+    """Обновляет zero_counts на месте; возвращает борта, у которых передача нулевая need проверок подряд (None не считается нулём)."""
+    stale = []
+    for b, tx in tx_by_board.items():
+        if tx == 0:
+            zero_counts[b] = zero_counts.get(b, 0) + 1
+            if zero_counts[b] >= need:
+                stale.append(b)
+        else:
+            zero_counts[b] = 0
+    return stale
 
 
 def sh(cmd, timeout=60):
@@ -139,6 +162,7 @@ def main():
     a = ap.parse_args()
     log("start", soft_mb=a.soft_mb, hard_mb=a.hard_mb, dry_run=a.dry_run)
     last_wait_log = 0.0
+    zero_counts = {}
     while True:
         if PAUSE.exists():
             if a.once:
@@ -155,6 +179,13 @@ def main():
             elif action == "wait" and time.time() - last_wait_log > 300:
                 last_wait_log = time.time()
                 log("waiting_for_landing", gz_rss_mb=rss, airborne=airborne)
+            if not a.dry_run and action == "none":
+                tx = {i: parse_dds_tx(sh(["docker", "exec", f"swarm-sitl-fc-{i}-1", "px4-shell", "uxrce_dds_client", "status"], timeout=20))
+                      for i in range(1, N + 1)}
+                for i in dds_stale_boards(tx, zero_counts):
+                    log("dds_restart", board=i, why="Payload tx = 0 B/s три проверки подряд")
+                    sh(["docker", "restart", f"swarm-sitl-fc-{i}-1"], timeout=120)
+                    zero_counts[i] = 0
             if a.once:
                 log("check", action=action, gz_rss_mb=rss, airborne=airborne)
                 return
