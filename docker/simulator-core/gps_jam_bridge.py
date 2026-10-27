@@ -24,7 +24,7 @@ N = int(os.environ.get("SWARM_SIZE", "5"))
 RAW_T = "/swarm/{n}/navsat_raw"
 OUT_T = "/world/{w}/model/x500_swarm_{n}/link/base_link/sensor/navsat_sensor/navsat"
 M_PER_DEG_LAT = 111_320.0
-EW_TOKEN = os.environ.get("EW_TOKEN", "")
+ADMIN_TOKEN = os.environ.get("EW_ADMIN_TOKEN", "")   # операторский токен (ew-controller), не тот, что у бортов
 
 
 class Chan:
@@ -109,9 +109,9 @@ def get_gps():
 
 @app.post("/v1/gps")
 def post_gps(r: Req, authorization: str = Header(default="")):
-    if not EW_TOKEN:
-        raise HTTPException(503, "EW_TOKEN not configured")
-    if not hmac.compare_digest(authorization.encode(), f"Bearer {EW_TOKEN}".encode()):
+    if not ADMIN_TOKEN:
+        raise HTTPException(503, "EW_ADMIN_TOKEN not configured")
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {ADMIN_TOKEN}".encode()):
         raise HTTPException(401, "bad token")
     ids = r.drones or list(chans)
     for n in ids:

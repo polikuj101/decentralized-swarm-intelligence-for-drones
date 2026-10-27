@@ -37,6 +37,10 @@ esac
   echo "EW_TOKEN=$(openssl rand -hex 16)" >> .env
   echo "создан EW_TOKEN в .env"
 }
+[ -f .env ] && grep -q '^EW_ADMIN_TOKEN=.\+' .env || {
+  echo "EW_ADMIN_TOKEN=$(openssl rand -hex 16)" >> .env
+  echo "создан EW_ADMIN_TOKEN в .env"
+}
 [ -f .env ] && grep -q '^SWARM_KEY=.\+' .env || {
   echo "SWARM_KEY=$(openssl rand -hex 16)" >> .env
   echo "создан SWARM_KEY в .env"

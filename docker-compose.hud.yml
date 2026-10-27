@@ -7,6 +7,7 @@ services:
       SWARM_SIZE: "5"
       EW_URL: http://172.33.0.2:8080
       EW_TOKEN: ${EW_TOKEN:?задайте EW_TOKEN в .env}
+      EW_ADMIN_TOKEN: ${EW_ADMIN_TOKEN:?задайте EW_ADMIN_TOKEN в .env}   # вызовы изменяющих методов ew-controller
       SCENE_FILE: /opt/swarm/scene/scene.json
       MISSION_FILE: /opt/swarm/config/mission.json
       MAV_BIND: 0.0.0.0:14550

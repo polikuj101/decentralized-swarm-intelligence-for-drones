@@ -18,7 +18,8 @@ log = logging.getLogger("ew-controller")
 
 AGENTS = [u.strip() for u in os.environ["AGENT_URLS"].split(",")]
 BRIDGE = os.environ["SIM_BRIDGE_URL"]
-TOKEN = os.environ.get("EW_TOKEN", "")
+TOKEN = os.environ.get("EW_TOKEN", "")              # общий с бортами: ew_agent на бортах проверяет его
+ADMIN_TOKEN = os.environ.get("EW_ADMIN_TOKEN", "")  # только операторская сторона (HUD, скрипты хоста, мост GPS); бортам не выдаётся
 SCEN_DIR = Path(os.environ.get("SCENARIO_DIR", "/app/scenarios"))
 N = len(AGENTS)
 client = httpx.AsyncClient(timeout=6.0, headers={"Authorization": f"Bearer {TOKEN}"} if TOKEN else {})
@@ -41,9 +42,10 @@ def targets(drones: list[int] | None) -> list[int]:
     return ids
 
 
-async def call(base: str, method: str, path: str, body: dict | None = None) -> dict:
+async def call(base: str, method: str, path: str, body: dict | None = None, token: str | None = None) -> dict:
     try:
-        r = await client.request(method, base + path, json=body)
+        r = await client.request(method, base + path, json=body,
+                                 headers={"Authorization": f"Bearer {token}"} if token is not None else None)
         data = r.json() if r.content else None
         return {"ok": r.status_code < 300, "status": r.status_code, "body": data}
     except Exception as e:  # noqa: BLE001
@@ -153,7 +155,7 @@ async def do_gps(r: GpsReq) -> dict:
         body = {"mode": r.mode, "eph_start_m": r.eph_start_m, "eph_end_m": r.eph_end_m, "ramp_s": r.ramp_s}
         out = {"agents": await to_agents(ids, "POST", "/v1/gps", body)}
     else:
-        out = {"bridge": await call(BRIDGE, "POST", "/v1/gps", {
+        out = {"bridge": await call(BRIDGE, "POST", "/v1/gps", token=ADMIN_TOKEN, body={
             "drones": ids, "mode": r.mode, "rate_mps": r.rate_mps, "heading_deg": r.heading_deg,
             "sigma_m": r.sigma_m, "target_north_m": r.target_north_m, "target_east_m": r.target_east_m})}
     arm_timer("gps", ids, r.duration_s)
@@ -171,7 +173,7 @@ async def do_restore(r: RestoreReq, _from_timer: bool = False) -> dict:
         out["mesh"] = await to_agents(ids, "DELETE", "/v1/mesh")
     if ch in ("gps", "all"):
         out["gps_agents"] = await to_agents(ids, "DELETE", "/v1/gps")
-        out["gps_bridge"] = await call(BRIDGE, "POST", "/v1/gps", {"drones": ids, "mode": "pass"})
+        out["gps_bridge"] = await call(BRIDGE, "POST", "/v1/gps", {"drones": ids, "mode": "pass"}, token=ADMIN_TOKEN)
     if not _from_timer:
         cancel_timers(ch, ids)
     log.info("restore channel=%s drones=%s", ch, ids)
@@ -253,10 +255,11 @@ app = FastAPI(title="ew-controller")
 
 
 def require_token(request: Request):
-    """Изменяющие методы РЭБ — только с Bearer EW_TOKEN (HUD, ewctl.sh, скрипты стенда). Пустой токен = отказ, а не «без проверки»."""
-    if not TOKEN:
-        raise HTTPException(503, "EW_TOKEN not configured")
-    if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {TOKEN}"):
+    """Изменяющие методы РЭБ — только с Bearer EW_ADMIN_TOKEN (HUD, ewctl.sh, скрипты стенда). Это не EW_TOKEN: тот есть у каждого борта,
+    и захваченный борт мог бы включить РЭБ против остальных (автоматическая проверка безопасности 2026-10-26). Пустой токен = отказ."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(503, "EW_ADMIN_TOKEN not configured")
+    if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {ADMIN_TOKEN}"):
         raise HTTPException(401, "bad token")
 
 

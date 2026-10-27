@@ -30,6 +30,7 @@ log = logging.getLogger("web-hud")
 N = int(os.environ.get("SWARM_SIZE", "5"))
 EW_URL = os.environ.get("EW_URL", "http://172.33.0.2:8080")
 TOKEN = os.environ.get("EW_TOKEN", "")
+ADMIN_TOKEN = os.environ.get("EW_ADMIN_TOKEN", "")   # для изменяющих методов ew-controller; бортам не выдаётся
 SCENE_FILE = os.environ.get("SCENE_FILE", "/opt/swarm/scene/scene.json")
 MISSION_FILE = os.environ.get("MISSION_FILE", "/opt/swarm/config/mission.json")
 MAV_BIND = os.environ.get("MAV_BIND", "0.0.0.0:14550")
@@ -288,7 +289,7 @@ EW_POST = {"c2": "/v1/ew/c2", "gps": "/v1/ew/gps", "mesh": "/v1/ew/mesh", "resto
 
 async def ew_call(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     try:
-        r = await CLIENT.request(method, EW_URL + path, json=body, headers={"Authorization": f"Bearer {TOKEN}"})
+        r = await CLIENT.request(method, EW_URL + path, json=body, headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
     except httpx.HTTPError as e:
         raise HTTPException(502, f"ew-controller unreachable: {type(e).__name__}")
     try:

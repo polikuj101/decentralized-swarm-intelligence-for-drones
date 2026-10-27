@@ -129,14 +129,14 @@ class GroundTruthHarness:
                 pass
 
 def ew_token():
-    """Bearer для изменяющих методов ew-controller: EW_TOKEN из окружения или из .env в корне репозитория."""
-    tok = os.environ.get("EW_TOKEN")
+    """Bearer для изменяющих методов ew-controller: EW_ADMIN_TOKEN из окружения или из .env в корне репозитория."""
+    tok = os.environ.get("EW_ADMIN_TOKEN")
     if tok:
         return tok
     env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
     try:
         for line in open(env, encoding="utf-8"):
-            if line.startswith("EW_TOKEN="):
+            if line.startswith("EW_ADMIN_TOKEN="):
                 return line.split("=", 1)[1].strip().strip('"')
     except OSError:
         pass

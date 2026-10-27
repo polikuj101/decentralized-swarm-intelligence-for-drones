@@ -2,8 +2,8 @@
 # ewctl.sh — управление РЭБ с хоста. Требует: curl; EW_URL по умолчанию http://127.0.0.1:8080
 set -euo pipefail
 URL="${EW_URL:-http://127.0.0.1:8080}"
-# изменяющие методы ew-controller требуют Bearer EW_TOKEN: из окружения или из .env в корне репозитория
-TOKEN="${EW_TOKEN:-$(sed -n 's/^EW_TOKEN=//p' "$(dirname "$0")/../.env" 2>/dev/null | tr -d '"')}"
+# изменяющие методы ew-controller требуют Bearer EW_ADMIN_TOKEN: из окружения или из .env в корне репозитория
+TOKEN="${EW_ADMIN_TOKEN:-$(sed -n 's/^EW_ADMIN_TOKEN=//p' "$(dirname "$0")/../.env" 2>/dev/null | tr -d '"\r')}"
 
 arr() { if [ -z "${1:-}" ] || [ "$1" = "all" ]; then echo null; else echo "[${1// /}]"; fi; }
 post() { curl -fsS -X POST "$URL$1" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" -d "$2"; echo; }
