@@ -78,11 +78,13 @@ def parse(text: str) -> dict:
 
 
 def merge(rules: dict, llm: dict) -> tuple:
-    """-> (поля манифеста, источник каждого поля "rules"|"llm"). Зоны — только из правил (пост-проверка: зон, которых нет в тексте, нет)."""
+    """-> (поля манифеста, источник каждого поля "rules"|"llm"). Зоны — только из правил (пост-проверка: зон, которых нет в тексте, нет).
+    rtb_on_complete=False (борт остаётся в воздухе и не возвращается) модель выставить не может: только правила по явным словам.
+    Замер 2026-10-27: Qwen2.5-1.5B ставила False на приказах вроде «Загляни в Дельту»; ответ модели False отбрасывается, поле берётся по умолчанию."""
     out, src = {}, {}
     for k in ("zones", "on_target", "dwell_s", "rtb_on_complete"):
         if rules.get(k) is not None:
             out[k], src[k] = rules[k], "rules"
-        elif k != "zones" and llm.get(k) is not None:
+        elif k != "zones" and llm.get(k) is not None and not (k == "rtb_on_complete" and llm[k] is False):
             out[k], src[k] = llm[k], "llm"
     return out, src

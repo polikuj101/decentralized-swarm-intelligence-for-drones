@@ -73,8 +73,8 @@ def test_order_without_zones_is_rejected_before_calling_the_model(monkeypatch):
 def test_unspecified_fields_come_from_the_model(monkeypatch):
     _fake_llm(monkeypatch, out={"zones": ["all"], "on_target": "DWELL_ONLY", "dwell_s": 11, "rtb_on_complete": False})
     m = tasking.compile_order("Look at Charlie please")
-    assert (m["active_sectors"], m["on_target"], m["dwell_s"], m["rtb_on_complete"]) == ([1], "DWELL_ONLY", 11, False)
-    assert m["parsed_by"] == {"zones": "rules", "on_target": "llm", "dwell_s": "llm", "rtb_on_complete": "llm"}
+    assert (m["active_sectors"], m["on_target"], m["dwell_s"], m["rtb_on_complete"]) == ([1], "DWELL_ONLY", 11, True)   # rtb=False от модели отбрасывается
+    assert m["parsed_by"] == {"zones": "rules", "on_target": "llm", "dwell_s": "llm", "rtb_on_complete": "default"}
 
 
 def test_model_down_still_compiles_with_defaults(monkeypatch):
@@ -131,3 +131,25 @@ def test_dwell(text, want):
 
 def test_without_recon_beats_recon():
     assert order_rules.on_target("при обнаружении только подтверди присутствие, без доразведки") == "DWELL_ONLY"
+
+
+# ───────── модель не может отменить возврат бортов (rtb_on_complete=False) ─────────
+
+def test_model_cannot_set_rtb_false(monkeypatch):
+    """«Загляни в Дельту» без слов об удержании: ответ модели rtb=False отбрасывается, поле берётся по умолчанию (возврат)."""
+    _fake_llm(monkeypatch, out={**WORST_LLM, "rtb_on_complete": False})
+    m = tasking.compile_order("Загляни в Дельту")
+    assert m["rtb_on_complete"] is True and m["parsed_by"]["rtb_on_complete"] == "default"
+
+
+def test_rules_can_still_set_rtb_false(monkeypatch):
+    _fake_llm(monkeypatch, out={**WORST_LLM, "rtb_on_complete": True})
+    m = tasking.compile_order("Search sector Alpha only, then stay in place")
+    assert m["rtb_on_complete"] is False and m["parsed_by"]["rtb_on_complete"] == "rules"
+
+
+def test_model_may_still_confirm_rtb_true():
+    fields, src = order_rules.merge({"zones": ["alpha"], "on_target": None, "dwell_s": None, "rtb_on_complete": None},
+                                    {"on_target": "SKIP", "dwell_s": 5, "rtb_on_complete": True})
+    assert fields["rtb_on_complete"] is True and src["rtb_on_complete"] == "llm"
+    assert fields["on_target"] == "SKIP" and fields["dwell_s"] == 5
