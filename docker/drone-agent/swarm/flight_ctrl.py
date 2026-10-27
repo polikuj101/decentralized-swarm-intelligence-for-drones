@@ -157,15 +157,14 @@ class Flight(Node):
         # 2026-10-26 дал там единственную ложную тревогу из пяти бортов
         steady = self.state == "FLY" and self.zsrc in ("lidar", "lidar+vz") and self.zc >= SPOOF_MIN_ALT_M
         if not (lp and lp.xy_valid and self.vio and now - self.vio[2] < 1.0 and g and now - g[2] < 1.0 and self.gps_fix >= 3 and steady):
-            self.spoof.reset()
+            self.spoof.pause()           # не сброс: когда GPS вернётся, его скачок за разрыв сверяется с VIO
             return
         wx, wy = common.ned_to_world(lp.x, lp.y)
         ge, gn = latlon_to_enu(g[0], g[1], ORIGIN_LAT, ORIGIN_LON)
         anchor = self.spoof.update(now, ge, gn, self.vio[0], self.vio[1], wx, wy)
         if anchor and not self.suspect:
             self.suspect, self.anc = True, anchor
-            self.get_logger().warning(f"GPS SUSPECT: скорость GPS расходится с VIO на {self.spoof.innov:.1f} м/с (допуск {self.spoof.tol:.1f}) "
-                                      f"-> nav source VIO, привязка к состоянию до начала расхождения")
+            self.get_logger().warning(f"GPS SUSPECT: {self.spoof.reason} -> nav source VIO, привязка к последнему согласованному состоянию")
         elif self.suspect and self.spoof.consistent_s >= self.spoof.CLEAR_S and now - self._t_mon >= 1.0:
             self._t_mon = now
             if self.anc is not None:
