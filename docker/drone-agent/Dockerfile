@@ -16,8 +16,13 @@ ARG GGML_FLAGS
 RUN echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf \
  && apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
+# Архив тега проверяется по sha256 до распаковки: тег можно перевесить, архив — подменить (автоматическая проверка безопасности 2026-10-26).
+# Хеш снят дважды 2026-10-26 для b4600; при смене LLAMA_CPP_REF задайте LLAMA_CPP_SHA256 нового архива.
+ARG LLAMA_CPP_SHA256=317efa87cfd06fcf016eeb9b366a0e8dfda36d42449710dd5e3bde2d3d3ee996
 RUN mkdir -p /src \
- && curl -4 -fL --retry 5 --retry-delay 3 "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMA_CPP_REF}.tar.gz" | tar -xz --strip-components=1 -C /src \
+ && curl -4 -fL --retry 5 --retry-delay 3 -o /tmp/llama.tar.gz "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMA_CPP_REF}.tar.gz" \
+ && echo "${LLAMA_CPP_SHA256}  /tmp/llama.tar.gz" | sha256sum --strict --check \
+ && tar -xzf /tmp/llama.tar.gz --strip-components=1 -C /src && rm /tmp/llama.tar.gz \
  && cmake -S /src -B /src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
       -DLLAMA_CURL=OFF ${GGML_FLAGS} \
  && cmake --build /src/build --target llama-server -j8
