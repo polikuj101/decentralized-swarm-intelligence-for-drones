@@ -115,6 +115,10 @@ def read_state():
     return rss, airborne
 
 
+def agent_running(i):
+    return sh(["docker", "inspect", "-f", "{{.State.Running}}", f"swarm-sitl-drone-agent-{i}-1"], timeout=20).strip() == "true"
+
+
 def telemetry_boards():
     try:
         s = json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/state", timeout=6))
@@ -180,7 +184,10 @@ def main():
                 last_wait_log = time.time()
                 log("waiting_for_landing", gz_rss_mb=rss, airborne=airborne)
             if not a.dry_run and action == "none":
+                # Борт с остановленным агентом (в демо агент борта 2 «поражён» docker kill) не протух: обмена нет законно, а перезапуск
+                # его PX4 в воздухе разоружит борт. Такие борта не проверяем (None = «неизвестно», счётчик не растёт).
                 tx = {i: parse_dds_tx(sh(["docker", "exec", f"swarm-sitl-fc-{i}-1", "px4-shell", "uxrce_dds_client", "status"], timeout=20))
+                      if agent_running(i) else None
                       for i in range(1, N + 1)}
                 for i in dds_stale_boards(tx, zero_counts):
                     log("dds_restart", board=i, why="Payload tx = 0 B/s три проверки подряд")
