@@ -55,7 +55,9 @@ fi
 
 # Таймлайн отсчитывается от взлёта роя, а не от приказа: на стенде взлёт занимает 1-2 минуты, и РЭБ «на 25-й секунде» приходился на землю
 # (отказ GPS до взлёта не даёт PX4 взвестись, рой не взлетал вообще — репетиция 2026-10-26).
-echo "ожидание взлёта: не менее 4 бортов в воздухе (до ${TAKEOFF_TIMEOUT_S}с)"
+# Нужны все 5: борт, у которого PX4 остался без положения (репетиция 2026-10-27, D5), не взлетает, а 4 бортов раньше засчитывались.
+MIN_AIRBORNE="${DEMO_MIN_AIRBORNE:-5}"
+echo "ожидание взлёта: не менее ${MIN_AIRBORNE} бортов в воздухе (до ${TAKEOFF_TIMEOUT_S}с)"
 airborne=0
 for k in $(seq 1 $((TAKEOFF_TIMEOUT_S / 5))); do
   airborne=$(curl -s -m 5 http://127.0.0.1:8000/api/state | python3 -c "
@@ -65,9 +67,9 @@ for d in s['drones'].values():
     n = ((d.get('pkt') or {}).get('nav') or {})
     if n.get('state') in ('NAV', 'HOLD', 'DWELL') and (n.get('z') or 0) > 1.0: c += 1
 print(c)" 2>/dev/null)
-  [ "${airborne:-0}" -ge 4 ] && break; sleep 5
+  [ "${airborne:-0}" -ge "$MIN_AIRBORNE" ] && break; sleep 5
 done
-[ "${airborne:-0}" -ge 4 ] || { echo "рой не взлетел за ${TAKEOFF_TIMEOUT_S}с (в воздухе: ${airborne:-0}); РЭБ не запускаю"; exit 1; }
+[ "${airborne:-0}" -ge "$MIN_AIRBORNE" ] || { echo "рой не взлетел за ${TAKEOFF_TIMEOUT_S}с (в воздухе: ${airborne:-0} из ${MIN_AIRBORNE}); РЭБ не запускаю: ./scripts/px4_position_check.sh --fix, при неудаче ./scripts/swarm_fresh.sh"; exit 1; }
 echo "в воздухе: $airborne, отсчёт таймлайна пошёл"
 echo "[3/4] таймлайн: РЭБ через ${RF_AT_S}с, поражение борта $KILL_DRONE через ${KILL_AT_S}с (от взлёта)"
 ( sleep "$RF_AT_S" && ./scripts/ewctl.sh scenario run 05_investor_demo >/dev/null \

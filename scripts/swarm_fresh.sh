@@ -40,6 +40,9 @@ for i in 1 2 3 4 5; do
   say "fc-$i Payload tx = ${tx:-?} B/s"; [ "${tx:-0}" = 0 ] && bad=1
 done
 if [ $bad = 1 ]; then say "ВНИМАНИЕ: у части бортов нет обмена PX4-агент; повторите скрипт или перезапустите такой борт целиком (PX4, затем агент)"; fi
+# У PX4 одного борта после старта может пропасть поток магнитометра и GPS из Gazebo (репетиция 2026-10-27, D5): положения нет, борт не взлетит.
+say "проверка положения ekf2 у всех пяти (при необходимости перезапуск PX4 и агента борта)"
+bash scripts/px4_position_check.sh --fix || bad=1
 if [ -n "$TASK" ]; then
   python3 -c 'import json,sys; print(json.dumps({"prompt": sys.argv[1]}))' "$TASK" > /tmp/swarm_fresh_task.json
   curl -s -m 90 -X POST http://127.0.0.1:8000/api/tasking -H "X-HUD: 1" -H 'Content-Type: application/json' -d @/tmp/swarm_fresh_task.json >/dev/null && say "приказ отправлен"

@@ -17,7 +17,7 @@ say "label=$LABEL"
 # vio_node держит журнал открытым: после rm без перезапуска он пишет в удалённый файл
 for i in 1 2 3 4 5; do docker exec swarm-sitl-drone-agent-$i-1 sh -c 'rm -f /tmp/vio_frames.jsonl; supervisorctl restart vio >/dev/null'; done
 docker cp docs/gz_leak/pose_log.py $SIM:/tmp/pose_log.py
-docker exec $SIM sh -c 'pkill -f pose_log.py; rm -f /tmp/poses.jsonl'
+docker exec $SIM sh -c "pkill -f '[p]ose_log.py'; rm -f /tmp/poses.jsonl"
 docker exec -d $SIM python3 /tmp/pose_log.py /tmp/poses.jsonl
 EV0=$(curl -s http://127.0.0.1:8000/api/evidence | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
 T0=$(date +%s)
@@ -29,7 +29,7 @@ say "run_demo rc=$RC; наблюдение ещё $AFTER_S с"
 sleep "$AFTER_S"
 say "collect"
 for i in 1 2 3 4 5; do docker cp swarm-sitl-drone-agent-$i-1:/tmp/vio_frames.jsonl "$OUT/frames_$i.jsonl" 2>>"$LOG"; done
-docker exec $SIM sh -c 'pkill -f pose_log.py'
+docker exec $SIM sh -c "pkill -f '[p]ose_log.py'"
 docker cp $SIM:/tmp/poses.jsonl "$OUT/poses.jsonl" 2>>"$LOG"
 curl -s http://127.0.0.1:8000/api/state > "$OUT/hud_state.json"
 curl -s http://127.0.0.1:8000/api/evidence > "$OUT/evidence.json"
