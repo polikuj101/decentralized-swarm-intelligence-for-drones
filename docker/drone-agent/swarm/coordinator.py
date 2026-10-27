@@ -88,7 +88,9 @@ class Coordinator(Node):
         self.create_subscription(String, "/swarm/local/planner_cmd", self._on_cmd, 10)
         self.create_subscription(String, "/swarm/local/planner_log", self._on_plog, 10)
         self.manifest_file = os.environ.get("MANIFEST_FILE", "/opt/swarm/config/manifest.json")
-        self.manifest_wait_timeout_s = 90.0
+        # без приказа столько секунд -> все сектора (safety net при потере C2 до приказа). На показе между swarm_fresh.sh и приказом
+        # оператора может пройти больше 90 с, тогда рой уходит на всё поле сам: MANIFEST_WAIT_S в .env (репетиции 2026-10-27)
+        self.manifest_wait_timeout_s = float(os.environ.get("MANIFEST_WAIT_S", "90"))
         self.active_zones, self.manifest, self.manifest_wait_t0 = None, None, now
         self._manifest_poll = 0.0
         self.params = order_params(None, common.MISSION.get("target_dwell_s", 5.0))

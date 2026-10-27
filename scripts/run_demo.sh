@@ -31,6 +31,16 @@ done
 [ $bad = 0 ] || { echo "нет обмена PX4-агент у части бортов: ./scripts/swarm_fresh.sh и повторите"; exit 1; }
 echo "ok"
 
+# Рой после старта взлетает сам и висит, ожидая приказа, но не дольше 90 с (coordinator.manifest_wait_timeout_s): потом он без приказа
+# берёт все сектора, и приказ «Браво» уже ничего не меняет (репетиции 2026-10-27). Приказ надо дать в течение 90 с после swarm_fresh.sh,
+# либо на время показа задать MANIFEST_WAIT_S=900 в .env (swarm_fresh.sh пересоздаст агентов с ним).
+for i in 1 2 3 4 5; do
+  c="swarm-sitl-drone-agent-$i-1"
+  if docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' "$c")" "$c" 2>&1 | grep -q "manifest timeout"; then
+    echo "борт $i не дождался приказа и ушёл на все сектора: ./scripts/swarm_fresh.sh и сразу ./scripts/run_demo.sh"; exit 1
+  fi
+done
+
 echo "[2/4] приказ оператора (pre-flight, C2 ещё жив)"
 if [ "$AUTOPILOT" = 1 ]; then
   TOKEN=$(grep ^EW_TOKEN .env 2>/dev/null | cut -d= -f2 || echo "")
