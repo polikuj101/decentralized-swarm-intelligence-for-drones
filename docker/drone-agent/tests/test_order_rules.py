@@ -131,29 +131,3 @@ def test_dwell(text, want):
 
 def test_without_recon_beats_recon():
     assert order_rules.on_target("при обнаружении только подтверди присутствие, без доразведки") == "DWELL_ONLY"
-
-
-# ───────── примеры в подсказке модели (tasking.SHOTS) ─────────
-
-def test_shots_are_valid_manifest_answers():
-    """Пример, нарушающий грамматику, учил бы модель отвечать вне grammar/manifest.gbnf."""
-    for _q, a in tasking.SHOTS:
-        assert set(a) == {"zones", "on_target", "dwell_s", "rtb_on_complete"}
-        assert 1 <= len(a["zones"]) <= 3 and set(a["zones"]) <= set(order_rules.ZONES) | {"all"}
-        assert a["on_target"] in ("DWELL_RECON", "DWELL_ONLY", "SKIP")
-        assert 3 <= a["dwell_s"] <= 15 and isinstance(a["rtb_on_complete"], bool)
-
-
-def test_shots_do_not_leak_the_eval_set():
-    """Замер точности на CASES честен, только пока примеры не совпадают с проверочными приказами."""
-    shots = {q.strip().lower() for q, _ in tasking.SHOTS}
-    assert not shots & {prompt.strip().lower() for _lang, prompt, _exp in CASES}
-
-
-def test_chat_prompt_layout():
-    p = tasking.chat_prompt("  Проверить Альфу  ")
-    assert p.startswith("<|im_start|>system\n" + tasking.SYSTEM)
-    assert p.count("<|im_start|>user\n") == len(tasking.SHOTS) + 1
-    assert p.endswith("<|im_start|>user\nПроверить Альфу<|im_end|>\n<|im_start|>assistant\n")
-    for q, a in tasking.SHOTS:
-        assert f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n{json.dumps(a, ensure_ascii=False)}<|im_end|>" in p

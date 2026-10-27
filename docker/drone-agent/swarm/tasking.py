@@ -36,26 +36,6 @@ SYSTEM = ("You convert a human operator's mission order (in English or Russian) 
           "unless specified. rtb_on_complete: true unless the order says to hold position after the search.")
 
 
-# Примеры в подсказке: на 20 приказах verify_tasking зоны Qwen2.5-0.5B верны 8/20 без примеров и 19/20 с ними (замер 2026-10-27);
-# тот же замер для 1.5B Q4 дал 18/20 и 19/20 при вдвое большем времени ответа. Примеры не совпадают с приказами verify_tasking.
-SHOTS = (
-    ("Осмотри Эхо, потом возвращайся", {"zones": ["echo"], "on_target": "DWELL_RECON", "dwell_s": 8, "rtb_on_complete": True}),
-    ("Scan Foxtrot, skip contacts, hold position", {"zones": ["foxtrot"], "on_target": "SKIP", "dwell_s": 8, "rtb_on_complete": False}),
-    ("Дельта и Альфа, зависни над целью на 4 секунды",
-     {"zones": ["delta", "alpha"], "on_target": "DWELL_RECON", "dwell_s": 4, "rtb_on_complete": True}),
-    ("Survey all zones, only confirm targets exist", {"zones": ["all"], "on_target": "DWELL_ONLY", "dwell_s": 8, "rtb_on_complete": True}),
-)
-
-
-def chat_prompt(order: str) -> str:
-    """ChatML: системная подсказка, примеры как пары user/assistant, затем приказ оператора."""
-    parts = [f"<|im_start|>system\n{SYSTEM}<|im_end|>\n"]
-    for q, a in SHOTS:
-        parts.append(f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n{json.dumps(a, ensure_ascii=False)}<|im_end|>\n")
-    parts.append(f"<|im_start|>user\n{order.strip()}<|im_end|>\n<|im_start|>assistant\n")
-    return "".join(parts)
-
-
 class TaskingError(Exception):
     pass
 
@@ -110,7 +90,7 @@ def _ask_llm(prompt: str, timeout_s: float):
     # cache_prompt включён: без него обработка системного промпта на каждом приказе давала p50 11 с, p95 14 с (живой прогон 2026-10-26,
     # рой в полёте). Возможная разница ответов модели между вызовами касается только полей, которых нет в тексте; HUD выравнивает по большинству.
     body = {
-        "prompt": chat_prompt(prompt),
+        "prompt": f"<|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n{prompt.strip()}<|im_end|>\n<|im_start|>assistant\n",
         "grammar": grammar, "n_predict": 100, "temperature": 0.0, "top_k": 1, "seed": 42,
         "cache_prompt": True, "stop": ["<|im_end|>"],
     }
