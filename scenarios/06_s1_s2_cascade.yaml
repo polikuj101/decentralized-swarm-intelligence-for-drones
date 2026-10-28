@@ -1,6 +1,5 @@
 name: s1_s2_cascade
-description: Каскад для показа System 1 и System 2. Время от взлёта роя. Сначала помехи (mesh L2, дрейф GPS борта 3) вызывают быстрые рефлексы System 1; затем run_demo.sh с DEMO_KILL_DRONES="2 3 4" убирает три борта, рой падает до SWARM_LOSS и включается System 2 (LLM-советник).
+description: Каскад для показа System 1 и System 2. Время от начала сценария. Дрейф GPS на бортах 3 и 4 вызывает реакции System 1 (удержание позиции, сектора); затем run_demo.sh с DEMO_KILL_DRONES="2 3 4" убирает три борта, у выживших фаза SWARM_LOSS, включается System 2 (LLM-советник). Без mesh-помех - при L2 и L3 живые борта на 15-25 с считают друг друга погибшими (2026-10-28).
 steps:
-  - {at: 0,  action: mesh, params: {level: L2}}
-  - {at: 10, action: gps,  params: {mode: drift, drones: [3], rate_mps: 1.5, heading_deg: 90, sigma_m: 0.5}}
-  - {at: 25, action: restore, params: {channel: mesh}}
+  - {at: 0,  action: gps, params: {mode: drift, drones: [3], rate_mps: 1.5, heading_deg: 90, sigma_m: 0.5}}
+  - {at: 15, action: gps, params: {mode: drift, drones: [4], rate_mps: 1.5, heading_deg: 270, sigma_m: 0.5}}
