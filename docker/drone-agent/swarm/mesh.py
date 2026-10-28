@@ -1,26 +1,17 @@
 """swarm/mesh.py — Zenoh peer-сессия по mesh-net. Только доставка байтов; логика протокола — в coordinator."""
-import json
 import logging
 import threading
 import time
 
 import zenoh
 
+from swarm.mesh_cfg import cfg
+
 log = logging.getLogger("mesh")
 PRIO = {"fail": "REAL_TIME", "claim": "INTERACTIVE_HIGH", "alloc": "INTERACTIVE_LOW", "hb": "DATA"}
 
 
-def _cfg(own_ip, peer_ips, tuned):
-    d = {
-        "mode": "peer",
-        "listen": {"endpoints": [f"udp/{own_ip}:7447"]},
-        "connect": {"endpoints": [f"udp/{ip}:7447" for ip in peer_ips]},
-        "scouting": {"multicast": {"enabled": False}, "gossip": {"enabled": True}},
-    }
-    if tuned:
-        d["transport"] = {"link": {"tx": {"lease": 4000, "keep_alive": 4}}}
-        d["connect"]["retry"] = {"period_init_ms": 500, "period_max_ms": 2000, "period_increase_factor": 2}
-    return json.dumps(d)
+_cfg = cfg
 
 
 class Mesh:

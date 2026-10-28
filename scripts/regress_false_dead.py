@@ -69,6 +69,20 @@ def probes_valid(probes: dict, n: int, min_samples: int) -> bool:
     return (len(probes) == n and all(isinstance(p, dict) and p.get("samples", 0) >= min_samples for p in probes.values()))
 
 
+def environment_record():
+    """Чем реально снят результат: эмуляция помех из состояния ew-агента (nftables или tc, что не воспроизведено) и загрузка хоста.
+    Без этого порог нельзя сравнивать между прогонами (2026-10-28: порог подбирали под tc netem, а стенд на nftables)."""
+    env = {"load_avg": [round(x, 2) for x in os.getloadavg()] if hasattr(os, "getloadavg") else None, "cpus": os.cpu_count()}
+    try:
+        st = json.loads(sh(["./scripts/ewctl.sh", "state"]).stdout)
+        prof = ((st.get("drones") or {}).get("1") or {}).get("mesh", {}).get("profile") or {}
+        env["emulation"] = prof.get("emulation")
+        env["emulation_unsupported"] = prof.get("unsupported")
+    except Exception as e:  # noqa: BLE001
+        env["emulation"] = f"не удалось прочитать: {type(e).__name__}"
+    return env
+
+
 def run_level(level, duration):
     reset_stand(N_DEFAULT)
     ew_errors = ew_agent_errors(sh(["./scripts/ewctl.sh", "mesh", level, "all", str(duration + 10)]))
@@ -84,6 +98,7 @@ def run_level(level, duration):
     threads = [threading.Thread(target=_collect, args=(i,)) for i in range(1, N_DEFAULT + 1)]
     for t in threads:
         t.start()
+    env = environment_record()
     t_start = time.time()
     while any(t.is_alive() for t in threads):
         elapsed = int(time.time() - t_start)
@@ -100,7 +115,7 @@ def run_level(level, duration):
     # все 5 бортов были живы физически всё время -> каждое событие 'dead'/'declared' ложное по определению теста
     return {"level": level, "duration_s": duration, "probes_valid": valid, "ew_agent_errors": sorted(set(ew_errors))[:5],
             "samples": {i: (p or {}).get("samples") for i, p in probes.items()}, "false_dead_count": len(all_dead),
-            "false_declared_failover_count": len(all_declared),
+            "false_declared_failover_count": len(all_declared), "environment": env,
             "dead_events": all_dead, "declared_events": all_declared}
 
 
