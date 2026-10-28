@@ -145,16 +145,20 @@ def nft_mesh_script(dev: str, p: MeshProfile, peer_ips: list[str] | None) -> tup
     if 0 < p.loss_pct < 100 and p.loss_corr_pct > 0:
         unsupported.append("loss_corr (пакетные потери заменены равномерными)")
     to = "" if peer_ips is None else f"ip daddr {{ {', '.join(peer_ips)} }} "
+    frm = "" if peer_ips is None else f"ip saddr {{ {', '.join(peer_ips)} }} "
     out_rules, in_rules = [], []
     if p.loss_pct >= 100:
         out_rules.append(f'oifname "{dev}" {to}counter drop')
         if peer_ips is not None:          # симметрично на приёме, как раньше: жёсткий разрыв с обеих сторон
             in_rules.append(f'iifname "{dev}" ip saddr {{ {", ".join(peer_ips)} }} counter drop')
     else:
+        # Частичные потери и лимит скорости режутся на ПРИЁМЕ: drop в хуке output возвращает отправителю ошибку sendto,
+        # и Zenoh (UDP) рвёт линк при первой же потере - при 50 % связь пропадала целиком за 4 с (опыт 2026-10-28,
+        # docs/HANDOFF_OPEN_PROBLEMS.md); при потере на приёме пакет теряется молча, как в радиоканале.
         if p.loss_pct > 0:
-            out_rules.append(f'oifname "{dev}" {to}numgen random mod 1000 < {round(p.loss_pct * 10)} counter drop')
+            in_rules.append(f'iifname "{dev}" {frm}numgen random mod 1000 < {round(p.loss_pct * 10)} counter drop')
         if p.rate_kbit:
-            out_rules.append(f'oifname "{dev}" {to}limit rate over {p.rate_kbit * 125} bytes/second counter drop')
+            in_rules.append(f'iifname "{dev}" {frm}limit rate over {p.rate_kbit * 125} bytes/second counter drop')
     if not out_rules and not in_rules:
         return None, unsupported
 

@@ -69,11 +69,11 @@ def test_full_blackout_without_peers_drops_whole_interface(ew):
 def test_partial_loss_uses_random_drop_not_a_full_drop(ew):
     """Регрессия: при loss<90 без пиров fallback раньше молча ничего не применял, а при пирах резал 100%."""
     script, _ = ew.nft_mesh_script("eth2", prof(ew, loss_pct=50), None)
-    assert "numgen random mod 1000 < 500 counter drop" in script
-    assert 'oifname "eth2" counter drop' not in script
+    assert 'iifname "eth2" numgen random mod 1000 < 500 counter drop' in script
     peers, _ = ew.nft_mesh_script("eth2", prof(ew, loss_pct=30, peers=[4]), ["172.31.0.14"])
-    assert "ip daddr { 172.31.0.14 } numgen random mod 1000 < 300 counter drop" in peers
-    assert "iifname" not in peers                      # потеря применяется один раз, на выходе (как netem)
+    assert "ip saddr { 172.31.0.14 } numgen random mod 1000 < 300 counter drop" in peers
+    # drop в хуке output даёт отправителю ошибку sendto и рвёт линк Zenoh (опыт 2026-10-28): режем только на приёме
+    assert "oifname" not in script and "oifname" not in peers
 
 
 def test_fractional_loss_has_permille_resolution(ew):
