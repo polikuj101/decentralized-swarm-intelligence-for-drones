@@ -14,6 +14,10 @@
 | **Shield AI** (Hivemind) | «ИИ-пилот» для БПЛА, в том числе для групп | Облёт групп из трёх V-BAT с одним пилотом Hivemind; цель — GPS/comms-denied (срок «2024» заявлен, подтверждения выполнения не нашёл). Партнёры Boeing и ST Engineering | [Defense One 2023](https://defenseone.com/technology/2023/08/shield-ai-drones-demonstrate-autonomous-teaming-under-usaf-contract/389857), [Inside Unmanned Systems](https://insideunmannedsystems.com/?p=38278), [C4ISRNET 2026](https://archetype-c4isrnet-prod.cdn.arcpublishing.com/unmanned/2026/02/06/shield-ai-st-engineering-join-forces-on-fine-tuning-drone-swarms) |
 | **Anduril** (Lattice for Mission Autonomy) | Платформа миссионной автономии для больших групп аппаратов | Выбрана DIU для координации в условиях нарушенной навигации и связи | [Defence Leaders](https://defenceleaders.com/news/anduril-selected-provide-software-autonomous-drone-swarms) |
 
+### FoxFour (foxfour.ai, смотрел сайт 2026-10-28)
+
+Модуль автономии для одного дрона (VGM-208): навигация без GNSS, обнаружение, сопровождение, наведение на цель, сброс груза. Продают OEM, оборонным интеграторам и Минобороны; заявляют боевой опыт в Украине, NDAA-совместимые компоненты, 50+ интеграций, 25 инженеров (Прага, Таллин, Львов). Роевую координацию на сайте не нашёл. Для нас это скорее конкурент за того же покупателя (OEM) и возможный партнёр: слой координации поверх их автономии. Их ядро включает поражение цели, что вне нашего объёма (ISR и координация). Контакт на сайте: info@foxfour.ai. Данные только с публичного сайта, не проверены.
+
 ### Открытый код и исследования
 
 - **Aerostack2** (ROS 2): открытый фреймворк для многороботных воздушных систем, плагины, управление миссиями по поведениям. Диссертация 2025 года на его основе описывает систему распределённого выполнения задач
