@@ -124,9 +124,11 @@ class Coordinator(Node):
     def periods(self, q):
         if q >= 0.7:
             return 0.5, 1.0, 2.0, 1500.0
+        # heartbeat не замедляем при потерях: чем хуже связь, тем нужнее частые пакеты живости (при 2 с и потере 50 %
+        # в окно T_DEAD попадало 1-2 пакета, ложные DEAD, опыт 2026-10-28); claim/alloc и бюджет токенов - как были
         if q >= 0.4:
-            return 1.0, 2.0, 4.0, 800.0
-        return 2.0, 3.0, 6.0, 450.0
+            return 0.5, 2.0, 4.0, 1200.0
+        return 0.5, 3.0, 6.0, 900.0
 
     def alive_set(self, now):
         alive = {ME}
