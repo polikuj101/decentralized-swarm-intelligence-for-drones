@@ -7,6 +7,8 @@ AUTOPILOT="${DEMO_AUTOPILOT:-0}"
 PROMPT="${DEMO_PROMPT:-Разведать квадрат Браво, вскрыть позиции, при обнаружении целей — доразведка и зависание}"
 KILL_AT_S="${DEMO_KILL_AT_S:-100}"
 KILL_DRONE="${DEMO_KILL_DRONE:-2}"
+KILL_DRONES="${DEMO_KILL_DRONES:-$KILL_DRONE}"      # список через пробел, например "2 3 4"
+SCENARIO="${DEMO_SCENARIO:-05_investor_demo}"
 RF_AT_S="${DEMO_RF_AT_S:-25}"
 TAKEOFF_TIMEOUT_S="${DEMO_TAKEOFF_TIMEOUT_S:-240}"
 
@@ -71,11 +73,13 @@ print(c)" 2>/dev/null)
 done
 [ "${airborne:-0}" -ge "$MIN_AIRBORNE" ] || { echo "рой не взлетел за ${TAKEOFF_TIMEOUT_S}с (в воздухе: ${airborne:-0} из ${MIN_AIRBORNE}); РЭБ не запускаю: ./scripts/px4_position_check.sh --fix, при неудаче ./scripts/swarm_fresh.sh"; exit 1; }
 echo "в воздухе: $airborne, отсчёт таймлайна пошёл"
-echo "[3/4] таймлайн: РЭБ через ${RF_AT_S}с, поражение борта $KILL_DRONE через ${KILL_AT_S}с (от взлёта)"
-( sleep "$RF_AT_S" && ./scripts/ewctl.sh scenario run 05_investor_demo >/dev/null \
+echo "[3/4] таймлайн: РЭБ через ${RF_AT_S}с, поражение бортов $KILL_DRONES через ${KILL_AT_S}с (от взлёта)"
+( sleep "$RF_AT_S" && ./scripts/ewctl.sh scenario run "$SCENARIO" >/dev/null \
     && echo "  РЭБ: C2/GPS подавление включено" ) &
-( sleep "$KILL_AT_S" && (docker kill "swarm-sitl-drone-agent-$KILL_DRONE-1" >/dev/null 2>&1 || docker kill "drone-agent-$KILL_DRONE" >/dev/null 2>&1 || true) \
-    && echo "  борт $KILL_DRONE подавлен (симуляция поражения)" ) &
+( sleep "$KILL_AT_S" && for k in $KILL_DRONES; do
+    (docker kill "swarm-sitl-drone-agent-$k-1" >/dev/null 2>&1 || docker kill "drone-agent-$k" >/dev/null 2>&1 || true)
+    echo "  борт $k подавлен (симуляция поражения)"
+  done ) &
 wait
 
 echo "[4/4] таймлайн завершён."
