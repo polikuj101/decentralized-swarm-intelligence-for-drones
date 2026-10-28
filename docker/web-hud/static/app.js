@@ -7,6 +7,15 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt = (v, d = 1) => (typeof v === "number" && isFinite(v)) ? v.toFixed(d) : "—";
 const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+// Имена секторов из приказа оператора: индекс сектора (клетка сетки r*cols+c) -> зона. Тот же порядок, что ZONE_TO_SECTOR в swarm/tasking.py.
+const SECTOR_ZONE = ["Альфа", "Чарли", "Дельта", "Эхо", "Браво", "Фокстрот"];
+const secLabel = (p) => SECTOR_ZONE[p] || ("S" + p);
+// «S4» -> «Браво», «S4.1» (половина разделённого сектора) -> «Браво.1»; цели «T0» не трогаем
+const humanTask = (name) => String(name).replace(/\bS([0-5])((?:\.\d+)?)\b/g, (_, p, q) => secLabel(+p) + q);
+// в тексте событий «S1»/«S2» бывают и системами (cmd S1:SCAN_TARGET), поэтому заменяем только после слов task/hold/prefer и в «S4 split»
+const humanEvent = (text) => String(text)
+  .replace(/\b(task|hold|prefer)\s+S([0-5])((?:\.\d+)?)\b/g, (_, w, p, q) => `${w} ${secLabel(+p)}${q}`)
+  .replace(/^S([0-5]) split\b/, (_, p) => `${secLabel(+p)} split`);
 
 let cfg = null, N = 5, map = null, ws = null;
 const M = {drone: {}, trail: {}, sigma: {}, link: {}, sec: [], pos: {}, taskLayer: null};
@@ -51,7 +60,7 @@ function buildMap() {
     const p = r * cols + c, x0 = A.x_min + c * cw, y0 = A.y_min + r * rh;
     M.sec[p] = L.rectangle([[y0, x0], [y0 + rh, x0 + cw]],
       {color: "#5b6b7c", weight: 1, fillColor: "#5b6b7c", fillOpacity: 0.05, interactive: false}).addTo(map);
-    L.marker([y0 + rh - 3, x0 + 4], {icon: L.divIcon({className: "lbl", html: "S" + p, iconSize: [30, 14]}), interactive: false}).addTo(map);
+    L.marker([y0 + rh - 3, x0 + 4], {icon: L.divIcon({className: "lbl", html: secLabel(p) + " <small>S" + p + "</small>", iconSize: [90, 14]}), interactive: false}).addTo(map);
   }
   for (const o of sc.obstacles) {
     L.rectangle([[o.y_m - o.size_m[1] / 2, o.x_m - o.size_m[0] / 2], [o.y_m + o.size_m[1] / 2, o.x_m + o.size_m[0] / 2]],
@@ -190,7 +199,7 @@ function cardHtml(i, d, ew) {
   h += row("NAV", esc(`${n.state} · ${n.src} · σ ${fmt(n.sigma)} м · alt ${fmt(p.pos[2])} м`));
   h += row("Фаза/S1", esc(`${p.phase || "—"} · ${(p.s1 || {}).mode || "—"} · p95 ${(p.s1 || {}).p95_ms ?? "—"} мс`));
   h += row("Препятствие", n.obst_min < 50 ? esc(fmt(n.obst_min) + " м") : "—");
-  h += row("Задача", esc(`${sw.task_name || "—"} · эпоха ${sw.epoch} · готово ${sw.done.length}/${sw.total_tasks}`));
+  h += row("Задача", esc(`${sw.task_name ? humanTask(sw.task_name) : "—"} · эпоха ${sw.epoch} · готово ${sw.done.length}/${sw.total_tasks}`));
   h += row("Mesh", esc(`q ${fmt(m.link_q, 2)} · peers ${m.zenoh_peers} · ${meshLabel(ew.mesh)}`));
   h += row("LLM", esc(`${ls.calls || 0} выз. (✔${ls.accepted || 0} ✘${ls.rejected || 0} ⚠${ls.failed || 0}) · ${l.last_latency_ms ?? "—"} мс`));
   return h;
@@ -247,7 +256,7 @@ function feedEl(f) {
              mk("span", "v " + f.verdict, (f.verdict || "?") + lat));
     if (f.reasoning) e.append(mk("div", "why", "« " + f.reasoning + " »"));
     if (f.reason) e.append(mk("div", "why err", "⤷ " + f.reason));
-  } else e.append(mk("span", "ev", "• " + f.text));
+  } else e.append(mk("span", "ev", "• " + humanEvent(f.text)));
   return e;
 }
 
@@ -390,7 +399,7 @@ function buildTasking() {
         card.style.display = "block";
         card.replaceChildren(
           mk("b", null, "Скомпилированный Task Manifest: "),
-          document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (сектора ${(b.active_sectors || []).join(",")}) | ` +
+          document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (${(b.active_sectors || []).map((p) => secLabel(p) + " = S" + p).join(", ")}) |` +
             `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
           mk("br"),
           mk("span", "dim", `Разбор: зоны — ${src("zones")}, при контакте — ${src("on_target")}, время — ${src("dwell_s")}, RTB — ${src("rtb_on_complete")}` +
