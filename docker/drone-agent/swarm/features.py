@@ -2,6 +2,12 @@
 from dataclasses import dataclass
 
 T_SUSPECT = 3.0
+T_SUSPECT_LOSSY = 10.0       # при плохой связи молчание соседа ожидаемо (потери), объявлять отказ рано: DECLARE_FAILOVER рвёт задачи живого борта
+LINK_OK = 0.6
+
+
+def suspect_after(link_q: float) -> float:
+    return T_SUSPECT if link_q >= LINK_OK else T_SUSPECT_LOSSY
 
 
 @dataclass(frozen=True)
@@ -54,7 +60,7 @@ def build_obs(st: dict) -> Obs:
         gps_fix=int(nav.get("gps_fix", 3)), gps_suspect=bool(nav.get("gps_suspect")), sigma=float(nav.get("sigma", 0.0)),
         min_silent_s=min(live) if live else 0.0, max_silent_s=max(live) if live else 0.0,
         n_suspect=sum(1 for p in peers.values()
-                      if not p["alive"] and not p["declared_failed"] and p["silent_s"] >= T_SUSPECT),
+                      if not p["alive"] and not p["declared_failed"] and p["silent_s"] >= suspect_after(float(st["link_q"]))),
         idle=st.get("task") is None, task_kind="TARGET" if name.startswith("T") else "SECTOR" if name else "none",
         n_open_targets=sum(1 for t in st["open"] if t["kind"] == "TARGET"),
         withdrawn=bool(st.get("withdrawn")), override_active=st.get("override") is not None)

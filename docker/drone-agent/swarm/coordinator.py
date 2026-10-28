@@ -326,6 +326,11 @@ class Coordinator(Node):
             self.adopt(d["epoch"], now, f"failover from {s}")
         f = d["failed"]
         if f in self.peers and f != s:
+            pf = self.peers[f]
+            if pf.last_rx is not None and now - pf.last_rx < T_DEAD:
+                # сам слышу этого борта: чужой FAIL - ложная тревога от соседа с потерями; не рвём задачи живого (2026-10-28)
+                self.log(f"peer {f} FAIL from {s} ignored: heard directly {now - pf.last_rx:.1f}s ago")
+                return
             self.force_dead.add(f)
             self.cbaa.drop_peer(f)
             self.reset_cbaa(now)

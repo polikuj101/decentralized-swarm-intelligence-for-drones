@@ -81,3 +81,26 @@ def test_candidates_property_g2():
                     assert A.permitted(ph, src, a.tool), (
                         f"VIOLATION: tool {a.tool} not permitted in phase {ph.value} for source {src}"
                     )
+
+
+def _silent_peer_state(link_q, silent_s):
+    st = synth_state(random.Random(7))
+    for p in st["peers"].values():
+        p.update(alive=True, declared_failed=False, silent_s=0.5)
+    k = sorted(st["peers"])[0]
+    st["peers"][k].update(alive=False, silent_s=silent_s)
+    st["link_q"] = link_q
+    return st, k
+
+
+def test_failover_waits_longer_on_a_lossy_link():
+    """Регрессия 2026-10-28: при mesh L2 живые борта объявляли друг друга отказавшими (70 за 5 мин)."""
+    def failovers(st):
+        return [c for c in enumerate_candidates(st, build_obs(st), A.Phase.NOMINAL, "S1") if c.tool == "DECLARE_FAILOVER"]
+    st, k = _silent_peer_state(link_q=0.9, silent_s=4.0)
+    assert [c.args.failed for c in failovers(st)] == [int(k)]
+    st, _ = _silent_peer_state(link_q=0.4, silent_s=4.0)
+    assert failovers(st) == [] and build_obs(st).n_suspect == 0
+    st, k = _silent_peer_state(link_q=0.4, silent_s=11.0)
+    assert [c.args.failed for c in failovers(st)] == [int(k)]
+

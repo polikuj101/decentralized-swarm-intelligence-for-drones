@@ -2,7 +2,7 @@
 import math
 
 from swarm import actions as A
-from swarm.features import T_SUSPECT, Obs
+from swarm.features import Obs, suspect_after
 
 MOVERS = {"HOLD_SECTOR", "EVADE_JAMMING", "NAVIGATE_TO"}
 
@@ -10,8 +10,9 @@ MOVERS = {"HOLD_SECTOR", "EVADE_JAMMING", "NAVIGATE_TO"}
 def enumerate_candidates(st: dict, o: Obs, phase: A.Phase, source: str) -> list:
     x, y = st["pos"][0], st["pos"][1]
     out = []
+    t_suspect = suspect_after(o.link_q)
     for k, p in sorted(st["peers"].items(), key=lambda kv: -kv[1]["silent_s"]):
-        if not p["alive"] and not p["declared_failed"] and p["silent_s"] >= T_SUSPECT:
+        if not p["alive"] and not p["declared_failed"] and p["silent_s"] >= t_suspect:
             out.append(A.DeclareFailover(args=A.DeclareFailoverArgs(failed=int(k))))
     near = sorted((t for t in st["open"] if t["kind"] == "TARGET"), key=lambda t: math.hypot(t["cx"] - x, t["cy"] - y))
     for t in near[:2]:
