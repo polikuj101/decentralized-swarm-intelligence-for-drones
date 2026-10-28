@@ -18,7 +18,7 @@ def _cfg(own_ip, peer_ips, tuned):
         "scouting": {"multicast": {"enabled": False}, "gossip": {"enabled": True}},
     }
     if tuned:
-        d["transport"] = {"link": {"tx": {"lease": 4000, "keep_alive": 1000}}}
+        d["transport"] = {"link": {"tx": {"lease": 4000, "keep_alive": 4}}}
         d["connect"]["retry"] = {"period_init_ms": 500, "period_max_ms": 2000, "period_increase_factor": 2}
     return json.dumps(d)
 
