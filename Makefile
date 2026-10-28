@@ -1,4 +1,4 @@
-.PHONY: all fetch-embedder build up down restart test-s1 test-hud bench isolation soak failover help
+.PHONY: all fetch-embedder build up down restart test-s1 test-host test-hud bench isolation soak failover help
 
 all: help
 
@@ -19,6 +19,10 @@ restart:
 
 test-s1:
 	docker compose exec -T drone-agent-1 /usr/local/bin/ros-run.sh pytest -v -p no:launch_testing -p no:launch_ros -p no:anyio /opt/swarm/tests
+
+# Тесты агента на хосте, без ROS и WSL (test_injection.py пропускаем: ему нужен живой ROS).
+test-host:
+	cd docker/drone-agent && PYTHONPATH=. python -m pytest tests -q -p no:cacheprovider --ignore=tests/test_injection.py
 
 # Тесты web-hud на хосте (pip install pytest fastapi httpx). cd нужен: корневой tests/ — симлинк, который pytest под Windows не обходит.
 test-hud:
