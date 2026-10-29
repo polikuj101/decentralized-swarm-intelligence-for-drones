@@ -88,7 +88,7 @@ class System1(Node):
             dt = (time.monotonic() - t_in) * 1000.0
             self.pub_log.publish(String(data=json.dumps({
                 "kind": "decision", "source": "S1", "id": self.n, "t": round(st["t"], 1), "trigger": phase.value,
-                "reasoning": f"{dec.path} score={dec.score:.2f}", "tool": cmd["tool"], "args": cmd["args"],
+                "reasoning": f"{dec.rule} {dec.path} score={dec.score:.2f}", "rule": dec.rule, "tool": cmd["tool"], "args": cmd["args"],
                 "verdict": "ACCEPTED", "reason": "", "latency_ms": round(dt, 1)})))
         self.lat.append((time.monotonic() - t_in) * 1000.0)
 

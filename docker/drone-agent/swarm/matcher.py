@@ -5,34 +5,22 @@ import threading
 from collections import OrderedDict, deque
 
 from swarm.actions import Phase
+from swarm.rules import fired
 
 COOLDOWN_S = {"DECLARE_FAILOVER": 20.0, "EVADE_JAMMING": 60.0}
 DEFAULT_COOLDOWN_S = 30.0
 
 
 class Decision:
-    __slots__ = ("action", "score", "path", "scores")
+    __slots__ = ("action", "score", "path", "scores", "rule")
 
-    def __init__(self, action=None, score=0.0, path="idle", scores=None):
-        self.action, self.score, self.path, self.scores = action, score, path, scores or {}
+    def __init__(self, action=None, score=0.0, path="idle", scores=None, rule=""):
+        self.action, self.score, self.path, self.scores, self.rule = action, score, path, scores or {}, rule
 
 
 def rule_score(a, o, phase: Phase) -> float:
-    """срочность действия [0..1]; 0 = не применимо (жёсткий gate). Инструменты только для S2 здесь не оцениваются."""
-    t = a.tool
-    if t == "DECLARE_FAILOVER":
-        return 0.95 if o.n_suspect > 0 else 0.0
-    if t == "RETURN_HOME":
-        return 0.95 if phase == Phase.CRITICAL else 0.6 if (phase == Phase.ISOLATED and o.sigma > 20) else 0.0
-    if t == "HOLD_POSITION":
-        return 0.8 if phase == Phase.CRITICAL else 0.7 if (phase == Phase.DEGRADED_NAV and o.sigma > 20) else 0.0
-    if t == "EVADE_JAMMING":
-        return 0.75 if phase in (Phase.DEGRADED_COMMS, Phase.ISOLATED) else 0.0
-    if t == "HOLD_SECTOR":
-        return 0.65 if (phase == Phase.DEGRADED_NAV and o.sigma > 10) else 0.55 if phase == Phase.ISOLATED else 0.0
-    if t == "SCAN_TARGET":
-        return 0.55 if (o.idle and o.n_open_targets > 0) else 0.0
-    return 0.0
+    """срочность действия [0..1]; 0 = не применимо (жёсткий gate). Таблица правил: swarm/rules.py."""
+    return fired(a.tool, o, phase)[0]
 
 
 class Matcher:
@@ -92,9 +80,9 @@ class Matcher:
             k = self.key_of(a)
             if self.until.get(k, 0.0) > now:
                 continue
-            r = rule_score(a, o, phase)
+            r, rid = fired(a.tool, o, phase)
             if r > 0.0:
-                scored.append((a, k, r))
+                scored.append((a, k, r, rid))
         if not scored:
             return Decision(path="idle")
         sims, path = None, "rules"
@@ -105,13 +93,13 @@ class Matcher:
         if sims:
             lo, hi = min(sims.values()), max(sims.values())
         best, scores = None, {}
-        for a, k, r in scored:
+        for a, k, r, rid in scored:
             e = 0.5 if not sims or hi - lo < 1e-3 else (sims.get(a.tool, lo) - lo) / (hi - lo)
             s = self.w * r + (1.0 - self.w) * e
             scores[a.tool] = round(s, 3)
             if best is None or s > best[2]:
-                best = (a, k, s)
+                best = (a, k, s, rid)
         if best[2] < self.tau:
             return Decision(path=path, scores=scores)
         self.until[best[1]] = now + COOLDOWN_S.get(best[0].tool, DEFAULT_COOLDOWN_S)
-        return Decision(best[0], best[2], path, scores)
+        return Decision(best[0], best[2], path, scores, best[3])
