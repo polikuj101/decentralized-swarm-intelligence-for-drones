@@ -1,0 +1,7 @@
+name: cascade_mesh_l2
+description: Каскад 06 плюс mesh L2 (потери 50%, 20 кбит/с) с 20 с по 80 с от начала сценария. Проверка, что при плохой связи и потере трёх бортов выжившие не объявляют друг друга погибшими (heartbeat 0.5 с, 2026-10-29).
+steps:
+  - {at: 0,  action: gps, params: {mode: drift, drones: [3], rate_mps: 1.5, heading_deg: 90, sigma_m: 0.5}}
+  - {at: 15, action: gps, params: {mode: drift, drones: [4], rate_mps: 1.5, heading_deg: 270, sigma_m: 0.5}}
+  - {at: 20, action: mesh, params: {level: L2}}
+  - {at: 80, action: restore, params: {channel: mesh}}
