@@ -15,7 +15,7 @@ from swarm import actions as A, common, wire
 from swarm.bids import compute_bid
 from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
-from swarm.features import silent_for
+from swarm.features import T_DEAD, dead_after, lossy_until_after_rx, silent_for
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
 from swarm.orders import manifest_signature, needs_rebuild, order_params, target_dwell_s, task_enabled
@@ -23,7 +23,7 @@ from swarm.replay import SeqFilter
 from swarm.supervise import withdraw_clearable
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
-T_DEAD, T_SUSPECT, SETTLE_S = 3.5, 3.0, 2.0
+T_SUSPECT, SETTLE_S = 3.0, 2.0      # T_DEAD в features.py
 AUTO_RESUME = os.environ.get("SWARM_AUTO_RESUME", "0") == "1"       # снятие отзыва (RETURN_HOME) без команды оператора — только по явному включению
 STATE_CODE = {"IDLE": 0, "TAKEOFF": 1, "NAV": 2, "HOLD": 3, "DWELL": 4, "RTB": 5, "LANDED": 6}
 CODE_STATE = {v: k for k, v in STATE_CODE.items()}
@@ -54,6 +54,7 @@ class Coordinator(Node):
         super().__init__("coordinator")
         now = time.monotonic()
         self.t0 = now
+        self.lossy_until = 0.0  # до этого момента порог DEAD увеличен: паузы приёма (>= 1.5 с) значат потери на канале
         self.t_live0 = now      # с этого момента борт в эфире: до приказа молчание соседей не считается
         self.lock = threading.RLock()
         self.peers = {i: Peer() for i in range(1, N + 1) if i != ME}
@@ -133,16 +134,17 @@ class Coordinator(Node):
         return 0.5, 3.0, 6.0, 900.0
 
     def alive_set(self, now):
+        t_dead = dead_after(now < self.lossy_until)
         alive = {ME}
         for j, p in self.peers.items():
             if j in self.force_dead:
                 continue
-            if p.last_rx is not None and now - p.last_rx < T_DEAD:
+            if p.last_rx is not None and now - p.last_rx < t_dead:
                 alive.add(j)
                 continue
             for k, pk in self.peers.items():
                 if (k != j and k not in self.force_dead and pk.heard_rx is not None
-                        and now - pk.heard_rx < T_DEAD and (pk.heard >> (j - 1)) & 1):
+                        and now - pk.heard_rx < t_dead and (pk.heard >> (j - 1)) & 1):
                     alive.add(j)
                     break
         return alive
@@ -287,6 +289,7 @@ class Coordinator(Node):
                 for _ in range(gap - 1):
                     p.q *= 0.9
             p.q = p.q * 0.9 + 0.1
+        self.lossy_until = lossy_until_after_rx(now, p.last_rx, self.lossy_until)
         p.seq, p.last_rx, p.rx = seq, now, p.rx + 1
         p.x, p.y, p.z, p.state, p.flags = d["x"], d["y"], d["z"], d["state"], d["flags"]
         p.sigma, p.task, p.epoch, p.link_q = d["sigma"], d["task"], d["epoch"], d["link_q"]
@@ -331,7 +334,7 @@ class Coordinator(Node):
         f = d["failed"]
         if f in self.peers and f != s:
             pf = self.peers[f]
-            if pf.last_rx is not None and now - pf.last_rx < T_DEAD:
+            if pf.last_rx is not None and now - pf.last_rx < dead_after(now < self.lossy_until):
                 # сам слышу этого борта: чужой FAIL - ложная тревога от соседа с потерями; не рвём задачи живого (2026-10-28)
                 self.log(f"peer {f} FAIL from {s} ignored: heard directly {now - pf.last_rx:.1f}s ago")
                 return

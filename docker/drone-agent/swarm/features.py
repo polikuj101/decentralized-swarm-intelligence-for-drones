@@ -1,6 +1,10 @@
 """swarm/features.py — состояние -> типизированный Obs -> бакеты -> каноническая строка (закрытый словарь)."""
 from dataclasses import dataclass
 
+T_DEAD = 3.5
+T_DEAD_LOSSY = 8.0        # при потерях паузы в 3-6 с на прямом канале обычны (L2); без gossip соседей они давали ложный DEAD (2026-10-29)
+GAP_LOSSY_S = 1.5         # пауза между пакетами живости больше этого значит, что канал теряет пакеты
+LOSSY_HOLD_S = 15.0
 T_SUSPECT = 3.0
 T_SUSPECT_LOSSY = 10.0       # при плохой связи молчание соседа ожидаемо (потери), объявлять отказ рано: DECLARE_FAILOVER рвёт задачи живого борта
 LINK_OK = 0.6
@@ -8,6 +12,17 @@ LINK_OK = 0.6
 
 def suspect_after(link_q: float) -> float:
     return T_SUSPECT if link_q >= LINK_OK else T_SUSPECT_LOSSY
+
+
+def dead_after(lossy: bool) -> float:
+    return T_DEAD_LOSSY if lossy else T_DEAD
+
+
+def lossy_until_after_rx(now: float, last_rx, lossy_until: float) -> float:
+    """продлить режим «канал с потерями», если между двумя приёмами от соседа прошла пауза >= GAP_LOSSY_S"""
+    if last_rx is not None and now - last_rx >= GAP_LOSSY_S:
+        return max(lossy_until, now + LOSSY_HOLD_S)
+    return lossy_until
 
 
 def silent_for(now: float, last_rx, t_live0: float) -> float:

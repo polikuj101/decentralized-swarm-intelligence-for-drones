@@ -102,3 +102,19 @@ def test_warmup_counts_from_going_live():
     assert build_obs(st).uptime_s == 2.0
     del st["t_live"]                       # старый формат состояния: от старта
     assert build_obs(st).uptime_s == 300.0
+
+
+def test_dead_threshold_grows_on_a_lossy_channel():
+    from swarm.features import GAP_LOSSY_S, LOSSY_HOLD_S, T_DEAD, T_DEAD_LOSSY, dead_after, lossy_until_after_rx
+    assert dead_after(False) == T_DEAD == 3.5
+    assert dead_after(True) == T_DEAD_LOSSY > 2 * T_DEAD - 0.1
+    # регулярный приём 0.5 с: режим не включается
+    assert lossy_until_after_rx(now=10.0, last_rx=9.5, lossy_until=0.0) == 0.0
+    # первый приём от соседа: пауз ещё не измерили
+    assert lossy_until_after_rx(now=10.0, last_rx=None, lossy_until=0.0) == 0.0
+    # пауза 1.5 с и больше: режим на LOSSY_HOLD_S
+    assert lossy_until_after_rx(now=10.0, last_rx=10.0 - GAP_LOSSY_S, lossy_until=0.0) == 10.0 + LOSSY_HOLD_S
+    # режим не сокращается более поздней, но короткой паузой
+    assert lossy_until_after_rx(now=12.0, last_rx=11.5, lossy_until=25.0) == 25.0
+    # и продлевается следующей паузой
+    assert lossy_until_after_rx(now=20.0, last_rx=17.0, lossy_until=25.0) == 20.0 + LOSSY_HOLD_S
