@@ -10,6 +10,12 @@ def suspect_after(link_q: float) -> float:
     return T_SUSPECT if link_q >= LINK_OK else T_SUSPECT_LOSSY
 
 
+def silent_for(now: float, last_rx, t_live0: float) -> float:
+    """сколько секунд сосед молчит. Отсчёт не раньше t_live0: пока борт сам не вышел в эфир (ждёт приказ), соседи тоже молчат,
+    и это не отказ (иначе в момент приказа фаза ISOLATED и ложные DECLARE_FAILOVER)."""
+    return now - max(t_live0, last_rx if last_rx is not None else t_live0)
+
+
 @dataclass(frozen=True)
 class Obs:
     uptime_s: float
@@ -56,7 +62,7 @@ def build_obs(st: dict) -> Obs:
     live = [p["silent_s"] for p in peers.values() if not p["declared_failed"]]
     name = st.get("task_name") or ""
     return Obs(
-        uptime_s=float(st["t"]), n_total=len(peers) + 1, n_alive=len(st["alive"]), link_q=float(st["link_q"]),
+        uptime_s=float(st.get("t_live", st["t"])), n_total=len(peers) + 1, n_alive=len(st["alive"]), link_q=float(st["link_q"]),
         gps_fix=int(nav.get("gps_fix", 3)), gps_suspect=bool(nav.get("gps_suspect")), sigma=float(nav.get("sigma", 0.0)),
         min_silent_s=min(live) if live else 0.0, max_silent_s=max(live) if live else 0.0,
         n_suspect=sum(1 for p in peers.values()

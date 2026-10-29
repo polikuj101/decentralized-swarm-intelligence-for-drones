@@ -15,6 +15,7 @@ from swarm import actions as A, common, wire
 from swarm.bids import compute_bid
 from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
+from swarm.features import silent_for
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
 from swarm.orders import manifest_signature, needs_rebuild, order_params, target_dwell_s, task_enabled
@@ -53,6 +54,7 @@ class Coordinator(Node):
         super().__init__("coordinator")
         now = time.monotonic()
         self.t0 = now
+        self.t_live0 = now      # с этого момента борт в эфире: до приказа молчание соседей не считается
         self.lock = threading.RLock()
         self.peers = {i: Peer() for i in range(1, N + 1) if i != ME}
         self.epoch, self.done, self.split2, self.split3 = 0, 0, 0, 0
@@ -505,6 +507,7 @@ class Coordinator(Node):
                 if self.active_zones is None:   # таймаут без приказа — safety net, не демо-путь
                     self.active_zones = set(range(common.COLS * common.ROWS))
                     self.log("manifest timeout -> fallback: все сектора активны")
+                self.t_live0 = now
                 self.reset_cbaa(now)
             self._poll_manifest(now)
             if AUTO_RESUME and withdraw_clearable(self.withdrawn, self.phase == A.Phase.NOMINAL, now - self.phase_t):
@@ -652,7 +655,7 @@ class Coordinator(Node):
         hb_p, cl_p, al_p, rate = self.periods(q)
         peers = {}
         for j, p in self.peers.items():
-            silent = now - (p.last_rx if p.last_rx is not None else self.t0)
+            silent = silent_for(now, p.last_rx, self.t_live0)
             peers[str(j)] = {
                 "alive": j in alive, "declared_failed": j in self.force_dead, "silent_s": round(silent, 1),
                 "q": round(self.peer_q(p, now), 2), "x": p.x, "y": p.y, "z": p.z,
@@ -665,7 +668,7 @@ class Coordinator(Node):
                 "splittable": j < common.COLS * common.ROWS and not (self.split2 >> j) & 1}
                for j in self.open_tasks()]
         x, y, z = self.pos()
-        st = {"t": round(now - self.t0, 1), "me": ME, "epoch": self.epoch, "pos": [x, y, z], "nav": self.nav,
+        st = {"t": round(now - self.t0, 1), "t_live": round(now - self.t_live0, 1), "me": ME, "epoch": self.epoch, "pos": [x, y, z], "nav": self.nav,
               "task": self.exec_task, "task_name": self.tasks[self.exec_task].name if self.exec_task is not None else None,
               "cbaa_x": self.cbaa.x, "winners": {str(j): self.cbaa.z[j] for j in range(M) if self.cbaa.z[j]},
               "done": [j for j in range(M) if (self.done >> j) & 1], "total_tasks": len(self.tasks),

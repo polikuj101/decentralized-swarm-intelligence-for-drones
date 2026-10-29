@@ -68,3 +68,37 @@ def test_gps_drift_reflex_waits_for_sigma():
         t += 1.0
     assert first["R7"] > 60.0      # реакция на дрейф при исправном VIO не быстрее минуты
     assert first["R5"] > first["R7"]
+
+
+def test_silence_counts_from_going_live_not_from_boot():
+    from swarm.features import silent_for
+    # борт ждал приказ 300 с, соседей не слышал (никто не в эфире): в момент приказа молчание 0, а не 300
+    assert silent_for(now=400.0, last_rx=None, t_live0=400.0) == 0.0
+    assert silent_for(now=402.0, last_rx=None, t_live0=400.0) == 2.0
+    # после приказа сосед услышан: отсчёт от последнего приёма
+    assert silent_for(now=410.0, last_rx=408.0, t_live0=400.0) == 2.0
+    # приём раньше выхода в эфир (перезапуск координатора): не раньше t_live0
+    assert silent_for(now=401.0, last_rx=100.0, t_live0=400.0) == 1.0
+
+
+def test_no_isolated_phase_at_the_moment_of_order():
+    from swarm.phase import PhaseTracker
+    from swarm.features import silent_for
+    # 300 с после загрузки, все соседи ни разу не слышны, борт только что вышел в эфир
+    silent = silent_for(now=300.0, last_rx=None, t_live0=300.0)
+    o = _obs(uptime_s=300.0, n_total=5, n_alive=5, min_silent_s=silent, max_silent_s=silent, n_suspect=0,
+             gps_fix=3, gps_suspect=False, link_q=1.0)
+    assert PhaseTracker.raw(o) == P.NOMINAL
+    # а если сосед правда молчит 15 с после выхода в эфир, ISOLATED остаётся
+    silent = silent_for(now=315.0, last_rx=None, t_live0=300.0)
+    o = _obs(uptime_s=315.0, n_total=5, n_alive=1, min_silent_s=silent, max_silent_s=silent, n_suspect=4,
+             gps_fix=3, gps_suspect=False, link_q=1.0)
+    assert PhaseTracker.raw(o) == P.ISOLATED
+
+
+def test_warmup_counts_from_going_live():
+    st = synth_state(random.Random(5))
+    st["t"], st["t_live"] = 300.0, 2.0
+    assert build_obs(st).uptime_s == 2.0
+    del st["t_live"]                       # старый формат состояния: от старта
+    assert build_obs(st).uptime_s == 300.0
