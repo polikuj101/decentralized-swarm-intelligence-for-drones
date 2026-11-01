@@ -8,8 +8,9 @@ FIELDS = ("active_sectors", "on_target", "dwell_s", "rtb_on_complete")
 
 
 def signature(manifest: dict) -> str:
+    assign = sorted((k, sorted(v)) for k, v in (manifest.get("assignments") or {}).items())
     return json.dumps([sorted(manifest.get("active_sectors") or []), manifest.get("on_target"),
-                       manifest.get("dwell_s"), manifest.get("rtb_on_complete")])
+                       manifest.get("dwell_s"), manifest.get("rtb_on_complete"), assign])
 
 
 def choose(results: list):

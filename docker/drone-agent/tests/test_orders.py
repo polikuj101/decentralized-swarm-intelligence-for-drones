@@ -15,7 +15,7 @@ def m(**kw):
 
 def test_no_manifest_keeps_previous_behaviour():
     p = order_params(None)
-    assert p == {"skip_targets": False, "capture": True, "dwell_s": 5.0, "rtb": True, "on_target": "DWELL_RECON"}
+    assert p == {"skip_targets": False, "capture": True, "dwell_s": 5.0, "rtb": True, "on_target": "DWELL_RECON", "allowed": None}
 
 
 def test_skip_removes_targets_but_not_sectors():

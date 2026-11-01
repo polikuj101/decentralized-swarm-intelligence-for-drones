@@ -49,6 +49,10 @@ def compile_order(prompt: str, timeout_s: float = 20.0) -> dict:
     rules = order_rules.parse(prompt)
     if rules["zones"] is None:
         raise TaskingError("в приказе не названа ни одна зона: назовите квадраты (Альфа…Фокстрот) или «все»")
+    try:
+        assign = order_rules.assignments(prompt, common.SWARM_SIZE)
+    except ValueError as e:
+        raise TaskingError(str(e))
     t0 = time.monotonic()
     llm, llm_error = ({}, None) if all(v is not None for v in rules.values()) else _ask_llm(prompt, timeout_s)
     fields, parsed_by = order_rules.merge(rules, llm)
@@ -58,13 +62,21 @@ def compile_order(prompt: str, timeout_s: float = 20.0) -> dict:
     zones = fields["zones"]
     sectors = sorted(set(ZONE_TO_SECTOR.values())) if "all" in zones else sorted({ZONE_TO_SECTOR[z] for z in zones})
 
-    return {
+    all_sectors = sorted(set(ZONE_TO_SECTOR.values()))
+    assignments = {str(d): (all_sectors if "all" in zs else sorted({ZONE_TO_SECTOR[z] for z in zs})) for d, zs in sorted(assign.items())}
+    if assignments:
+        parsed_by["assignments"] = "rules"
+
+    m = {
         "manifest_id": f"m-{int(time.time())}", "source_prompt": prompt.strip()[:300],
         "zones_named": zones, "active_sectors": sectors, "on_target": fields["on_target"],
         "dwell_s": int(fields["dwell_s"]), "rtb_on_complete": bool(fields["rtb_on_complete"]),
         "parsed_by": parsed_by, "llm_zones": llm.get("zones"), "llm_error": llm_error,
         "compiled_at": time.time(), "latency_ms": round((time.monotonic() - t0) * 1000, 1),
     }
+    if assignments:
+        m["assignments"] = assignments
+    return m
 
 
 def _ask_llm(prompt: str, timeout_s: float):

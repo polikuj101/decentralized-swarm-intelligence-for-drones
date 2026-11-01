@@ -22,4 +22,13 @@ def manifest_problem(m, n_sectors: int):
         return f"dwell_s вне {DWELL_MIN_S}..{DWELL_MAX_S}: {dwell!r}"
     if "rtb_on_complete" in m and not isinstance(m["rtb_on_complete"], bool):
         return f"rtb_on_complete не bool: {m['rtb_on_complete']!r}"
+    if "assignments" in m:
+        a = m["assignments"]
+        if not isinstance(a, dict) or not a:
+            return "assignments не объект или пуст"
+        for d, secs in a.items():
+            if not (isinstance(d, str) and d.isdigit() and int(d) >= 1):
+                return f"assignments: номер борта {d!r} не целое >= 1"
+            if not isinstance(secs, list) or not secs or any(isinstance(s, bool) or not isinstance(s, int) or s not in sectors for s in secs):
+                return f"assignments[{d}] должны быть непустым списком из active_sectors: {secs!r}"
     return None

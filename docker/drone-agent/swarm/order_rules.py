@@ -72,6 +72,41 @@ def rtb(text: str):
     return ret
 
 
+# «D1», «борт 2», «дроны 1, 2 и 3», «drones 1 and 2»: ключевое слово и список номеров
+DRONE_REF = re.compile(r"\b(?:d|д|борт\w*|дрон\w*|drones?)\s*[-#№]?\s*(\d{1,2}(?:\s*(?:,|и|and|&)\s*\d{1,2})*)")
+# «остальные»: все борта, которых нет ни в одной фразе с номерами
+REST = re.compile(r"\bостальн|\bостал\w*\s+борт|\bthe\s+rest\b|\bothers?\b|\bremaining\b")
+SEGMENT_END = re.compile(r"[;.!?\n]+|(?=\bостальн|\bостал\w*\s+борт|\bthe\s+rest\b|\bothers?\b|\bremaining\b)")
+
+
+def drones_named(text: str) -> list:
+    nums = {int(n) for m in DRONE_REF.finditer(text.lower()) for n in re.findall(r"\d+", m.group(1))}
+    return sorted(nums)
+
+
+def assignments(text: str, n_drones: int) -> dict:
+    """Приказ с адресацией бортов: «D1 и D2 — Дельта и Фокстрот, остальные — Альфа» -> {1: [delta, foxtrot], 2: [...], 3: [alpha], ...}.
+    Фраза с номерами бортов и зонами привязывает эти борта к этим зонам; «остальные» с зонами — все борта, не названные по номерам.
+    Без адресации (нет ни номеров, ни «остальных» рядом с зонами) -> {}: все борта торгуются за все активные сектора.
+    Номер борта вне 1..n_drones — ValueError: молча пропустить адресата хуже, чем отказать."""
+    named, rest = {}, []
+    for seg in SEGMENT_END.split(text.lower()):
+        zs = zones(seg)
+        if not seg.strip() or not zs:
+            continue
+        if REST.match(seg.strip()):
+            rest = sorted(set(rest) | set(zs))
+        else:
+            for d in drones_named(seg):
+                if not 1 <= d <= n_drones:
+                    raise ValueError(f"борт {d} вне роя 1..{n_drones}")
+                named[d] = sorted(set(named.get(d, [])) | set(zs))
+    if rest:
+        for d in range(1, n_drones + 1):
+            named.setdefault(d, list(rest))
+    return named
+
+
 def parse(text: str) -> dict:
     """Поля, которые однозначно следуют из текста; None — в тексте ничего нет, поле берётся из ответа модели."""
     return {"zones": zones(text) or None, "on_target": on_target(text), "dwell_s": dwell_s(text), "rtb_on_complete": rtb(text)}

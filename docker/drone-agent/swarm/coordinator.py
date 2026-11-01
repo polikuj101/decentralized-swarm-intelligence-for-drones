@@ -18,7 +18,7 @@ from swarm.cbaa import CBAA
 from swarm.features import T_DEAD, dead_after, lossy_until_after_rx, silent_for
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
-from swarm.orders import manifest_signature, needs_rebuild, order_params, target_dwell_s, task_enabled
+from swarm.orders import manifest_signature, needs_rebuild, order_params, sector_allowed, target_dwell_s, task_enabled
 from swarm.replay import SeqFilter
 from swarm.supervise import withdraw_clearable
 
@@ -96,7 +96,7 @@ class Coordinator(Node):
         self.manifest_wait_timeout_s = float(os.environ.get("MANIFEST_WAIT_S", "90"))
         self.active_zones, self.manifest, self.manifest_wait_t0 = None, None, now
         self._manifest_poll = 0.0
-        self.params = order_params(None, common.MISSION.get("target_dwell_s", 5.0))
+        self.params = order_params(None, common.MISSION.get("target_dwell_s", 5.0), common.DRONE_ID)
         self.log("ожидание Task Manifest (NL-приказ оператора)...")
         self.create_timer(0.1, self.tick)
         self.log("coordinator started")
@@ -167,7 +167,7 @@ class Coordinator(Node):
                     self.log(f"manifest отклонён: {bad}")
                 return False
             self.active_zones, self.manifest = set(m["active_sectors"]), m
-            self.params = order_params(m, common.MISSION.get("target_dwell_s", 5.0))
+            self.params = order_params(m, common.MISSION.get("target_dwell_s", 5.0), common.DRONE_ID)
             self.log(f"manifest загружен: zones={m.get('zones_named')} sectors={sorted(self.active_zones)} on_target={m.get('on_target')}")
             return True
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
@@ -188,7 +188,7 @@ class Coordinator(Node):
         if m.get("manifest_id") == (self.manifest or {}).get("manifest_id") and manifest_signature(m) == manifest_signature(self.manifest):
             return                                  # тот же id и то же содержимое; один id с другим содержимым — это новый приказ
         new = set(m["active_sectors"])
-        new_params = order_params(m, common.MISSION.get("target_dwell_s", 5.0))
+        new_params = order_params(m, common.MISSION.get("target_dwell_s", 5.0), common.DRONE_ID)
         changed = new != self.active_zones or needs_rebuild(self.params, new_params)
         self.manifest, self.params = m, new_params
         if not changed:
@@ -218,6 +218,8 @@ class Coordinator(Node):
     def bid_for(self, j, now):
         if self.withdrawn:
             return 0
+        if not sector_allowed(self.params, self._zone_of(j)):
+            return 0                                # приказ с адресацией: чужой сектор этому борту не положен, нулевую ставку CBAA не выбирает
         t = self.tasks[j]
         x, y, _ = self.pos()
         dx, dy = t.cx - x, t.cy - y
