@@ -118,3 +118,11 @@ def test_hud_consensus_distinguishes_assignments():
     assert order_consensus.signature(a) != order_consensus.signature(b)
     chosen, dissent, _ = order_consensus.choose([{"drone": i, "ok": True, "body": a if i != 4 else b} for i in range(1, 6)])
     assert chosen is a and dissent == [4]
+
+
+@pytest.mark.parametrize("bad", [{"assignments": [1, 2]}, {"assignments": {"1": 5}}, {"active_sectors": 7}])
+def test_hud_consensus_treats_malformed_manifest_as_missing(bad):
+    good = _manifest()
+    chosen, dissent, missing = order_consensus.choose(
+        [{"drone": 1, "ok": True, "body": good}, {"drone": 2, "ok": True, "body": {**good, **bad}}, {"drone": 3, "ok": True, "body": good}])
+    assert chosen is good and dissent == [] and missing == [2]

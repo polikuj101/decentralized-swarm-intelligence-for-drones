@@ -16,7 +16,14 @@ def signature(manifest: dict) -> str:
 def choose(results: list):
     """results: [{"drone": i, "ok": bool, "body": manifest}]. -> (выбранный манифест | None, борта с другим манифестом, борта без манифеста).
     Побеждает подпись, которую выдало больше бортов; при равенстве — та, что у борта с меньшим номером."""
-    good = sorted((r for r in results if r.get("ok") and isinstance(r.get("body"), dict)), key=lambda r: r["drone"])
+    def readable(r):
+        try:
+            signature(r["body"])
+            return True
+        except (TypeError, AttributeError, ValueError):     # искажённый манифест (чужой тип поля): борт считается без манифеста
+            return False
+
+    good = sorted((r for r in results if r.get("ok") and isinstance(r.get("body"), dict) and readable(r)), key=lambda r: r["drone"])
     if not good:
         return None, [], [r["drone"] for r in results]
     count = {}
