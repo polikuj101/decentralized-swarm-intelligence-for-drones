@@ -54,6 +54,7 @@ function buildMap() {
   const gs = {color: "#222c3a", weight: 1, interactive: false};
   for (let x = gx0; x <= gx1; x += 10) L.polyline([[gy0, x], [gy1, x]], gs).addTo(map);
   for (let y = gy0; y <= gy1; y += 10) L.polyline([[y, gx0], [y, gx1]], gs).addTo(map);
+  loadTerrain();
 
   const {cols, rows} = cfg.mission.grid, cw = (A.x_max - A.x_min) / cols, rh = (A.y_max - A.y_min) / rows;
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
@@ -89,6 +90,40 @@ function refDrone(s) {
   }
   return best;
 }
+
+// Подложка: открытые данные OSM, район масштабирован в область сцены (scripts/build_terrain.py). Нет файла — карта как раньше.
+const TERR = {
+  road_major: {color: "#6b7a8c", weight: 2.5}, road: {color: "#4d5a69", weight: 1.5}, track: {color: "#3a4553", weight: 1, dashArray: "3 3"},
+  rail: {color: "#7a7f88", weight: 1.5, dashArray: "6 3"}, river: {color: "#2f6f9f", weight: 1.5},
+};
+const TERR_AREA = {
+  forest: {color: "#1d3a2a", fillColor: "#1d3a2a", fillOpacity: 0.55, weight: 0}, water: {color: "#1c3b5a", fillColor: "#1c3b5a", fillOpacity: 0.7, weight: 0},
+};
+async function loadTerrain() {
+  try {
+    const r = await fetch("/static/terrain.json", {cache: "no-cache"});
+    if (!r.ok) return;
+    const t = await r.json();
+    map.createPane("terrain").style.zIndex = 250;      // ниже секторов, целей и бортов
+    const rend = L.svg({pane: "terrain"});
+    const ll = (pts) => pts.map(([x, y]) => [y, x]);
+    for (const p of t.polys || []) L.polygon(ll(p.pts), {...TERR_AREA[p.kind], renderer: rend, interactive: false}).addTo(map);
+    for (const l of t.lines || []) L.polyline(ll(l.pts), {...TERR[l.kind], renderer: rend, interactive: false}).addTo(map);
+    for (const p of t.places || []) {
+      L.marker([p.y, p.x], {pane: "terrain", interactive: false,
+        icon: L.divIcon({className: "plc " + p.kind, html: esc(p.name), iconSize: [100, 12]})}).addTo(map);
+    }
+    const m = t.meta || {}, note = L.control({position: "bottomleft"});
+    note.onAdd = () => mk("div", "terr-note", `SIMULATION · масштабная карта района (1 м сцены ≈ ${m.real_m_per_scene_m} м местности) · ${m.source}`);
+    note.addTo(map);
+  } catch (e) { /* подложка необязательна */ }
+}
+
+const fmtAssign = (a) => {
+  const g = {};
+  for (const [d, s] of Object.entries(a)) (g[JSON.stringify(s)] ||= []).push(d);
+  return Object.entries(g).map(([s, ds]) => "D" + ds.join(",D") + " → " + JSON.parse(s).map((p) => secLabel(p)).join(", ")).join(" · ");
+};
 
 function updateMap(s, ref) {
   const doneAll = new Set(), exec = {};
@@ -388,7 +423,7 @@ function buildTasking() {
         return;
       }
       const oks = (data.results || []).filter(r => r.ok && r.body);
-      const sig = (b) => JSON.stringify([b.active_sectors, b.on_target, b.dwell_s, b.rtb_on_complete]);
+      const sig = (b) => JSON.stringify([b.active_sectors, b.on_target, b.dwell_s, b.rtb_on_complete, b.assignments || null]);
       const sigs = new Set(oks.map(r => sig(r.body)));
       const firstOk = oks[0];
       if (firstOk) {
@@ -401,6 +436,7 @@ function buildTasking() {
           mk("b", null, "Скомпилированный Task Manifest: "),
           document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (${(b.active_sectors || []).map((p) => secLabel(p) + " = S" + p).join(", ")}) |` +
             `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
+          ...(b.assignments ? [mk("br"), mk("span", null, "Адресация бортов: " + fmtAssign(b.assignments))] : []),
           mk("br"),
           mk("span", "dim", `Разбор: зоны — ${src("zones")}, при контакте — ${src("on_target")}, время — ${src("dwell_s")}, RTB — ${src("rtb_on_complete")}` +
             (b.llm_error ? " · бортовая модель недоступна" : (b.llm_zones ? ` · модель предлагала зоны [${b.llm_zones.join(", ")}]` : ""))),

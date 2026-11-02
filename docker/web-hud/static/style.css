@@ -69,3 +69,6 @@ button{cursor:pointer}button:hover{background:#26344a}button.danger{border-color
 #graph{width:100%;height:auto;background:#0c1118;border-radius:6px}
 #graph text{fill:#d7dee8;font:11px system-ui,sans-serif;text-anchor:middle}
 #graph .sub{fill:#8493a6;font-size:9px}
+.plc{color:#8fa0b4;font:10px ui-monospace,monospace;white-space:nowrap;text-shadow:0 0 3px #0a0e14,0 0 3px #0a0e14}
+.plc.city,.plc.town{font-size:12px;color:#b4c2d4}
+.terr-note{background:#0e131add;border:1px solid #33425a;color:#9aa8ba;font:10px ui-monospace,monospace;padding:2px 6px;margin:0 0 4px 4px}
