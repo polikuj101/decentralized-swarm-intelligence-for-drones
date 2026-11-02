@@ -25,6 +25,7 @@ from swarm.supervise import withdraw_clearable
 
 ME, N, M = common.DRONE_ID, common.SWARM_SIZE, common.TASK_COUNT
 T_SUSPECT, SETTLE_S = 3.0, 2.0      # T_DEAD в features.py
+STALL_RESTART = os.environ.get("SWARM_MESH_STALL_RESTART", "1") == "1"   # перезапуск при заклинивании слушателя Zenoh (mesh_cfg.py)
 AUTO_RESUME = os.environ.get("SWARM_AUTO_RESUME", "0") == "1"       # снятие отзыва (RETURN_HOME) без команды оператора — только по явному включению
 STATE_CODE = {"IDLE": 0, "TAKEOFF": 1, "NAV": 2, "HOLD": 3, "DWELL": 4, "RTB": 5, "LANDED": 6}
 CODE_STATE = {v: k for k, v in STATE_CODE.items()}
@@ -511,6 +512,13 @@ class Coordinator(Node):
     def tick(self):
         with self.lock:
             now = time.monotonic()
+            if self.mesh.stalled and STALL_RESTART:
+                # слушатель Zenoh заклинило (swarm/mesh_cfg.py): в этом процессе mesh не вернётся, порт 7447 не освободить;
+                # выход -> supervisord перезапускает координатор, приказ берётся из тома состояния, задачи и эпоха — от соседей
+                self.log(f"mesh stalled (rx backlog {self.mesh.backlog} B on :7447), restarting coordinator")
+                self.fdlog.write("stall", backlog=self.mesh.backlog)
+                self.fdlog.close()
+                os._exit(3)
             if self.active_zones is None:
                 got = self._try_load_manifest(now)
                 if not got and now - self.manifest_wait_t0 <= self.manifest_wait_timeout_s:
@@ -701,6 +709,7 @@ class Coordinator(Node):
                            if self.manifest else
                            {"id": None, "sectors": sorted(self.active_zones or []), "source": "fallback" if self.active_zones else "waiting"}),
               "mesh": {"ready": self.mesh.ready, "tuned": self.mesh.tuned, "zenoh_peers": self.mesh.peers_connected(),
+                       "rx_backlog": self.mesh.backlog, "stalled": self.mesh.stalled,
                        "dropped": self.dropped, "bad_tag": self.bad_tag, "tx_bytes": self.mesh.tx_bytes}}
         payload = json.dumps(st)
         self.pub_state.publish(String(data=payload))

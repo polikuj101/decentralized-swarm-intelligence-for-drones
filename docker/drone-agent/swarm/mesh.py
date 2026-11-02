@@ -5,7 +5,7 @@ import time
 
 import zenoh
 
-from swarm.mesh_cfg import cfg
+from swarm.mesh_cfg import StallWatch, cfg, listen_backlog
 
 log = logging.getLogger("mesh")
 PRIO = {"fail": "REAL_TIME", "claim": "INTERACTIVE_HIGH", "alloc": "INTERACTIVE_LOW", "hb": "DATA"}
@@ -23,7 +23,23 @@ class Mesh:
         self.rx_bad = 0
         self.session = None
         self.pubs = {}
+        self.backlog, self.stalled = None, False
+        self._stall = StallWatch()
         threading.Thread(target=self._open, args=(own_ip, peer_ips), daemon=True).start()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        """слежение за заклиниванием слушателя Zenoh (см. mesh_cfg.py): stalled=True, решение — у координатора"""
+        while True:
+            try:
+                with open("/proc/net/udp") as f:
+                    self.backlog = listen_backlog(f.read())
+            except OSError:
+                self.backlog = None
+            if self._stall.update(self.backlog, time.monotonic()) and not self.stalled:
+                self.stalled = True
+                log.error("zenoh listener stalled: rx backlog %s B on :7447", self.backlog)
+            time.sleep(1.0)
 
     def _open(self, own_ip, peer_ips):
         while self.session is None:
