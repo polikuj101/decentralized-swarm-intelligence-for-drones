@@ -15,6 +15,7 @@ from swarm import actions as A, common, wire
 from swarm.bids import compute_bid
 from swarm.bump_gate import BumpGate
 from swarm.cbaa import CBAA
+from swarm.fdlog import FdLog
 from swarm.features import T_DEAD, dead_after, lossy_until_after_rx, silent_for
 from swarm.manifest_check import manifest_problem
 from swarm.mesh import Mesh
@@ -81,6 +82,8 @@ class Coordinator(Node):
         self.phase, self.phase_t = A.Phase.NOMINAL, time.monotonic()
         self.crumbs, self.t_crumb = deque(maxlen=150), 0.0           # (t, x, y): позиции с хорошей связью
         self.llm_ok_t, self.t_state, self.t_goal_pub = 0.0, 0.0, 0.0
+        self.fdlog = FdLog()               # журнал для детектора отказа соседа, SWARM_FD_LOG; по умолчанию выключен
+        self.fdlog.write("start", me=ME, n=N)
 
         peers_ips = [ip for ip in os.environ.get("PEERS", "").split(",") if ip]
         self.mesh = Mesh(ME, os.environ["SELF_MESH_IP"], peers_ips, self._on_wire)
@@ -296,6 +299,7 @@ class Coordinator(Node):
         p.x, p.y, p.z, p.state, p.flags = d["x"], d["y"], d["z"], d["state"], d["flags"]
         p.sigma, p.task, p.epoch, p.link_q = d["sigma"], d["task"], d["epoch"], d["link_q"]
         p.heard, p.heard_rx, p.hb_s = d["heard"], now, max(0.5, d["hb_s"])
+        self.fdlog.write("hb", s=s, seq=seq, hb=round(p.hb_s, 2), lq=round(d["link_q"]), h=d["heard"])
         self.force_dead.discard(s)
         if sgt(d["epoch"], self.epoch):
             self.adopt(d["epoch"], now, f"hb from {s}")
@@ -339,7 +343,9 @@ class Coordinator(Node):
             if pf.last_rx is not None and now - pf.last_rx < dead_after(now < self.lossy_until):
                 # сам слышу этого борта: чужой FAIL - ложная тревога от соседа с потерями; не рвём задачи живого (2026-10-28)
                 self.log(f"peer {f} FAIL from {s} ignored: heard directly {now - pf.last_rx:.1f}s ago")
+                self.fdlog.write("fail", s=s, f=f, ign=True)
                 return
+            self.fdlog.write("fail", s=s, f=f, ign=False)
             self.force_dead.add(f)
             self.cbaa.drop_peer(f)
             self.reset_cbaa(now)
@@ -513,6 +519,7 @@ class Coordinator(Node):
                     self.active_zones = set(range(common.COLS * common.ROWS))
                     self.log("manifest timeout -> fallback: все сектора активны")
                 self.t_live0 = now
+                self.fdlog.write("live")
                 self.reset_cbaa(now)
             self._poll_manifest(now)
             if AUTO_RESUME and withdraw_clearable(self.withdrawn, self.phase == A.Phase.NOMINAL, now - self.phase_t):
@@ -535,14 +542,19 @@ class Coordinator(Node):
 
     def _liveness(self, now):
         alive = self.alive_set(now)
+        lossy = now < self.lossy_until
         if alive != self.alive_prev:
             left, joined = self.alive_prev - alive, alive - self.alive_prev
             for g in sorted(left):
                 self.log(f"peer {g} DEAD")
+                self.fdlog.write("dead", j=g, lossy=lossy)
             for g in sorted(joined):
                 self.log(f"peer {g} ALIVE")
+                self.fdlog.write("alive", j=g, lossy=lossy)
             self.alive_prev = alive
             self.bump_gate.observe(bool(joined), bool(left), now)
+        if self.fdlog.tick_due():
+            self.fdlog.write("tk", lq=round(self.link_quality(now), 2), lossy=lossy, alive=sorted(alive))
         if self.bump_gate.due(now, self.last_bump):
             self.bump_gate.fire()
             self.bump("alive-set", now)

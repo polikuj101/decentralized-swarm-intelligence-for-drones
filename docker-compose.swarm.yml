@@ -18,6 +18,7 @@ x-swarm-env: &swarm-env
   S2_PERIOD_S: "20"
   VIO_DEROT: ${VIO_DEROT:--1}            # поправка VIO на поворот борта между кадрами (см. swarm/vio_node.py), 0 — выключить
   VIO_FRAME_LOG: ${VIO_FRAME_LOG:-}      # покадровый журнал VIO для сверки с Gazebo (docs/gz_leak/vio_eval.py), по умолчанию выключен
+  SWARM_FD_LOG: ${SWARM_FD_LOG:-}       # журнал детектора отказа соседа (swarm/fdlog.py), например /opt/swarm/state/fd.jsonl; по умолчанию выключен
   MANIFEST_WAIT_S: ${MANIFEST_WAIT_S:-90}   # ожидание приказа после старта, потом все сектора (на показе — больше, см. scripts/run_demo.sh)
 
 services:
