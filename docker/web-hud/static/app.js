@@ -8,7 +8,8 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":
 const fmt = (v, d = 1) => (typeof v === "number" && isFinite(v)) ? v.toFixed(d) : "—";
 const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
 // Имена секторов из приказа оператора: индекс сектора (клетка сетки r*cols+c) -> зона. Тот же порядок, что ZONE_TO_SECTOR в swarm/tasking.py.
-const SECTOR_ZONE = ["Альфа", "Чарли", "Дельта", "Эхо", "Браво", "Фокстрот"];
+const SECTOR_ZONE = new URLSearchParams(location.search).get("lang") === "ru"
+  ? ["Альфа", "Чарли", "Дельта", "Эхо", "Браво", "Фокстрот"] : ["Alpha", "Charlie", "Delta", "Echo", "Bravo", "Foxtrot"];
 const secLabel = (p) => SECTOR_ZONE[p] || ("S" + p);
 // «S4» -> «Браво», «S4.1» (половина разделённого сектора) -> «Браво.1»; цели «T0» не трогаем
 const humanTask = (name) => String(name).replace(/\bS([0-5])((?:\.\d+)?)\b/g, (_, p, q) => secLabel(+p) + q);
