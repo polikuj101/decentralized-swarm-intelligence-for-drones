@@ -25,6 +25,8 @@
     ["Манифест принят координаторами всех бортов", "Manifest accepted by the coordinators of all drones"], ["НЕ принят координаторами:", "NOT accepted by coordinators:"],
     ["Компиляция", "Compiling"], ["бортов)...", "drones)..."], ["Ошибка сети:", "Network error:"], ["Ошибка:", "Error:"],
     ["Скомпилирован на", "Compiled on"], ["жду подтверждения координаторов…", "waiting for coordinator confirmation…"],
+    ["Приказ передан бортам в", "Order sent to the drones at"], ["скомпилирован на", "compiled on"], ["бортах", "drones"],
+    ["вымышленная местность, не реальный район", "fictional terrain, not a real place"], ["модель", "model"], [" с) |", " s) |"], [" мс", " ms"],
     ["Манифест не скомпилирован ни на одном борту", "Manifest not compiled on any drone"],
     ["ВНИМАНИЕ: борты скомпилировали РАЗНЫЕ манифесты", "WARNING: drones compiled DIFFERENT manifests"], ["варианта), принято ответов", "variants), replies accepted"],
     ["скомпилировали иначе,", "compiled differently,"], ["выровнены по большинству", "aligned to the majority"], ["НЕ выровнены", "NOT aligned"],

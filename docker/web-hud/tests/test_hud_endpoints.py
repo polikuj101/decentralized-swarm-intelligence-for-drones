@@ -89,6 +89,28 @@ def test_tasking_with_x_hud_reaches_handler(hud):
     assert hud.post("/api/tasking", json={"prompt": ""}, headers=HUD).status_code == 422        # длина промпта проверяется уже в хендлере
 
 
+class FakeAgents:
+    """Подмена httpx.AsyncClient для /api/tasking: каждый борт компилирует один и тот же манифест."""
+    MAN = {"active_sectors": [0, 2, 5], "on_target": "SKIP", "dwell_s": 0, "rtb_on_complete": True,
+           "assignments": {"1": [2, 5], "2": [2, 5], "3": [0], "4": [0], "5": [0]}}
+
+    async def post(self, url, json=None, headers=None, timeout=None):
+        return type("R", (), {"status_code": 200, "text": "{}", "json": lambda _s: dict(FakeAgents.MAN)})()
+
+
+def test_order_sent_via_api_is_in_state_so_the_prompt_field_shows_it(hud):
+    # регрессия записи демо: run_demo.sh шлёт приказ через API, а в поле HUD оставался текст по умолчанию
+    main.ORDER.update(prompt=None, ts=None, compiled=0, manifest=None)
+    assert hud.get("/api/state").json()["order"] is None
+    main.CLIENT = FakeAgents()
+    prompt = "Drones 1 and 2 search Delta and Foxtrot, the rest stay in Alpha"
+    r = hud.post("/api/tasking", json={"prompt": prompt}, headers=HUD)
+    assert r.status_code == 200
+    o = hud.get("/api/state").json()["order"]
+    assert o["prompt"] == prompt and o["compiled"] == 5 and o["ts"] == r.json()["order_ts"]
+    assert o["manifest"]["assignments"]["1"] == [2, 5]
+
+
 # ───────────── id карточек BDA (регрессия: len(deque)+1 давал id=201 после 200-й) ─────────────
 
 def test_evidence_ids_stay_unique_after_deque_is_full(hud):

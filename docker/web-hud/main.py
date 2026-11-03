@@ -55,6 +55,9 @@ EVIDENCE_SEQ = itertools.count(1)       # id не зависит от разме
 TRACK = convergence.Tracker()
 SPLIT_MAX_S = 120.0                     # страховка: если HUD упал, разделение само снимется
 AGENT_MGMT_IPS = {i: f"172.33.0.{10+i}" for i in range(1, N + 1)}
+# Последний приказ, переданный бортам: из поля HUD или через /api/tasking (run_demo.sh). HUD показывает его в поле приказа,
+# иначе на записи демо в поле висел текст по умолчанию, а борта летали по другому приказу.
+ORDER = {"prompt": None, "ts": None, "compiled": 0, "manifest": None}
 _feed_n = 0
 CLIENT: httpx.AsyncClient | None = None
 _cache: dict = {}
@@ -254,7 +257,8 @@ def snapshot() -> dict:
             "c2": {"state": "NO_LINK" if hb_age is None else ("OK" if hb_age < C2_LOST_S else "LOST"),
                    "hb_age": hb_age, "armed": m["armed"], "fix": m["fix"], "sats": m["sats"]}}
     return {"ts": time.time(), "swarm_size": N, "drones": drones, "converge": TRACK.snapshot(now), "ew": EW["state"],
-            "ew_ok": bool(EW["ok"] and now - (EW["rx"] or 0.0) < 4.0), "ew_err": EW["err"]}
+            "ew_ok": bool(EW["ok"] and now - (EW["rx"] or 0.0) < 4.0), "ew_err": EW["err"],
+            "order": dict(ORDER) if ORDER["ts"] is not None else None}
 
 
 @app.get("/api/state")
@@ -433,7 +437,8 @@ async def post_tasking(request: Request):
             if ok:
                 harmonized.append(i)
                 results[i - 1] = {"drone": i, "ok": True, "body": chosen, "harmonized": True}
-    return {"results": results, "dissent": dissent, "harmonized": harmonized}
+    ORDER.update(prompt=prompt, ts=time.time(), compiled=sum(1 for r in results if r.get("ok")), manifest=chosen)
+    return {"results": results, "dissent": dissent, "harmonized": harmonized, "order_ts": ORDER["ts"]}
 
 
 # ───────────── статика ─────────────

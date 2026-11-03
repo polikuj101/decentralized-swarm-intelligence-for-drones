@@ -115,7 +115,8 @@ async function loadTerrain() {
         icon: L.divIcon({className: "plc " + p.kind, html: esc(p.name), iconSize: [100, 12]})}).addTo(map);
     }
     const m = t.meta || {}, note = L.control({position: "bottomleft"});
-    note.onAdd = () => mk("div", "terr-note", `SIMULATION · масштабная карта района (1 м сцены ≈ ${m.real_m_per_scene_m} м местности) · ${m.source}`);
+    note.onAdd = () => mk("div", "terr-note", m.fictional ? "SIMULATION · вымышленная местность, не реальный район"
+      : `SIMULATION · масштабная карта района (1 м сцены ≈ ${m.real_m_per_scene_m} м местности) · ${m.source}`);
     note.addTo(map);
   } catch (e) { /* подложка необязательна */ }
 }
@@ -274,7 +275,7 @@ function convText(c) {
 
 function render(s) {
   const ref = refDrone(s);
-  updateTop(s, ref); updateMap(s, ref); updateGraph(s); updateCards(s);
+  updateTop(s, ref); updateMap(s, ref); updateGraph(s); updateCards(s); updateOrder(s.order);
 }
 
 // ───────────── консоль ─────────────
@@ -396,11 +397,42 @@ async function confirmManifest(man, st) {
     st.className = "cmd-badge";
   }
 }
+function showManifest(b) {
+  const card = $("manifest-info");
+  const SRC = {rules: "из текста", llm: "модель", default: "по умолчанию"};
+  const by = b.parsed_by || {};
+  const src = (k) => SRC[by[k]] || "модель";
+  card.style.display = "block";
+  card.replaceChildren(
+    mk("b", null, "Скомпилированный Task Manifest: "),
+    document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (${(b.active_sectors || []).map((p) => secLabel(p) + " = S" + p).join(", ")}) |` +
+      `При контакте: ${b.on_target} (${b.dwell_s} с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
+    ...(b.assignments ? [mk("br"), mk("span", null, "Адресация бортов: " + fmtAssign(b.assignments))] : []),
+    mk("br"),
+    mk("span", "dim", `Разбор: зоны — ${src("zones")}, при контакте — ${src("on_target")}, время — ${src("dwell_s")}, RTB — ${src("rtb_on_complete")}` +
+      (b.llm_error ? " · бортовая модель недоступна" : (b.llm_zones ? ` · модель предлагала зоны [${b.llm_zones.join(", ")}]` : ""))),
+    mk("br"),
+    mk("span", "dim", "Исполняются: сектора, режим при контакте (SKIP — цели пропускаются, DWELL_ONLY — зависание без снимка, DWELL_RECON — со снимком), время зависания и возврат. Имена зон → сектора заданы в таблице, а не выводятся из карты; цели на карте известны заранее."));
+}
+
+// Поле приказа = последний приказ, переданный бортам (s.order с сервера), в том числе отправленный через API из run_demo.sh.
+// Пока оператор печатает, поле не трогаем; свой приказ страница отмечает по order_ts из ответа /api/tasking.
+let orderTs = null;
+function updateOrder(o) {
+  const inp = $("cmd-input"), st = $("cmd-status");
+  if (!o || !inp || o.ts === orderTs || document.activeElement === inp) return;
+  orderTs = o.ts;
+  inp.value = o.prompt;
+  if (o.manifest) showManifest(o.manifest);
+  const hhmm = new Date(o.ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  st.textContent = `Приказ передан бортам в ${hhmm}: скомпилирован на ${o.compiled}/${N} бортах`;
+  st.className = o.compiled === N ? "cmd-badge ready" : "cmd-badge";
+}
+
 function buildTasking() {
   const btn = $("cmd-send");
   const inp = $("cmd-input");
   const st = $("cmd-status");
-  const card = $("manifest-info");
   if (!btn || !inp) return;
 
   btn.onclick = async () => {
@@ -418,6 +450,7 @@ function buildTasking() {
       });
       const data = await res.json();
       btn.disabled = false;
+      if (data.order_ts) orderTs = data.order_ts;         // свой приказ: статус ниже точнее, updateOrder его не перезаписывает
       if (!res.ok) {
         st.textContent = "Ошибка: " + (data.detail || "502");
         st.className = "cmd-badge";
@@ -427,23 +460,7 @@ function buildTasking() {
       const sig = (b) => JSON.stringify([b.active_sectors, b.on_target, b.dwell_s, b.rtb_on_complete, b.assignments || null]);
       const sigs = new Set(oks.map(r => sig(r.body)));
       const firstOk = oks[0];
-      if (firstOk) {
-        const b = firstOk.body;
-        const SRC = {rules: "из текста", llm: "модель", default: "по умолчанию"};
-        const by = b.parsed_by || {};
-        const src = (k) => SRC[by[k]] || "модель";
-        card.style.display = "block";
-        card.replaceChildren(
-          mk("b", null, "Скомпилированный Task Manifest: "),
-          document.createTextNode(`Зоны: [${(b.zones_named || []).join(", ")}] (${(b.active_sectors || []).map((p) => secLabel(p) + " = S" + p).join(", ")}) |` +
-            `При контакте: ${b.on_target} (${b.dwell_s}с) | RTB: ${b.rtb_on_complete} | Инференс: ${b.latency_ms} мс`),
-          ...(b.assignments ? [mk("br"), mk("span", null, "Адресация бортов: " + fmtAssign(b.assignments))] : []),
-          mk("br"),
-          mk("span", "dim", `Разбор: зоны — ${src("zones")}, при контакте — ${src("on_target")}, время — ${src("dwell_s")}, RTB — ${src("rtb_on_complete")}` +
-            (b.llm_error ? " · бортовая модель недоступна" : (b.llm_zones ? ` · модель предлагала зоны [${b.llm_zones.join(", ")}]` : ""))),
-          mk("br"),
-          mk("span", "dim", "Исполняются: сектора, режим при контакте (SKIP — цели пропускаются, DWELL_ONLY — зависание без снимка, DWELL_RECON — со снимком), время зависания и возврат. Имена зон → сектора заданы в таблице, а не выводятся из карты; цели на карте известны заранее."));
-      }
+      if (firstOk) showManifest(firstOk.body);
       if (!oks.length) {
         st.textContent = `Манифест не скомпилирован ни на одном борту (0/${N})`;
         st.className = "cmd-badge";
