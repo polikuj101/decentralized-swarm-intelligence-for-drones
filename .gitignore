@@ -11,3 +11,7 @@ docker/drone-agent/models/embed/*
 
 # секреты стенда: токен оператора и ключ mesh (шаблон: .env.example)
 .env
+.gstack/
+
+# контакты лидов (персональные данные)
+docs/leads_tracker.xlsx
