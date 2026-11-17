@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_cbaa_standalone.py — Unit & Integration tests for CBAA/CBBA logic.
+"""test_cbaa_standalone.py — Unit & Integration tests for the CBAA auction and its experimental bundle mode (the bundle mode is not CBBA).
 Verifies convergence, anti-flapping hysteresis, fair tie-breaking, and bundle allocation.
 """
 import sys
@@ -49,7 +49,7 @@ def test_basic_convergence():
 def test_fair_tie_breaking():
     print("--- TEST 2: Fair Tie-Breaking Test ---")
     m = 10
-    # In CBBA mode with max_bundle=2, 5 agents can take all 10 tasks
+    # Experimental bundle mode (max_bundle=2; not CBBA, not used in production): 5 agents can take all 10 tasks
     agents = [CBAA(i, m, max_bundle=2) for i in range(1, 6)]
     
     for a in agents:
@@ -103,7 +103,7 @@ def test_flapping_hysteresis():
     print("PASS: Anti-flapping hysteresis successfully filtered noise while allowing true advantage!\n")
 
 def test_bundle_allocation_cbba():
-    print("--- TEST 4: Bundle Allocation (CBBA Multi-Task) ---")
+    print("--- TEST 4: Bundle Allocation (experimental multi-task mode, not CBBA) ---")
     m = 6
     # 2 agents, 6 tasks, max_bundle = 3
     a1 = CBAA(1, m, max_bundle=3)
@@ -119,7 +119,7 @@ def test_bundle_allocation_cbba():
     a2.select()
     
     rounds = simulate_consensus([a1, a2])
-    print(f"CBBA converged in {rounds} rounds.")
+    print(f"Bundle mode converged in {rounds} rounds.")
     print(f"Agent 1 bundle: {a1.bundle} (active task x: {a1.x})")
     print(f"Agent 2 bundle: {a2.bundle} (active task x: {a2.x})")
     print(f"Winners: {{j: a1.z[j] for j in range(m)}}")
@@ -135,5 +135,5 @@ if __name__ == "__main__":
     test_flapping_hysteresis()
     test_bundle_allocation_cbba()
     print("==================================================")
-    print("ALL CBAA / CBBA UPGRADE TESTS PASSED (4/4)!")
+    print("ALL CBAA TESTS PASSED (4/4)!")
     print("==================================================")
