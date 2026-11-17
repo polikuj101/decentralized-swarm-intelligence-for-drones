@@ -52,7 +52,7 @@ Inside every drone (`docker/drone-agent/swarm/`):
 
 | Part | What it does | Where |
 |---|---|---|
-| Auction | CBAA/CBBA-style task auction over the mesh; zero bids are never selected, which is how per-drone assignments are enforced | `coordinator.py`, `cbaa.py`, `bids.py`, `orders.py` |
+| Auction | Consensus-based auction (**CBAA**: one task per drone at a time) over the mesh, with epoch resets, a hysteresis margin against flapping and a hash tie-break; winning bids and winners travel as claim vectors. Zero bids are never selected, which is how per-drone assignments are enforced. `cbaa.py` contains experimental bundle code, but production runs with a bundle size of 1, and that bundle mode is not CBBA (static scores, no timestamp vector) | `coordinator.py`, `cbaa.py`, `bids.py`, `orders.py` |
 | System 1 | Nine explicit numbered rules R1-R9 (condition, action, urgency), evaluated at 5 Hz with no LLM; the rule id goes into every decision log | `rules.py`, `matcher.py`, `phase.py` |
 | System 2 | A 0.5B model that advises only in severe phases (loss of the group, critical navigation); every command passes a validator | `planner_bridge.py`, `actions.py` |
 | Order compiler | Zones and drone references come from rules, never from the model; the model fills only fields the text does not state | `order_rules.py`, `tasking.py`, `manifest_check.py` |
